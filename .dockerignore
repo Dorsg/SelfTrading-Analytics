@@ -1,0 +1,23 @@
+# Python
+venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+
+# Logs and caches
+*.log
+logs/
+
+# Node + UI
+node_modules
+client-ui/
+client-ui-naive/node_modules
+
+# Git & IDE
+.git
+.vscode
+
+# Build output
+dist
+build.log

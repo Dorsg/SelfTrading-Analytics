@@ -1,0 +1,25 @@
+{
+  email dorsabag93@gmail.com
+}
+
+selftrading.org {
+  encode gzip
+
+  # Serve static UI except API
+  @static_root {
+    not path /api/* /simulation*
+  }
+  reverse_proxy @static_root client-ui:80
+
+  # Serve simulation UI at /simulation
+  @sim {
+    path /simulation* 
+  }
+  route @sim {
+    uri strip_prefix /simulation
+    reverse_proxy client-ui:80
+  }
+
+  # Single proxy rule for all API routes
+  reverse_proxy /api/* api_gateway:8000
+}
