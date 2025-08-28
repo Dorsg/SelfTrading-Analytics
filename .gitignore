@@ -179,6 +179,12 @@ cython_debug/
 # PyPI configuration file
 .pypirc
 
+# Large data files and databases
+*.db
+*.sqlite
+*.sqlite3
+data/
+tools/finnhub_downloader/data/
 
 copy_client_content.ps1
 copy_project_content.ps1
