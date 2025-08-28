@@ -79,7 +79,7 @@ async def _tick_users(ts_epoch: int) -> None:
 
 async def main() -> None:
     logging.basicConfig(level=logging.INFO)
-    os.environ["ANALYTICS_MODE"] = "true"
+
     pace_seconds = int(os.getenv("SIM_PACE_SECONDS", "0"))  # 0 = as fast as possible
     step_seconds = int(os.getenv("SIM_STEP_SECONDS", "300"))  # 5 minutes default
 
@@ -109,14 +109,27 @@ async def main() -> None:
             if not existing:
                 _bootstrap_runners(db, u)
 
-    log.info("Analytics simulation start at %s", datetime.fromtimestamp(ts, tz=timezone.utc))
+    log.info("Analytics simulation initialized at %s", datetime.fromtimestamp(ts, tz=timezone.utc))
+    
+    # Initialize simulation state as stopped - user will start manually from UI
+    with DBManager() as db:
+        u = db.get_user_by_username("analytics")
+        if u:
+            st = db.db.query(SimulationState).filter(SimulationState.user_id == u.id).first()
+            if not st:
+                st = SimulationState(user_id=u.id, is_running="false")
+                db.db.add(st)
+            else:
+                st.is_running = "false"
+            st.last_ts = datetime.fromtimestamp(ts, tz=timezone.utc)
+            db.db.commit()
 
     while True:
         # Respect persisted start/stop state
         with DBManager() as db:
             u = db.get_user_by_username("analytics")
             st = db.db.query(SimulationState).filter(SimulationState.user_id == (u.id if u else -1)).first() if u else None
-            if st and st.is_running != "true":
+            if not st or st.is_running != "true":
                 await asyncio.sleep(1.0)
                 continue
         if end_ts and ts > end_ts:

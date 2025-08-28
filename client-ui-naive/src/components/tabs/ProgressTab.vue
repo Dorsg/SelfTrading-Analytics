@@ -1,13 +1,81 @@
 <template>
   <div class="wrap">
     <n-space vertical size="large">
+      <!-- Database Readiness Status -->
+      <n-card title="Database Status" size="small" :bordered="false">
+        <n-space vertical>
+          <!-- Status indicator -->
+          <n-space align="center">
+            <n-tag :type="dbStatus.ready ? 'success' : 'warning'">
+              {{ dbStatus.ready ? 'Ready' : dbStatus.status }}
+            </n-tag>
+            <n-text v-if="dbStatus.data?.daily_bars">
+              {{ formatNumber(dbStatus.data.daily_bars) }} daily bars
+            </n-text>
+            <n-text v-if="dbStatus.data?.minute_bars">
+              {{ formatNumber(dbStatus.data.minute_bars) }} minute bars
+            </n-text>
+            <n-text v-if="dbStatus.setup?.runners">
+              {{ dbStatus.setup.runners }} runners configured
+            </n-text>
+            <n-text v-if="dbStatus.data?.date_range?.start && dbStatus.data?.date_range?.end">
+              Data: {{ new Date(dbStatus.data.date_range.start).toLocaleDateString() }} - 
+              {{ new Date(dbStatus.data.date_range.end).toLocaleDateString() }}
+            </n-text>
+          </n-space>
+          
+          <!-- Import progress bars (show when import in progress) -->
+          <div v-if="dbStatus.import_progress && (dbStatus.status === 'importing' || !dbStatus.ready)">
+            <n-space vertical size="small">
+              <div>
+                <n-text strong>Daily Bars Import ({{ formatNumber(dbStatus.data?.daily_bars || 0) }}/{{ formatNumber(dbStatus.import_progress?.targets?.daily_target || 0) }})</n-text>
+                <n-progress 
+                  type="line" 
+                  :percentage="dbStatus.import_progress.daily_progress" 
+                  :indicator-placement="'inside'" 
+                  processing 
+                />
+              </div>
+              <div>
+                <n-text strong>Minute Bars Import ({{ formatNumber(dbStatus.data?.minute_bars || 0) }}/{{ formatNumber(dbStatus.import_progress?.targets?.minute_target || 0) }})</n-text>
+                <n-progress 
+                  type="line" 
+                  :percentage="dbStatus.import_progress.minute_progress" 
+                  :indicator-placement="'inside'" 
+                  processing 
+                />
+              </div>
+              <div>
+                <n-text strong>Overall Progress</n-text>
+                <n-progress 
+                  type="line" 
+                  :percentage="dbStatus.import_progress.overall_progress" 
+                  :indicator-placement="'inside'" 
+                  :status="dbStatus.import_progress.overall_progress >= 100 ? 'success' : 'default'"
+                />
+              </div>
+            </n-space>
+          </div>
+          
+
+        </n-space>
+      </n-card>
+
       <n-card title="Simulation Controls" size="small" :bordered="false">
         <n-space align="center">
           <n-tag type="success" v-if="state.running">Running</n-tag>
           <n-tag type="warning" v-else>Stopped</n-tag>
-          <n-button type="primary" @click="toggleRun" ghost>
+          <n-button 
+            type="primary" 
+            @click="toggleRun" 
+            :disabled="!dbStatus.ready" 
+            ghost
+          >
             {{ state.running ? 'Stop Simulation' : 'Start Simulation' }}
           </n-button>
+          <n-text v-if="!dbStatus.ready" depth="3">
+            Waiting for database to be ready...
+          </n-text>
           <n-text v-if="state.last_ts">Last TS: {{ new Date(state.last_ts).toLocaleString() }}</n-text>
         </n-space>
       </n-card>
@@ -35,7 +103,7 @@
 </template>
 
 <script setup>
-import { ref, onMounted } from 'vue';
+import { ref, onMounted, watch } from 'vue';
 import { useMessage } from 'naive-ui';
 import axios from 'axios';
 
@@ -43,6 +111,7 @@ const message = useMessage();
 const state = ref({ running: false, last_ts: null });
 const progress = ref({ '5m': { percent: 0, ticks_done: 0, ticks_total: 0 }, '1d': { percent: 0, ticks_done: 0, ticks_total: 0 } });
 const errors = ref([]);
+const dbStatus = ref({ ready: false, status: 'checking...', data: {}, setup: {} });
 
 const errColumns = [
   { title: 'Time', key: 'time' },
@@ -51,6 +120,25 @@ const errColumns = [
   { title: 'Reason', key: 'reason' },
   { title: 'Strategy', key: 'strategy' },
 ];
+
+async function loadDatabaseStatus() {
+  try {
+    const res = await axios.get('/api/analytics/database/status');
+    dbStatus.value = res.data;
+  } catch (err) {
+    dbStatus.value = { ready: false, status: 'error', data: {}, setup: {} };
+    console.error('Failed to load database status:', err);
+  }
+}
+
+function formatNumber(num) {
+  if (num >= 1000000) {
+    return (num / 1000000).toFixed(1) + 'M';
+  } else if (num >= 1000) {
+    return (num / 1000).toFixed(1) + 'K';
+  }
+  return num?.toString() || '0';
+}
 
 async function load() {
   try {
@@ -90,8 +178,31 @@ async function toggleRun() {
 
 onMounted(() => {
   load();
-  const t = setInterval(load, 3000);
-  window.addEventListener('beforeunload', () => clearInterval(t));
+  loadDatabaseStatus();
+  
+  // Refresh progress every 3 seconds
+  const progressTimer = setInterval(load, 3000);
+  
+  // Refresh database status more frequently during import
+  const getDbRefreshInterval = () => {
+    return dbStatus.value.status === 'importing' ? 2000 : 10000; // 2s when importing, 10s when stable
+  };
+  
+  let dbTimer = setInterval(loadDatabaseStatus, getDbRefreshInterval());
+  
+  // Update timer interval based on status
+  const updateDbTimer = () => {
+    clearInterval(dbTimer);
+    dbTimer = setInterval(loadDatabaseStatus, getDbRefreshInterval());
+  };
+  
+  // Watch for status changes to adjust refresh rate
+  watch(() => dbStatus.value.status, updateDbTimer);
+  
+  window.addEventListener('beforeunload', () => {
+    clearInterval(progressTimer);
+    clearInterval(dbTimer);
+  });
 });
 </script>
 

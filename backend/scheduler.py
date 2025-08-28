@@ -21,6 +21,12 @@ from apscheduler.triggers.cron import CronTrigger
 
 from backend.ib_manager.ib_connector import IBBusinessManager, _in_maintenance_window
 from backend.ib_manager.market_data_manager import MarketDataManager
+
+
+class MockMarketDataManager:
+    """Mock market data manager for analytics mode - always returns market active"""
+    async def is_us_market_active(self):
+        return True
 from database.db_manager import DBManager, get_users_with_ib_safe
 from database.models import User
 from sqlalchemy import text
@@ -36,7 +42,8 @@ log = logging.getLogger("Scheduler")
 RUN_LOCK = asyncio.Lock()             # protects the 5‑min runner job
 MINUTE_SYNC_LOCK = asyncio.Lock()     # protects the 1‑min sync job
 IB_POOL: dict[int, "PoolEntry"] = {}
-MKT = MarketDataManager()
+# Always use mock market data manager for analytics simulation
+MKT = MockMarketDataManager()
 
 # Cache users to reduce database queries
 _USERS_CACHE = None
@@ -78,50 +85,8 @@ class PoolEntry:
 
     async def ensure_connected(self) -> bool:
         """Return True when a live IB connection is ready to use."""
-        if _in_maintenance_window():
-            logging.getLogger("Scheduler").info(
-                "Skipping IB connect for %s – maintenance window (with buffer)",
-                self.user.username
-            )
-            return False
-
-        now = asyncio.get_running_loop().time()
-        
-        # Check if this entry is too old or has been idle too long
-        if self.should_cleanup(now):
-            log.info("IB pool entry for %s is stale, will be cleaned up", self.user.username)
-            return False
-            
-        if now < self.backoff_until:
-            return False
-
-        # Update last used time when connection is actively requested
-        self.last_used = now
-
-        if self.manager.ib.isConnected():
-            # Only health check if enough time has passed since last check
-            if now - self.last_health_check > self.health_check_interval:
-                self.last_health_check = now
-                if await self.manager.health_check():
-                    return True
-                else:
-                    log.warning("IB connection appears dead for %s, reconnecting...", self.user.username)
-                    self.manager.disconnect()
-            else:
-                # Trust the connection is still alive if we checked recently
-                return True
-
-        try:
-            await self.manager.connect()
-            self.backoff_pow = 1
-            return True
-        except Exception as e:
-            wait = (2 ** self.backoff_pow) + random.random()
-            self.backoff_pow = min(self.backoff_pow + 1, 8)
-            self.backoff_until = now + wait
-            log.warning("IB connect failed for %s – cooling-off %.0fs (error: %s)",
-                        self.user.username, wait, str(e))
-            return False
+        # Analytics simulation - always return True (no IB connection needed)
+        return True
 
     def should_cleanup(self, now: float) -> bool:
         """Check if this pool entry should be cleaned up due to age or idle time."""

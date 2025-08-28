@@ -86,61 +86,15 @@ export async function stopSimulation() {
   return data;
 }
 
-// ─────────── Mutations for positions ───────────
-export async function closeAllPositionsAPI() {
-  try {
-    const { data } = await axios.post(`/api/account/positions/close-all`);
-    // Invalidate related caches so next reads are fresh
-    invalidateCache('openPositions');
-    invalidateCache('orders');
-    invalidateCache('accountSnapshot');
-    invalidateCache('runners');
-    invalidateCache('runnersOverview');
-    return data; // { status, total, closed, failed, reactivated_runner_ids }
-  } catch (e) {
-    console.error('Error closing all positions:', e);
-    throw e;
-  }
-}
+// ─────────── Analytics API Functions ─────────── //
 
-// ─────────── Open-orders snapshot ───────────
 export async function fetchErrors(limit = 50) {
   const { data } = await axios.get(`/api/analytics/errors?limit=${limit}`);
   return data;
 }
 
-// ─────────── Filled trades snapshot ───────────
 export async function fetchResults(params = {}) {
   const search = new URLSearchParams(params);
   const { data } = await axios.get(`/api/analytics/results?${search.toString()}`);
   return data;
 }
-
-// Pruned legacy endpoints below this line
-
-// -- end prune
-
-// ─────────── Mutations that Invalidate Cache ─────────── //
-
-
-export async function validateSymbolViaAPI() { return true; }
-
-export async function createRunnerAPI() { return null; }
-
-export async function deleteRunnersAPI() { return null; }
-
-export async function activateRunnersAPI() { return null; }
-
-export async function deactivateRunnersAPI() { return { succeeded: [], failed: [] }; }
-
-// -- ──────────── Executions API ──────────── -- //
-// cache key is per-runner
-export async function fetchRunnerExecutions() { return []; }
-
-export async function clearRunnerHistoryAPI() { return null; }
-
-// ─────────── Other API Calls ─────────── //
-
-export async function fetchIbStatus() { return { connected: false, maintenance: false }; }
-
-export async function fetchMarketStatus() { return null; }

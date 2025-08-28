@@ -57,15 +57,8 @@ async def execute_decision(
 
     action = str(decision["action"]).upper()
 
-    if action == "BUY" and not decision.get("trail_stop_order") and not decision.get("static_stop_order"):
-        if os.getenv("ANALYTICS_MODE", "false").lower() != "true":
-            record_exec(
-                db, user_id=user.id, runner_id=runner.id,
-                status=ExecutionStatus.SKIPPED_BUILD_FAILED,
-                cycle_seq=cycle_seq, symbol=runner.stock,
-                reason="missing_stop_loss", strategy=strategy_name,
-            )
-            return
+    # Analytics simulation - skip stop loss requirement validation for buy orders
+    # (Original validation was disabled to allow simulation without stop losses)
 
     record_exec(
         db, user_id=user.id, runner_id=runner.id,

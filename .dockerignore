@@ -9,6 +9,13 @@ __pycache__
 *.log
 logs/
 
+# Large data files and databases
+*.db
+*.sqlite
+*.sqlite3
+data/
+tools/finnhub_downloader/data/
+
 # Node + UI
 node_modules
 client-ui/

@@ -2,7 +2,9 @@ from __future__ import annotations
 from fastapi import APIRouter, Query
 from typing import Optional
 from datetime import datetime, timezone
-from sqlalchemy import select, func, desc
+from sqlalchemy import select, func, desc, text
+import os
+import sqlite3
 
 from database.db_core import engine
 from database.db_manager import DBManager
@@ -188,5 +190,109 @@ def get_simulation_state() -> dict:
             "last_ts": st.last_ts if st else None,
             "env_ts": int(sim_env) if sim_env else None,
         }
+
+
+@router.get("/database/status")
+def get_database_status() -> dict:
+    """
+    Check database readiness for analytics simulation.
+    Returns status of database tables and data availability.
+    """
+    with engine.connect() as conn:
+        try:
+            # Check if tables exist and have data
+            daily_count = conn.execute(select(func.count()).select_from(HistoricalDailyBar)).scalar() or 0
+            minute_count = conn.execute(select(func.count()).select_from(HistoricalMinuteBar)).scalar() or 0
+            users_count = conn.execute(text("SELECT COUNT(*) FROM users")).scalar() or 0
+            runners_count = conn.execute(text("SELECT COUNT(*) FROM runners")).scalar() or 0
+            
+            # Check if import is completed
+            import_marker_exists = os.path.exists("/app/data/.import_completed")
+            
+            # Determine readiness
+            has_data = daily_count > 0 and minute_count > 0
+            has_setup = users_count > 0 and runners_count > 0
+            is_ready = has_data and has_setup and import_marker_exists
+            
+            # Get date ranges for data
+            start_date = None
+            end_date = None
+            if daily_count > 0:
+                start_date = conn.execute(select(func.min(HistoricalDailyBar.date))).scalar()
+                end_date = conn.execute(select(func.max(HistoricalDailyBar.date))).scalar()
+            
+            # Calculate import progress if importing
+            import_progress = None
+            if not import_marker_exists:
+                # Get actual target counts from SQLite source file
+                sqlite_path = os.getenv("ANALYTICS_SQLITE_PATH", "/app/tools/finnhub_downloader/data/daily_bars.sqlite")
+                
+                try:
+                    if os.path.exists(sqlite_path):
+                        with sqlite3.connect(sqlite_path) as sqlite_conn:
+                            cur = sqlite_conn.cursor()
+                            
+                            # Get actual total counts from source
+                            cur.execute("SELECT COUNT(*) FROM daily_bars")
+                            actual_daily_target = cur.fetchone()[0]
+                            
+                            cur.execute("SELECT COUNT(*) FROM minute_bars WHERE interval=5")
+                            actual_minute_target = cur.fetchone()[0]
+                    else:
+                        # Fallback to estimates if SQLite not found
+                        actual_daily_target = 500000
+                        actual_minute_target = 2000000
+                except Exception:
+                    # Fallback to estimates on any error
+                    actual_daily_target = 500000
+                    actual_minute_target = 2000000
+                
+                # Calculate accurate progress percentages
+                daily_progress = min(100, (daily_count / actual_daily_target) * 100) if actual_daily_target > 0 else 0
+                minute_progress = min(100, (minute_count / actual_minute_target) * 100) if actual_minute_target > 0 else 0
+                
+                # If no data yet, show as starting (1% to indicate activity)
+                if daily_count == 0 and minute_count == 0:
+                    daily_progress = 1
+                    minute_progress = 1
+                
+                import_progress = {
+                    "daily_progress": round(daily_progress, 1),
+                    "minute_progress": round(minute_progress, 1),
+                    "overall_progress": round((daily_progress + minute_progress) / 2, 1),
+                    "importing": True,
+                    "targets": {
+                        "daily_target": actual_daily_target,
+                        "minute_target": actual_minute_target
+                    }
+                }
+
+            return {
+                "ready": is_ready,
+                "import_completed": import_marker_exists,
+                "import_progress": import_progress,
+                "data": {
+                    "daily_bars": daily_count,
+                    "minute_bars": minute_count,
+                    "has_data": has_data,
+                    "date_range": {
+                        "start": start_date.isoformat() if start_date else None,
+                        "end": end_date.isoformat() if end_date else None,
+                    }
+                },
+                "setup": {
+                    "users": users_count,
+                    "runners": runners_count,
+                    "has_setup": has_setup,
+                },
+                "status": "ready" if is_ready else ("importing" if not import_marker_exists else "setup_needed")
+            }
+            
+        except Exception as e:
+            return {
+                "ready": False,
+                "error": str(e),
+                "status": "error"
+            }
 
 

@@ -33,9 +33,8 @@ async def sync_account(user: User, db: DBManager, ib: IBBusinessManager) -> None
     log.info("Account-sync START user=%s(id=%d)", user.username, user.id)
 
     try:
-        broker = ib
-        if os.getenv("ANALYTICS_MODE", "false").lower() == "true" and not isinstance(ib, MockBusinessManager):
-            broker = MockBusinessManager(user)
+        # Always use mock broker for analytics simulation
+        broker = MockBusinessManager(user) if not isinstance(ib, MockBusinessManager) else ib
         await asyncio.gather(
             sync_snapshot(user, db, broker),
             sync_positions(user, db, broker),

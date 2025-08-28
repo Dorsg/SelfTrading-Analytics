@@ -1,16 +1,15 @@
-version: "3.9"
-
 volumes:
-  pg_data:
-    name: selftrading_analytics_pg_data   # ← pinned, won't change across project/folder renames
-  ib_settings:
+  pg_data_dev:
+    name: selftrading_analytics_pg_data_dev
 
 services:
   db:
     image: postgres:15
-    container_name: analytics-db
-    restart: always
+    container_name: analytics-db-dev
+    restart: unless-stopped
     env_file: .env
+    ports:
+      - "5432:5432"  # Expose for development access
     environment:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
@@ -32,6 +31,8 @@ services:
       - "effective_cache_size=512MB"
       - "-c"
       - "checkpoint_completion_target=0.9"
+      - "-c"
+      - "default_statistics_target=100"
       - "-c"
       - "random_page_cost=1.1"
       - "-c"
@@ -76,15 +77,13 @@ services:
       - "max_wal_size=1GB"
       - "-c"
       - "min_wal_size=80MB"
-    mem_limit: 512m
+    mem_limit: 1g
     shm_size: 256m
     stop_grace_period: 60s
     volumes:
-      - pg_data:/var/lib/postgresql/data
+      - pg_data_dev:/var/lib/postgresql/data
       - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/00-init-db.sql:ro
       - ./scripts/10-init-app-user.sh:/docker-entrypoint-initdb.d/10-init-app-user.sh:ro
-    ports:
-      - "5432:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB} && psql -U ${POSTGRES_USER} -d ${POSTGRES_DB} -c 'SELECT 1' || exit 1"]
       interval: 15s
@@ -92,12 +91,11 @@ services:
       retries: 10
       start_period: 45s
 
-
   db-init-tables:
     build:
       context: .
       dockerfile: Dockerfile.api
-    container_name: analytics-db-init-tables
+    container_name: analytics-db-init-tables-dev
     restart: "no"
     env_file: .env
     environment:
@@ -109,12 +107,11 @@ services:
         condition: service_healthy
     entrypoint: ["python", "-m", "backend.database.init_db"]
 
-
   import-historical-bars:
     build:
       context: .
       dockerfile: Dockerfile.api
-    container_name: analytics-import-historical-bars
+    container_name: analytics-import-historical-bars_dev
     restart: "no"
     env_file: .env
     environment:
@@ -134,69 +131,53 @@ services:
       disable: true  # Disable health checks for long-running import
     entrypoint: ["python", "-m", "backend.analytics_importer"]
 
-
-
-
-
   api_gateway:
     build:
       context: .
       dockerfile: Dockerfile.api
-    container_name: analytics-api-gateway
+    container_name: analytics-api-gateway-dev
     restart: unless-stopped
-    volumes:
-      - .:/app
-      - ./logs:/app/logs
-    command: uvicorn backend.api_gateway.main:app --host 0.0.0.0 --port 8000
+    env_file:
+      - .env
     ports:
-      - "8000:8000"
-    env_file: .env
+      - "8000:8000"  # Expose for development access
+    volumes:
+      - ./logs:/app/logs
+      - .:/app  # Mount source code for development
     environment:
       DATABASE_URL_DOCKER: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
-      RUNNING_ENV: analytics
+      RUNNING_ENV: development
       ANALYTICS_MODE: "true"
-      DB_ALLOW_AUTO_CREATE_DB: "true"
-      DB_ALLOW_AUTO_CREATE_TABLES: "true"
+      DB_ALLOW_AUTO_CREATE_DB: "false"
+      DB_ALLOW_AUTO_CREATE_TABLES: "false"
     depends_on:
       db:
         condition: service_healthy
       db-init-tables:
-        condition: service_completed_successfully
-      import-historical-bars:
         condition: service_completed_successfully
 
   client-ui:
     build:
       context: .
       dockerfile: Dockerfile.client-ui-naive
-    container_name: analytics-client-ui
+    container_name: analytics-client-ui-dev
+    restart: unless-stopped
     ports:
       - "8080:80"
     depends_on:
-      api_gateway:
-        condition: service_started
+      - api_gateway
 
   scheduler:
     build:
       context: .
       dockerfile: Dockerfile.scheduler
-    container_name: analytics-scheduler
+    container_name: analytics-scheduler-dev
+    restart: unless-stopped
     volumes:
-      - .:/app
-      - /var/run/docker.sock:/var/run/docker.sock
       - ./logs:/app/logs
-    command: python backend/analytics/sim_scheduler.py
-    restart: always
-    env_file: .env
-    environment:
-      DATABASE_URL_DOCKER: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
-      RUNNING_ENV: analytics
-      ANALYTICS_MODE: "true"
-
-      DB_ALLOW_AUTO_CREATE_DB: "true"
-      DB_ALLOW_AUTO_CREATE_TABLES: "true"
-      SIM_PACE_SECONDS: "0"
-      SIM_STEP_SECONDS: "300"
+      - .:/app  # Mount source code for development
+    env_file:
+      - .env
     depends_on:
       db:
         condition: service_healthy
@@ -204,11 +185,14 @@ services:
         condition: service_completed_successfully
       import-historical-bars:
         condition: service_completed_successfully
+    environment:
+      DATABASE_URL_DOCKER: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      RUNNING_ENV: development
+      ANALYTICS_MODE: "true"
 
-
-  # ib-gateway removed for analytics-only
-
+      DB_ALLOW_AUTO_CREATE_DB: "false"
+      DB_ALLOW_AUTO_CREATE_TABLES: "false"
 
 networks:
   default:
-    name: selftrading_analytics_default
+    name: selftrading_analytics_dev

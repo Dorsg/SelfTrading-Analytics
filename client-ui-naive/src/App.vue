@@ -5,64 +5,21 @@
         <n-layout-header class="header">
           <div class="title clickable" @click="goHome" style="display: flex; align-items: center; gap: 10px;">
             <img src="/kraken-svgrepo-com.svg" alt="SelfTrading Icon" style="width: 28px; height: 28px;" />
-            <div class="title">SelfTrading</div>
+            <div class="title">SelfTrading | simulations</div>
           </div>
           <div v-if="isAuth" class="user-box">
-            <!-- Broker connection status -->
+            <!-- Analytics Mode Indicator -->
             <n-tag
-              v-if="statusLoading"
               round
               size="small"
               :bordered="false"
-              type="default"
+              type="info"
               class="status-label"
             >
               <template #icon>
-                <n-spin size="12" />
+                <n-icon :component="AnalyticsOutline" />
               </template>
-              checking broker...
-            </n-tag>
-
-            <n-tag
-              v-else
-              round
-              size="small"
-              :bordered="false"
-              :type="ibMaintenance ? 'warning' : (ibConnected ? 'success' : 'error')"
-              class="status-label"
-            >
-              <template #icon>
-                <n-icon :component="ibMaintenance ? TimeOutline : (ibConnected ? CheckmarkCircleOutline : CloseCircleOutline)" />
-              </template>
-              {{ ibMaintenance ? 'broker in maintenance' : 'connection to broker' }}
-            </n-tag>
-
-            <!-- Market session status -->
-            <n-tag
-              v-if="marketLoading"
-              round
-              size="small"
-              :bordered="false"
-              type="default"
-              class="status-label"
-            >
-              <template #icon>
-                <n-spin size="12" />
-              </template>
-              checking market...
-            </n-tag>
-            <n-tag
-              v-else
-              round
-              size="small"
-              :bordered="false"
-              :type="marketStatusColor"
-              class="status-label"
-            >
-              <template #icon>
-                <n-icon :component="marketStatusIcon" />
-              </template>
-              {{ marketStatusLabel }}
+              Analytics Mode
             </n-tag>
 
             <span class="uname">{{ capitalizedUsername }}</span>
@@ -96,9 +53,7 @@ import { useRouter } from "vue-router";
 import { darkTheme } from "naive-ui";
 import {
   LogOutOutline,
-  CheckmarkCircleOutline,
-  CloseCircleOutline,
-  TimeOutline
+  AnalyticsOutline
 } from "@vicons/ionicons5";
 
 import {
@@ -106,19 +61,15 @@ import {
   useCurrentUser,
   
 } from "@/services/auth";
-import { fetchIbStatus, fetchMarketStatus  } from '@/services/dataManager';
+
 
 let inactivityTimer = null;
 const INACTIVITY_TIMEOUT_MS = 15 * 60 * 1000; // 15 minutes
 
 
 const router = useRouter();
-const ibConnected = ref(false);
-const ibMaintenance = ref(false);
-const marketSession = ref();
-const statusLoading = ref(true);
-const marketLoading = ref(true);
-let statusTimer = null;
+
+
 const user   = useCurrentUser(); // reactive singleton
 const isAuth = ref(!!user.value);
 
@@ -135,21 +86,7 @@ function updateAuth() {
   isAuth.value = !!localStorage.getItem("token");
 }
 
-const marketStatusIcon = computed(() => {
-  switch (marketSession.value) {
-    case "open":
-      return CheckmarkCircleOutline; // green
-    case "extended-hours":
-      return TimeOutline;           // yellow-ish semantic
-    case "closed":
-    case "close":
-    case "":
-    case null:
-    case undefined:
-    default:
-      return CloseCircleOutline;    // red / error
-  }
-});
+
 
 function handleLogout() {
   doLogout();
@@ -172,32 +109,7 @@ function resetInactivityTimer() {
   }, INACTIVITY_TIMEOUT_MS);
 }
 
-async function refreshStatuses () {
-  try {
-    const [ib, session] = await Promise.all([
-      fetchIbStatus(),          // now returns { connected, maintenance }
-      fetchMarketStatus()
-    ]);
 
-    ibConnected.value   = !!ib.connected;
-    ibMaintenance.value = !!ib.maintenance;
-
-    marketSession.value = session?.toLowerCase?.() || null;
-    statusLoading.value = false;
-    marketLoading.value = false;
-  } catch (e) {
-    console.error("Error refreshing statuses:", e);
-    ibConnected.value = false;
-    ibMaintenance.value = false;
-    marketSession.value = null;
-    statusLoading.value = false;
-    marketLoading.value = false;
-  }
-}
-
-refreshStatuses().catch((e) => {
-  console.error("Initial refreshStatuses failed:", e);
-});
 
 onMounted(() => {
   const events = ["mousemove", "keydown", "mousedown", "touchstart"];
@@ -205,7 +117,7 @@ onMounted(() => {
     window.addEventListener(event, resetInactivityTimer);
   });
 
-  window.addEventListener("auth-login", refreshStatuses); 
+ 
 
   window.addEventListener("auth-logout", () => {
     if (inactivityTimer) clearTimeout(inactivityTimer);
@@ -214,44 +126,7 @@ onMounted(() => {
   resetInactivityTimer(); // start the timer immediately
 });
 
-const marketStatusColor = computed(() => {
-  // Widget colors per request:
-  // a) closed → red
-  // b) pre/after (extended-hours) → yellow
-  // c) open → green
-  // d) no market data → red
-  switch (marketSession.value) {
-    case "open":
-      return "success";        // green
-    case "extended-hours":
-      return "warning";        // yellow
-    case "close":
-    case "closed":
-      return "error";          // red
-    case null:
-    case "":
-    case undefined:
-    default:
-      return "error";          // red (no market data)
-  }
-});
 
-const marketStatusLabel = computed(() => {
-  switch (marketSession.value) {
-    case "open":
-      return "market open";
-    case "extended-hours":
-      return "pre/after market";
-    case "close":
-    case "closed":
-      return "market closed";
-    case null:
-    case "":
-    case undefined:
-    default:
-      return "no market data";
-  }
-});
 
 onBeforeUnmount(() => {
   if (inactivityTimer) clearTimeout(inactivityTimer);

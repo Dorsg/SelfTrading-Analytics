@@ -48,10 +48,8 @@ async def run_due_runners(user: User, db_unused, ib: IBBusinessManager) -> None:
             async with _SEM:
                 # Create separate DB connection per runner for thread safety
                 with DBManager() as db:
-                    # Swap broker in analytics mode
-                    broker = ib
-                    if os.getenv("ANALYTICS_MODE", "false").lower() == "true":
-                        broker = MockBusinessManager(user)
+                    # Always use mock broker for analytics simulation
+                    broker = MockBusinessManager(user)
                     await _run_runner(r, user, db, broker)
 
         await asyncio.gather(*[_wrap(r) for r in actives])
