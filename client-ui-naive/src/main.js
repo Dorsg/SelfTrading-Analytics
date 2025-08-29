@@ -3,11 +3,8 @@ import { createApp } from "vue";
 import App from "./App.vue";
 import { createNaiveUI } from "./naive";
 
-import router from "@/router";          
-import { setAuthHeader } from "@/services/auth";
-
-const saved = localStorage.getItem("token");
-if (saved) setAuthHeader(saved);
+import router from "@/router";
+// Analytics mode - no authentication needed
 
 const app = createApp(App);
 app.use(createNaiveUI());

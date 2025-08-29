@@ -70,6 +70,7 @@
             @click="toggleRun" 
             :disabled="!dbStatus.ready" 
             ghost
+            size="large"
           >
             {{ state.running ? 'Stop Simulation' : 'Start Simulation' }}
           </n-button>
@@ -80,51 +81,102 @@
         </n-space>
       </n-card>
 
-      <n-card title="Progress" size="small" :bordered="false">
+      <n-card title="Simulation Progress" size="small" :bordered="false">
         <n-space vertical>
+          <!-- Simulation Time Display -->
+          <div v-if="progress.sim_time_readable">
+            <n-text strong>Current Simulation Time:</n-text>
+            <n-text>{{ progress.sim_time_readable }}</n-text>
+          </div>
+          
+          <!-- Current Runner Display -->
+          <div v-if="progress.current_runner_info">
+            <n-text strong>Last Runner:</n-text>
+            <n-text>{{ progress.current_runner_info }}</n-text>
+          </div>
+          
+          <!-- Progress Bars -->
           <div>
-            <n-text strong>5m</n-text>
+            <n-text strong>5m Timeframe</n-text>
             <n-progress type="line" :percentage="progress['5m']?.percent || 0" :indicator-placement="'inside'" processing />
-            <n-text depth="3">{{ progress['5m']?.ticks_done || 0 }} / {{ progress['5m']?.ticks_total || 0 }}</n-text>
+            <n-text depth="3">{{ progress['5m']?.ticks_done || 0 }} / {{ progress['5m']?.ticks_total || 0 }} ticks</n-text>
           </div>
           <div>
-            <n-text strong>1d</n-text>
+            <n-text strong>1d Timeframe</n-text>
             <n-progress type="line" :percentage="progress['1d']?.percent || 0" :indicator-placement="'inside'" />
-            <n-text depth="3">{{ progress['1d']?.ticks_done || 0 }} / {{ progress['1d']?.ticks_total || 0 }}</n-text>
+            <n-text depth="3">{{ progress['1d']?.ticks_done || 0 }} / {{ progress['1d']?.ticks_total || 0 }} ticks</n-text>
+          </div>
+          
+          <!-- Execution Stats -->
+          <div v-if="progress.execution_stats">
+            <n-text strong>Execution Statistics (24h):</n-text>
+            <n-space vertical size="small">
+              <n-text depth="3">Total: {{ progress.execution_stats.total_executions }}</n-text>
+              <n-text depth="3">Completed: {{ progress.execution_stats.completed_executions }}</n-text>
+              <n-text depth="3">Errors: {{ progress.execution_stats.error_executions }}</n-text>
+              <n-text depth="3">Skipped: {{ progress.execution_stats.skipped_executions }}</n-text>
+            </n-space>
           </div>
         </n-space>
       </n-card>
 
-      <n-card title="Recent Errors" size="small" :bordered="false">
-        <n-data-table :columns="errColumns" :data="errors" :bordered="false" size="small" :single-line="false" />
+      <n-card title="Recent Warnings & Errors" size="small" :bordered="false">
+        <n-space vertical>
+          <n-space align="center">
+            <n-select v-model:value="logHours" :options="logHoursOptions" size="small" style="width: 120px;" />
+            <n-button @click="loadLogs" size="small">Refresh</n-button>
+          </n-space>
+          <div class="log-container">
+            <pre v-if="logs.length > 0" class="log-text">{{ logsText }}</pre>
+            <n-empty v-else description="No logs found" />
+          </div>
+        </n-space>
       </n-card>
     </n-space>
   </div>
 </template>
 
 <script setup>
-import { ref, onMounted, watch } from 'vue';
+import { ref, onMounted, watch, computed } from 'vue';
 import { useMessage } from 'naive-ui';
 import axios from 'axios';
 
 const message = useMessage();
 const state = ref({ running: false, last_ts: null });
 const progress = ref({ '5m': { percent: 0, ticks_done: 0, ticks_total: 0 }, '1d': { percent: 0, ticks_done: 0, ticks_total: 0 } });
-const errors = ref([]);
+const logs = ref([]);
 const dbStatus = ref({ ready: false, status: 'checking...', data: {}, setup: {} });
-
-const errColumns = [
-  { title: 'Time', key: 'time' },
-  { title: 'Symbol', key: 'symbol' },
-  { title: 'Status', key: 'status' },
-  { title: 'Reason', key: 'reason' },
-  { title: 'Strategy', key: 'strategy' },
+// Log controls - only warnings and errors
+const logHours = ref(24);
+const logHoursOptions = [
+  { label: '1 hour', value: 1 },
+  { label: '6 hours', value: 6 },
+  { label: '12 hours', value: 12 },
+  { label: '24 hours', value: 24 },
+  { label: '48 hours', value: 48 },
 ];
 
+// Caching
+const dbStatusCache = ref(null);
+const dbStatusCacheTime = ref(0);
+const CACHE_DURATION = 30000; // 30 seconds
+
 async function loadDatabaseStatus() {
+  const now = Date.now();
+  
+  // Check cache first
+  if (dbStatusCache.value && (now - dbStatusCacheTime.value) < CACHE_DURATION) {
+    dbStatus.value = dbStatusCache.value;
+    return;
+  }
+  
   try {
     const res = await axios.get('/api/analytics/database/status');
     dbStatus.value = res.data;
+    
+    // Update cache
+    dbStatusCache.value = res.data;
+    dbStatusCacheTime.value = now;
   } catch (err) {
     dbStatus.value = { ready: false, status: 'error', data: {}, setup: {} };
     console.error('Failed to load database status:', err);
@@ -140,22 +192,51 @@ function formatNumber(num) {
   return num?.toString() || '0';
 }
 
+async function loadLogs() {
+  try {
+    // Load both warnings and errors
+    const [warningsRes, errorsRes] = await Promise.all([
+      axios.get(`/api/analytics/logs/plain?hours_back=${logHours.value}&log_level=WARNING`),
+      axios.get(`/api/analytics/logs/plain?hours_back=${logHours.value}&log_level=ERROR`)
+    ]);
+    
+    const warnings = warningsRes.data.log_entries || [];
+    const errors = errorsRes.data.log_entries || [];
+    
+    // Combine and sort by timestamp
+    logs.value = [...warnings, ...errors].sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+  } catch (err) {
+    console.error('Failed to load logs:', err);
+    logs.value = [];
+  }
+}
+
 async function load() {
   try {
-    const [p, s, e] = await Promise.all([
+    const [p, s] = await Promise.all([
       axios.get('/api/analytics/progress'),
       axios.get('/api/analytics/simulation/state'),
-      axios.get('/api/analytics/errors?limit=50'),
     ]);
-    progress.value = p.data.timeframes || progress.value;
+    // Handle both old and new format
+    if (p.data.timeframes) {
+      progress.value.timeframes = p.data.timeframes;
+      progress.value['5m'] = p.data.timeframes['5m'];
+      progress.value['1d'] = p.data.timeframes['1d'];
+    } else {
+      progress.value = p.data || progress.value;
+    }
+    
+    // Add additional progress info
+    if (p.data.sim_time_readable) {
+      progress.value.sim_time_readable = p.data.sim_time_readable;
+    }
+    if (p.data.execution_stats) {
+      progress.value.execution_stats = p.data.execution_stats;
+    }
+    if (p.data.current_runner_info) {
+      progress.value.current_runner_info = p.data.current_runner_info;
+    }
     state.value = { running: !!s.data.running, last_ts: s.data.last_ts };
-    errors.value = (e.data || []).map(r => ({
-      time: r.time,
-      symbol: r.symbol,
-      status: r.status,
-      reason: r.reason,
-      strategy: r.strategy,
-    }));
   } catch (err) {
     message.error('Failed to load progress');
   }
@@ -166,9 +247,11 @@ async function toggleRun() {
     if (state.value.running) {
       await axios.post('/api/analytics/simulation/stop');
       state.value.running = false;
+      stopAutoAdvance();
     } else {
       await axios.post('/api/analytics/simulation/start');
       state.value.running = true;
+      startAutoAdvance();
     }
     await load();
   } catch (err) {
@@ -176,38 +259,92 @@ async function toggleRun() {
   }
 }
 
+let autoAdvanceTimer = null;
+
+function startAutoAdvance() {
+  if (autoAdvanceTimer) return; // Already running
+  
+  // Run very fast - every 50ms for rapid progression
+  autoAdvanceTimer = setInterval(async () => {
+    if (state.value.running) {
+      try {
+        // Use fast mode for rapid progression
+        await axios.post('/api/analytics/simulation/force-tick?fast=true');
+        // Refresh progress every 20 ticks to avoid overwhelming the UI
+        if (Math.random() < 0.05) {
+          await load();
+        }
+      } catch (err) {
+        console.error('Auto-advance error:', err);
+      }
+    }
+  }, 50); // Every 50ms = 20 ticks per second
+  
+  console.log('Fast auto-advance started (10 ticks/second)');
+}
+
+function stopAutoAdvance() {
+  if (autoAdvanceTimer) {
+    clearInterval(autoAdvanceTimer);
+    autoAdvanceTimer = null;
+    console.log('Auto-advance stopped');
+  }
+}
+
+
+
+
+
+// Computed properties
+const logsText = computed(() => {
+  return logs.value.map(entry => 
+    `[${entry.timestamp}] ${entry.level} (${entry.file}): ${entry.message}`
+  ).join('\n');
+});
+
 onMounted(() => {
   load();
   loadDatabaseStatus();
+  loadLogs();
   
   // Refresh progress every 3 seconds
   const progressTimer = setInterval(load, 3000);
   
-  // Refresh database status more frequently during import
-  const getDbRefreshInterval = () => {
-    return dbStatus.value.status === 'importing' ? 2000 : 10000; // 2s when importing, 10s when stable
-  };
+  // Refresh database status less frequently (cached)
+  const dbTimer = setInterval(loadDatabaseStatus, 30000); // 30 seconds
   
-  let dbTimer = setInterval(loadDatabaseStatus, getDbRefreshInterval());
-  
-  // Update timer interval based on status
-  const updateDbTimer = () => {
-    clearInterval(dbTimer);
-    dbTimer = setInterval(loadDatabaseStatus, getDbRefreshInterval());
-  };
-  
-  // Watch for status changes to adjust refresh rate
-  watch(() => dbStatus.value.status, updateDbTimer);
+  // Refresh logs every 10 seconds
+  const logsTimer = setInterval(loadLogs, 10000);
   
   window.addEventListener('beforeunload', () => {
     clearInterval(progressTimer);
     clearInterval(dbTimer);
+    clearInterval(logsTimer);
   });
 });
 </script>
 
 <style scoped>
 .wrap { padding: 8px; }
+
+.log-container {
+  max-height: 400px;
+  overflow-y: auto;
+  border: 1px solid #444;
+  border-radius: 4px;
+  padding: 8px;
+  background: #1a1a1a;
+}
+
+.log-text {
+  font-family: 'Courier New', monospace;
+  font-size: 12px;
+  line-height: 1.4;
+  color: #ccc;
+  margin: 0;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+}
 </style>
 
 

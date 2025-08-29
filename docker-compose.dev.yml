@@ -176,6 +176,7 @@ services:
     volumes:
       - ./logs:/app/logs
       - .:/app  # Mount source code for development
+    command: python backend/analytics/sim_scheduler.py
     env_file:
       - .env
     depends_on:
@@ -192,6 +193,9 @@ services:
 
       DB_ALLOW_AUTO_CREATE_DB: "false"
       DB_ALLOW_AUTO_CREATE_TABLES: "false"
+      SIM_PACE_SECONDS: "0"
+      SIM_STEP_SECONDS: "300"
+      SIM_SYMBOL_LIMIT: "10"
 
 networks:
   default:

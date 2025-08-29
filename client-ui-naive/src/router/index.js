@@ -6,7 +6,7 @@ import { logout }  from "@/services/auth";
 
 const routes = [
   { path: "/login", component: LoginPage, name: "Login" },
-  { path: "/", component: Dashboard, name: "Home", meta: { requiresAuth: true } },
+  { path: "/", component: Dashboard, name: "Home" }, // No auth required for analytics
 ];
 
 const router = createRouter({
@@ -14,27 +14,13 @@ const router = createRouter({
   routes,
 });
 
+// Analytics mode - no authentication required
 router.beforeEach((to, _from, next) => {
-  const token = localStorage.getItem("token");
-  if (to.meta.requiresAuth && !token) {
-    next({ name: "Login", query: { next: to.fullPath } });
-  } else {
-    next();
-  }
+  // Skip authentication checks for analytics-only app
+  next();
 });
 
-// global 401 → auto-logout
+// Analytics mode - no 401 handling needed since no auth required
 import axios from "axios";
-axios.interceptors.response.use(
-  r => r,
-  err => {
-    if (err.response?.status === 401) {
-      logout();
-      router.push({ name: "Login" });
-      window.dispatchEvent(new Event("auth-logout"));
-    }
-    return Promise.reject(err);
-  },
-);
 
 export default router;

@@ -157,6 +157,8 @@ services:
       ANALYTICS_MODE: "true"
       DB_ALLOW_AUTO_CREATE_DB: "true"
       DB_ALLOW_AUTO_CREATE_TABLES: "true"
+      SIM_STEP_SECONDS: "300"
+      SIM_SYMBOL_LIMIT: "10"
     depends_on:
       db:
         condition: service_healthy
@@ -197,6 +199,7 @@ services:
       DB_ALLOW_AUTO_CREATE_TABLES: "true"
       SIM_PACE_SECONDS: "0"
       SIM_STEP_SECONDS: "300"
+      SIM_SYMBOL_LIMIT: "10"
     depends_on:
       db:
         condition: service_healthy

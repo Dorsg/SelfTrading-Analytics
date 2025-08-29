@@ -20,4 +20,4 @@ COPY . .
 ENV PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app:/app/backend
 
-CMD ["python", "backend/scheduler.py"]
+# CMD is specified in docker-compose.yml to choose between scheduler.py and sim_scheduler.py

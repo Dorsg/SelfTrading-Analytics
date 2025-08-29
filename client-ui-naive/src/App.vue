@@ -7,7 +7,7 @@
             <img src="/kraken-svgrepo-com.svg" alt="SelfTrading Icon" style="width: 28px; height: 28px;" />
             <div class="title">SelfTrading | simulations</div>
           </div>
-          <div v-if="isAuth" class="user-box">
+          <div class="user-box">
             <!-- Analytics Mode Indicator -->
             <n-tag
               round
@@ -22,15 +22,7 @@
               Analytics Mode
             </n-tag>
 
-            <span class="uname">{{ capitalizedUsername }}</span>
-            <n-tooltip trigger="hover" placement="bottom">
-              <template #trigger>
-                <n-button circle quaternary size="large" @click="handleLogout">
-                  <n-icon :size="27" :component="LogOutOutline" />
-                </n-button>
-              </template>
-              Logout
-            </n-tooltip>
+            <span class="uname">Analytics User</span>
           </div>
         </n-layout-header>
 
@@ -52,28 +44,19 @@ import {
 import { useRouter } from "vue-router";
 import { darkTheme } from "naive-ui";
 import {
-  LogOutOutline,
   AnalyticsOutline
 } from "@vicons/ionicons5";
 
-import {
-  logout as doLogout,
-  useCurrentUser,
-  
-} from "@/services/auth";
 
-
-let inactivityTimer = null;
-const INACTIVITY_TIMEOUT_MS = 15 * 60 * 1000; // 15 minutes
+// Analytics mode - no inactivity timer needed
 
 
 const router = useRouter();
 
 
-const user   = useCurrentUser(); // reactive singleton
-const isAuth = ref(!!user.value);
-
-watch(user, (v) => (isAuth.value = !!v));
+// Analytics mode - no authentication required
+const user = ref({ username: "analytics" });
+const isAuth = ref(true); // Always authenticated in analytics mode
 
 /* Capitalized username */
 const capitalizedUsername = computed(() => {
@@ -82,16 +65,6 @@ const capitalizedUsername = computed(() => {
 });
 
 /* ───────── helpers ───────── */
-function updateAuth() {
-  isAuth.value = !!localStorage.getItem("token");
-}
-
-
-
-function handleLogout() {
-  doLogout();
-  router.push({ name: "Login" });
-}
 
 function goHome() {
   try {
@@ -101,41 +74,21 @@ function goHome() {
   router.push({ name: "Home" });
 }
 
+// Analytics mode - no inactivity logout needed
 function resetInactivityTimer() {
-  if (inactivityTimer) clearTimeout(inactivityTimer);
-  inactivityTimer = setTimeout(() => {
-    console.log("Logging out due to inactivity");
-    handleLogout();
-  }, INACTIVITY_TIMEOUT_MS);
+  // No-op in analytics mode
 }
 
 
 
 onMounted(() => {
-  const events = ["mousemove", "keydown", "mousedown", "touchstart"];
-  events.forEach((event) => {
-    window.addEventListener(event, resetInactivityTimer);
-  });
-
- 
-
-  window.addEventListener("auth-logout", () => {
-    if (inactivityTimer) clearTimeout(inactivityTimer);
-  });
-
-  resetInactivityTimer(); // start the timer immediately
+  // Analytics mode - no authentication events needed
 });
 
 
 
 onBeforeUnmount(() => {
-  if (inactivityTimer) clearTimeout(inactivityTimer);
-  const events = ["mousemove", "keydown", "mousedown", "touchstart"];
-  events.forEach((event) => {
-    window.removeEventListener(event, resetInactivityTimer);
-  });
-
-  window.removeEventListener("auth-login", refreshStatuses); 
+  // Analytics mode - no cleanup needed
 });
 </script>
 
