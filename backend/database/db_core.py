@@ -26,10 +26,16 @@ from sqlalchemy.orm import sessionmaker
 logger = logging.getLogger(__name__)
 
 # ────────────────────────────── config ──────────────────────────────
-DATABASE_URL = os.getenv(
-    "DATABASE_URL_DOCKER",
-    "postgresql+psycopg2://postgres:postgres@db:5432/new_self_trading_db",
-)
+# Analytics always uses PostgreSQL - build URL from environment variables
+POSTGRES_USER = os.getenv("POSTGRES_USER", "postgres")
+POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "YUVAL142sabag")
+POSTGRES_DB = os.getenv("POSTGRES_DB", "selftrading_analytics_db")
+POSTGRES_HOST = os.getenv("POSTGRES_HOST", "db")
+POSTGRES_PORT = os.getenv("POSTGRES_PORT", "5432")
+
+DATABASE_URL = f"postgresql+psycopg2://{POSTGRES_USER}:{POSTGRES_PASSWORD}@{POSTGRES_HOST}:{POSTGRES_PORT}/{POSTGRES_DB}"
+
+logger.info(f"Using PostgreSQL database: {POSTGRES_USER}@{POSTGRES_HOST}:{POSTGRES_PORT}/{POSTGRES_DB}")
 
 _POOL_SIZE = int(os.getenv("DB_POOL_SIZE", "5"))
 _MAX_OVERFLOW = int(os.getenv("DB_MAX_OVERFLOW", "10"))
@@ -128,17 +134,23 @@ def _create_engine() -> Engine:
     """
     Build an Engine that:
       • pre‑pings every connection (drops dead ones immediately)
-      • enforces short statement timeouts so “stuck” transactions don’t sit forever
+      • enforces short statement timeouts so "stuck" transactions don't sit forever
       • uses TCP keepalives to detect half‑open sockets quickly
     """
-    connect_args = {
-        "options": "-c statement_timeout=60000",  # 60s
-        "keepalives": 1,
-        "keepalives_idle": 60,
-        "keepalives_interval": 10,
-        "keepalives_count": 5,
-        "connect_timeout": 10,
-    }
+    # Database-specific connection arguments
+    connect_args = {}
+    url = make_url(DATABASE_URL)
+    
+    if url.get_backend_name() == "postgresql":
+        connect_args = {
+            "options": "-c statement_timeout=60000",  # 60s
+            "keepalives": 1,
+            "keepalives_idle": 60,
+            "keepalives_interval": 10,
+            "keepalives_count": 5,
+            "connect_timeout": 10,
+        }
+    # SQLite doesn't need special connect_args
 
     eng = create_engine(
         DATABASE_URL,

@@ -11,10 +11,22 @@ from database.models import Base
 from sqlalchemy import inspect, text
 import os
 import logging
+from backend.logger_config import setup_logging as setup_analytics_logging
+
+
+def _configure_logging() -> None:
+    # Use shared analytics logger config (mirrors main app)
+    setup_analytics_logging()
+    # Ensure uvicorn/fastapi propagate into our configured root
+    for name in ["uvicorn", "uvicorn.error", "uvicorn.access", "fastapi"]:
+        lg = logging.getLogger(name)
+        lg.setLevel(logging.INFO)
+        lg.propagate = True
 
 @app.on_event("startup")
 async def _init_db() -> None:
     """Ensure all core tables exist before serving requests."""
+    _configure_logging()
     logger = logging.getLogger(__name__)
     try:
         # Safety check: only create tables if they don't exist

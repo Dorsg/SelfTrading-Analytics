@@ -99,7 +99,7 @@ services:
     restart: "no"
     env_file: .env
     environment:
-      DATABASE_URL_DOCKER: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+
       DB_ALLOW_AUTO_CREATE_DB: "true"
       DB_ALLOW_AUTO_CREATE_TABLES: "true"
     depends_on:
@@ -115,7 +115,7 @@ services:
     restart: "no"
     env_file: .env
     environment:
-      DATABASE_URL_DOCKER: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+
       ANALYTICS_SQLITE_PATH: /app/tools/finnhub_downloader/data/daily_bars.sqlite
     volumes:
       - ./logs:/app/logs
@@ -145,9 +145,9 @@ services:
       - ./logs:/app/logs
       - .:/app  # Mount source code for development
     environment:
-      DATABASE_URL_DOCKER: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+
       RUNNING_ENV: development
-      ANALYTICS_MODE: "true"
+
       DB_ALLOW_AUTO_CREATE_DB: "false"
       DB_ALLOW_AUTO_CREATE_TABLES: "false"
     depends_on:
@@ -187,9 +187,9 @@ services:
       import-historical-bars:
         condition: service_completed_successfully
     environment:
-      DATABASE_URL_DOCKER: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+
       RUNNING_ENV: development
-      ANALYTICS_MODE: "true"
+
 
       DB_ALLOW_AUTO_CREATE_DB: "false"
       DB_ALLOW_AUTO_CREATE_TABLES: "false"

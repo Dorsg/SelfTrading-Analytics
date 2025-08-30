@@ -1,16 +1,278 @@
 from __future__ import annotations
 from fastapi import APIRouter, Query, HTTPException
 from typing import Optional
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from sqlalchemy import select, func, desc, text
 import os
 import sqlite3
+import logging
 
 from database.db_core import engine
 from database.db_manager import DBManager
-from database.models import RunnerExecution, AnalyticsResult, HistoricalDailyBar, HistoricalMinuteBar, SimulationState
+from database.models import RunnerExecution, AnalyticsResult, HistoricalDailyBar, HistoricalMinuteBar, SimulationState, ExecutedTrade, Runner
 
 router = APIRouter(prefix="/analytics", tags=["analytics"])
+@router.get("/debug/database-test")
+async def test_database_connection() -> dict:
+    """Test database connection and data availability."""
+    logger = logging.getLogger("api-gateway")
+    
+    try:
+        with engine.connect() as conn:
+            logger.info("✅ Database connection successful")
+            
+            # Check if tables exist
+            tables_exist = {}
+            for table_name in ['historical_minute_bars', 'historical_daily_bars', 'users', 'runners']:
+                try:
+                    result = conn.execute(text(f"SELECT COUNT(*) FROM {table_name}")).scalar()
+                    tables_exist[table_name] = result
+                    logger.info(f"📊 Table {table_name}: {result} rows")
+                except Exception as e:
+                    tables_exist[table_name] = f"ERROR: {str(e)}"
+                    logger.error(f"❌ Table {table_name} error: {e}")
+            
+            # Check available intervals in minute bars
+            intervals = {}
+            try:
+                interval_results = conn.execute(text("""
+                    SELECT interval_min, COUNT(*) 
+                    FROM historical_minute_bars 
+                    GROUP BY interval_min 
+                    ORDER BY interval_min
+                """)).all()
+                intervals = dict(interval_results)
+                logger.info(f"📈 Available intervals: {intervals}")
+            except Exception as e:
+                intervals = f"ERROR: {str(e)}"
+                logger.error(f"❌ Intervals query error: {e}")
+            
+            # Sample symbols for 5min data
+            sample_symbols = []
+            try:
+                symbol_results = conn.execute(text("""
+                    SELECT DISTINCT symbol 
+                    FROM historical_minute_bars 
+                    WHERE interval_min = 5 
+                    LIMIT 10
+                """)).all()
+                sample_symbols = [r[0] for r in symbol_results]
+                logger.info(f"🏢 Sample 5min symbols: {sample_symbols}")
+            except Exception as e:
+                sample_symbols = f"ERROR: {str(e)}"
+                logger.error(f"❌ Sample symbols error: {e}")
+            
+            return {
+                "success": True,
+                "database_connected": True,
+                "tables": tables_exist,
+                "intervals": intervals,
+                "sample_symbols": sample_symbols
+            }
+            
+    except Exception as e:
+        logger.error(f"❌ Database connection failed: {e}")
+        return {
+            "success": False,
+            "database_connected": False,
+            "error": str(e)
+        }
+
+@router.get("/debug/comprehensive-test")
+async def comprehensive_system_test() -> dict:
+    """Comprehensive test of the entire system flow."""
+    logger = logging.getLogger("api-gateway")
+    
+    results = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "tests": {}
+    }
+    
+    # Test 1: Database connection and data
+    try:
+        with engine.connect() as conn:
+            minute_count = conn.execute(select(func.count()).select_from(HistoricalMinuteBar)).scalar() or 0
+            daily_count = conn.execute(select(func.count()).select_from(HistoricalDailyBar)).scalar() or 0
+            
+            results["tests"]["database"] = {
+                "connected": True,
+                "minute_bars": minute_count,
+                "daily_bars": daily_count,
+                "has_data": minute_count > 0 and daily_count > 0
+            }
+            
+            if minute_count > 0:
+                earliest = conn.execute(select(func.min(HistoricalMinuteBar.ts))).scalar()
+                latest = conn.execute(select(func.max(HistoricalMinuteBar.ts))).scalar()
+                
+                results["tests"]["data_range"] = {
+                    "earliest": earliest.isoformat() if earliest else None,
+                    "latest": latest.isoformat() if latest else None,
+                    "earliest_readable": earliest.strftime("%Y-%m-%d %H:%M:%S UTC") if earliest else None,
+                    "latest_readable": latest.strftime("%Y-%m-%d %H:%M:%S UTC") if latest else None,
+                    "total_days": int((latest - earliest).days) if earliest and latest else 0
+                }
+                
+                # Check intervals
+                intervals = conn.execute(
+                    select(HistoricalMinuteBar.interval_min, func.count())
+                    .group_by(HistoricalMinuteBar.interval_min)
+                ).all()
+                results["tests"]["intervals"] = dict(intervals)
+                
+                # Sample symbols for 5min
+                symbols = conn.execute(
+                    select(HistoricalMinuteBar.symbol)
+                    .where(HistoricalMinuteBar.interval_min == 5)
+                    .distinct()
+                    .limit(5)
+                ).all()
+                results["tests"]["sample_symbols"] = [s[0] for s in symbols]
+            
+    except Exception as e:
+        results["tests"]["database"] = {"connected": False, "error": str(e)}
+    
+    # Test 2: Simulation time
+    sim_ts = os.getenv("SIM_TIME_EPOCH")
+    if sim_ts:
+        try:
+            sim_dt = datetime.fromtimestamp(int(sim_ts), tz=timezone.utc)
+            results["tests"]["simulation_time"] = {
+                "set": True,
+                "timestamp": int(sim_ts),
+                "datetime": sim_dt.isoformat(),
+                "readable": sim_dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+            }
+        except Exception as e:
+            results["tests"]["simulation_time"] = {"set": True, "error": str(e)}
+    else:
+        results["tests"]["simulation_time"] = {"set": False}
+    
+    # Test 3: MarketDataManager query
+    try:
+        from backend.ib_manager.market_data_manager import MarketDataManager
+        mkt = MarketDataManager()
+        
+        test_symbol = "AAPL"
+        candles = await mkt._get_candles(test_symbol, "5", 10)
+        
+        results["tests"]["market_data"] = {
+            "symbol": test_symbol,
+            "candles_returned": len(candles),
+            "sample_candles": candles[:2] if candles else [],
+            "success": len(candles) > 0
+        }
+    except Exception as e:
+        results["tests"]["market_data"] = {"error": str(e), "success": False}
+    
+    return results
+
+@router.get("/debug/test-candles")
+async def test_candles_query(symbol: str = "AAPL", timeframe: str = "5") -> dict:
+    """Test endpoint to verify candle data query works."""
+    from backend.ib_manager.market_data_manager import MarketDataManager
+    from sqlalchemy import text
+    
+    try:
+        # First check what's actually in the database
+        with engine.connect() as conn:
+            # Check if tables exist
+            tables_check = conn.execute(text("""
+                SELECT table_name FROM information_schema.tables 
+                WHERE table_schema = 'public' AND table_name LIKE 'historical%'
+            """)).fetchall()
+            
+            # Check minute bars count and sample
+            minute_count = conn.execute(select(func.count()).select_from(HistoricalMinuteBar)).scalar() or 0
+            
+            # Check what symbols exist
+            symbols_sample = []
+            if minute_count > 0:
+                symbols_sample = [r[0] for r in conn.execute(
+                    select(HistoricalMinuteBar.symbol).distinct().limit(10)
+                ).fetchall()]
+            
+            # Check what intervals exist
+            intervals_sample = []
+            if minute_count > 0:
+                intervals_sample = [r[0] for r in conn.execute(
+                    select(HistoricalMinuteBar.interval_min).distinct()
+                ).fetchall()]
+            
+            # Check specific symbol data
+            symbol_data = []
+            if minute_count > 0:
+                symbol_data = conn.execute(
+                    select(HistoricalMinuteBar.symbol, HistoricalMinuteBar.interval_min, func.count())
+                    .where(HistoricalMinuteBar.symbol == symbol.upper())
+                    .group_by(HistoricalMinuteBar.symbol, HistoricalMinuteBar.interval_min)
+                ).fetchall()
+        
+        # Now test the MarketDataManager
+        mkt = MarketDataManager()
+        candles = await mkt._get_candles(symbol, timeframe, 10)
+        
+        return {
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "candles_found": len(candles),
+            "sample_candles": candles[:3] if candles else [],
+            "database_info": {
+                "tables": [t[0] for t in tables_check],
+                "minute_bars_count": minute_count,
+                "symbols_sample": symbols_sample,
+                "intervals_available": intervals_sample,
+                "symbol_specific_data": [{"symbol": r[0], "interval": r[1], "count": r[2]} for r in symbol_data]
+            },
+            "success": True
+        }
+    except Exception as e:
+        import traceback
+        return {
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "error": str(e),
+            "traceback": traceback.format_exc(),
+            "success": False
+        }
+
+@router.get("/strategies/compare")
+def compare_strategies() -> dict:
+    """Compare strategy names available in analytics vs main app.
+    Assumes both projects exist under /root/projects.
+    Returns simple lists to manually verify parity.
+    """
+    import os, glob
+    def list_strategy_names(root: str) -> list[str]:
+        paths = glob.glob(os.path.join(root, "backend/strategies/*_strategy.py"))
+        names = []
+        for p in paths:
+            base = os.path.basename(p)
+            if base.endswith("_strategy.py"):
+                names.append(base[:-3])  # file name without .py
+        return sorted(names)
+
+    analytics_root = "/root/projects/SelfTrading Analytics"
+    main_root      = "/root/projects/SelfTrading"
+    try:
+        analytics = list_strategy_names(analytics_root)
+    except Exception:
+        analytics = []
+    try:
+        main = list_strategy_names(main_root)
+    except Exception:
+        main = []
+
+    only_in_main = sorted([n for n in main if n not in analytics])
+    only_in_analytics = sorted([n for n in analytics if n not in main])
+
+    return {
+        "analytics": analytics,
+        "main": main,
+        "only_in_main": only_in_main,
+        "only_in_analytics": only_in_analytics,
+        "parity": len(only_in_main) == 0 and len(only_in_analytics) == 0,
+    }
 
 
 def _bootstrap_runners_simple(db: DBManager, user) -> int:
@@ -18,7 +280,7 @@ def _bootstrap_runners_simple(db: DBManager, user) -> int:
     import os
     import logging
     
-    logger = logging.getLogger(__name__)
+    logger = logging.getLogger("api-gateway")
     
     # Simple strategy list
     strategies = ["test", "triple_top_break", "below_above"]
@@ -94,9 +356,16 @@ def _now_sim() -> Optional[int]:
 @router.get("/progress")
 def get_progress() -> dict:
     """
-    Overall simulation progress based on SIM_TIME_EPOCH vs earliest/latest bars.
-    Returns ticks processed and total ticks for both 5m and 1d.
+    Overall simulation progress based on current sim-time vs earliest/latest bars.
+    DB-agnostic (works on Postgres/SQLite). Also returns last/current runner info
+    and a realistic ETA using the auto-advance pace if available.
     """
+    from sqlalchemy import select, func, desc
+    from datetime import datetime, timezone, timedelta
+    import json
+    import os
+
+    # ── 0) Data range (for % complete)
     with engine.connect() as conn:
         start_min = conn.execute(select(func.min(HistoricalMinuteBar.ts))).scalar()
         end_min   = conn.execute(select(func.max(HistoricalMinuteBar.ts))).scalar()
@@ -105,6 +374,18 @@ def get_progress() -> dict:
 
     sim_ts = _now_sim() or 0
     sim_dt = datetime.fromtimestamp(sim_ts, tz=timezone.utc) if sim_ts else None
+    
+    # Enhanced logging for debugging
+    logger = logging.getLogger("api-gateway")
+    logger.info(f"📊 Progress Check - Sim time: {sim_dt} (ts: {sim_ts})")
+    logger.info(f"📅 Data range: {start_min} to {end_min}")
+    if start_min and end_min and sim_dt:
+        if sim_dt < start_min:
+            logger.warning(f"⚠️ Simulation time ({sim_dt}) is BEFORE data start ({start_min})")
+        elif sim_dt > end_min:
+            logger.warning(f"⚠️ Simulation time ({sim_dt}) is AFTER data end ({end_min})")
+        else:
+            logger.info(f"✅ Simulation time is within data range")
 
     def _ticks(start: Optional[datetime], end: Optional[datetime], step_seconds: int) -> tuple[int, int, float]:
         if not (start and end):
@@ -114,47 +395,121 @@ def get_progress() -> dict:
         pct   = (cur / total * 100.0) if total > 0 else 0.0
         return (cur, total, round(pct, 2))
 
-    cur5, tot5, pct5 = _ticks(start_min, end_min, 300)
-    cur1d, tot1d, pct1d = _ticks(start_day, end_day, 86400)
+    cur5, tot5, pct5     = _ticks(start_min, end_min, 300)
+    cur1d, tot1d, pct1d  = _ticks(start_day, end_day, 86400)
 
-    # Get current simulation state
+    # ── 1) Simulation state
     with DBManager() as db:
         user = db.get_user_by_username("analytics")
-        st = None
+        st = db.db.query(SimulationState).filter(SimulationState.user_id == user.id).first() if user else None
+
+        # ── 2) Execution stats (last 24h), DB-agnostic (compute in Python)
+        cutoff = datetime.now(timezone.utc) - timedelta(days=1)
+        statuses: list[str] = []
         if user:
-            st = db.db.query(SimulationState).filter(SimulationState.user_id == user.id).first()
-        
-        # Get runner execution stats
+            rows = (
+                db.db.query(RunnerExecution.status, RunnerExecution.execution_time)
+                .filter(RunnerExecution.execution_time >= cutoff)
+                .all()
+            )
+            statuses = [r[0] for r in rows if r and r[0] is not None]
+
+        total_exec   = len(statuses)
+        completed    = sum(1 for s in statuses if s == "completed")
+        errors       = sum(1 for s in statuses if s in {"error", "failed"})
+        skipped      = sum(1 for s in statuses if str(s).startswith("skipped"))
+
+        # All-time counters
+        executions_all_time = 0
+        trades_all_time = 0
         try:
-            runner_stats = db.db.execute(text("""
-                SELECT 
-                    COUNT(*) as total_executions,
-                    COUNT(CASE WHEN status = 'completed' THEN 1 END) as completed_executions,
-                    COUNT(CASE WHEN status = 'error' THEN 1 END) as error_executions,
-                    COUNT(CASE WHEN status = 'skipped_build_failed' THEN 1 END) as skipped_executions
-                FROM runner_executions 
-                WHERE execution_time > (NOW() - INTERVAL '1 day')
-            """)).fetchone()
+            executions_all_time = db.db.query(func.count(RunnerExecution.id)).scalar() or 0
         except Exception:
-            # Fallback if query fails
-            runner_stats = (0, 0, 0, 0)
-            
-        # Get current runner info
+            executions_all_time = 0
+        try:
+            trades_all_time = db.db.query(func.count(ExecutedTrade.id)).scalar() or 0
+        except Exception:
+            trades_all_time = 0
+
+        # Fallback to analytics_results when runner_executions isn't populated
+        if total_exec == 0:
+            try:
+                completed_from_results = (
+                    db.db.query(AnalyticsResult)
+                    .filter(AnalyticsResult.end_ts != None, AnalyticsResult.end_ts >= cutoff)
+                    .count()
+                )
+            except Exception:
+                completed_from_results = 0
+            if completed_from_results > 0:
+                total_exec = completed_from_results
+                completed  = completed_from_results
+
+        # ── 3) Current/last runner info (prefer runner_executions, else analytics_results)
         current_runner_info = None
-        try:
-            # Get most recent runner execution
-            recent_execution = db.db.execute(text("""
-                SELECT symbol, strategy, status, execution_time 
-                FROM runner_executions 
-                ORDER BY execution_time DESC 
-                LIMIT 1
-            """)).fetchone()
-            
-            if recent_execution:
-                current_runner_info = f"{recent_execution[0]} - {recent_execution[1]} ({recent_execution[2]})"
-                
-        except Exception:
-            pass
+        current_struct = None
+        if user:
+            try:
+                re = (
+                    db.db.query(
+                        RunnerExecution.symbol,
+                        RunnerExecution.strategy,
+                        RunnerExecution.status,
+                        Runner.time_frame,
+                    )
+                    .join(Runner, Runner.id == RunnerExecution.runner_id)
+                    .order_by(RunnerExecution.execution_time.desc())
+                    .first()
+                )
+                if re:
+                    tf_val = str(re[3] or "").lower()
+                    tf = "1d" if tf_val in {"d", "1day", "1440"} else ("5m" if tf_val in {"5", "5min", "5m"} else tf_val)
+                    current_runner_info = f"{re[0]} - {re[1]} ({re[2]})"
+                    current_struct = {
+                        "symbol": re[0],
+                        "strategy": re[1],
+                        "status": re[2],
+                        "timeframe": tf,
+                    }
+                else:
+                    ar = (
+                        db.db.query(AnalyticsResult.symbol, AnalyticsResult.strategy, AnalyticsResult.timeframe)
+                        .order_by(AnalyticsResult.end_ts.desc())
+                        .first()
+                    )
+                    if ar:
+                        current_runner_info = f"{ar[0]} - {ar[1]} ({ar[2]})"
+                        current_struct = {
+                            "symbol": ar[0],
+                            "strategy": ar[1],
+                            "status": "completed",
+                            "timeframe": ar[2],
+                        }
+            except Exception:
+                pass
+
+    # ── 4) ETA (use /tmp/sim_auto_advance.json pace if available; else assume ~2 ticks/sec)
+    estimated_finish = None
+    try:
+        pace_seconds = None
+        step_seconds = int(os.getenv("SIM_STEP_SECONDS", "300"))
+        flag_path = "/tmp/sim_auto_advance.json"
+        if os.path.exists(flag_path):
+            with open(flag_path, "r") as f:
+                data = json.load(f)
+                pace_seconds = float(data.get("pace_seconds", 0)) or None
+        # ticks/sec: if pace_seconds is 0/None => default to ~2 (matches UI timer of 500ms)
+        ticks_per_sec = (1.0 / pace_seconds) if (pace_seconds and pace_seconds > 0) else 2.0
+
+        if sim_dt and end_min and st and st.is_running == "true":
+            remaining_sim_seconds = max(0.0, (end_min - sim_dt).total_seconds())
+            sim_seconds_per_real_second = ticks_per_sec * float(step_seconds)
+            if sim_seconds_per_real_second > 0:
+                eta_real_seconds = remaining_sim_seconds / sim_seconds_per_real_second
+                estimated_finish_dt = datetime.now(tz=timezone.utc) + timedelta(seconds=eta_real_seconds)
+                estimated_finish = estimated_finish_dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+    except Exception:
+        estimated_finish = None
 
     return {
         "sim_time_epoch": sim_ts,
@@ -162,18 +517,48 @@ def get_progress() -> dict:
         "sim_time_readable": sim_dt.strftime("%Y-%m-%d %H:%M:%S") if sim_dt else "Not started",
         "simulation_running": (st.is_running == "true") if st else False,
         "last_sim_ts": st.last_ts.isoformat() if st and st.last_ts else None,
+
         "current_runner_info": current_runner_info,
+        "current": current_struct,
+        "estimated_finish": estimated_finish,
+
         "timeframes": {
             "5m":  {"ticks_done": cur5,  "ticks_total": tot5,  "percent": pct5},
             "1d":  {"ticks_done": cur1d, "ticks_total": tot1d, "percent": pct1d},
         },
         "execution_stats": {
-            "total_executions": runner_stats[0] if runner_stats else 0,
-            "completed_executions": runner_stats[1] if runner_stats else 0,
-            "error_executions": runner_stats[2] if runner_stats else 0,
-            "skipped_executions": runner_stats[3] if runner_stats else 0,
+            "total_executions": total_exec,
+            "completed_executions": completed,
+            "error_executions": errors,
+            "skipped_executions": skipped,
+        },
+        "counters": {
+            "executions_all_time": int(executions_all_time),
+            "trades_all_time": int(trades_all_time),
+        },
+        # Enhanced debugging and status information
+        "data_range": {
+            "start": start_min.isoformat() if start_min else None,
+            "end": end_min.isoformat() if end_min else None,
+            "start_readable": start_min.strftime("%Y-%m-%d %H:%M:%S UTC") if start_min else None,
+            "end_readable": end_min.strftime("%Y-%m-%d %H:%M:%S UTC") if end_min else None,
+            "total_days": int((end_min - start_min).days) if start_min and end_min else 0,
+        },
+        "simulation_status": {
+            "time_position": "before_data" if sim_dt and start_min and sim_dt < start_min else
+                           "after_data" if sim_dt and end_min and sim_dt > end_min else
+                           "within_range" if sim_dt and start_min and end_min else "no_time_set",
+            "days_simulated": int((sim_dt - start_min).days) if sim_dt and start_min else 0,
+            "days_remaining": int((end_min - sim_dt).days) if sim_dt and end_min else 0,
+        },
+        "debug_info": {
+            "sim_timestamp": sim_ts,
+            "has_simulation_state": st is not None,
+            "simulation_state_running": st.is_running if st else None,
+            "env_sim_time": os.getenv("SIM_TIME_EPOCH"),
         }
     }
+
 
 
 @router.get("/errors")
@@ -204,64 +589,78 @@ def list_errors(limit: int = Query(100, ge=1, le=1000)) -> list[dict]:
 @router.get("/logs/plain")
 def get_plain_logs(
     hours_back: int = Query(24, ge=1, le=168),
-    log_level: str = Query("INFO", regex="^(DEBUG|INFO|WARNING|ERROR)$"),
+    log_level: str = Query("ERROR", regex="^(DEBUG|INFO|WARNING|ERROR)$"),
 ) -> dict:
-    """Get plain text logs for errors and warnings."""
-    import os
-    import glob
-    from datetime import datetime, timedelta
-    
-    # Get all log files
-    log_dir = "/app/logs"
+    """
+    Parse *.log files and return ONLY the requested severities.
+    No synthetic INFO entries are injected anymore.
+    If no matches are found, return an empty list.
+    """
+    import os, glob
+    from datetime import datetime, timedelta, timezone
+
+    cutoff_time = datetime.now(timezone.utc) - timedelta(hours=hours_back)
+    want = log_level.upper()
+    allowed_levels = {"DEBUG", "INFO", "WARNING", "ERROR"}
+    if want not in allowed_levels:
+        want = "ERROR"
+
+    log_dirs = ["/app/logs", "/root/projects/SelfTrading Analytics/logs"]
     log_files = []
-    
-    if os.path.exists(log_dir):
-        log_files = glob.glob(os.path.join(log_dir, "*.log"))
-    
-    # If no logs in container, try host paths
-    if not log_files:
-        host_log_dir = "/root/projects/SelfTrading Analytics/logs"
-        if os.path.exists(host_log_dir):
-            log_files = glob.glob(os.path.join(host_log_dir, "*.log"))
-    
-    cutoff_time = datetime.now() - timedelta(hours=hours_back)
-    log_entries = []
-    
-    for log_file in log_files:
+    for d in log_dirs:
+        if os.path.exists(d):
+            log_files.extend(glob.glob(os.path.join(d, "*.log")))
+
+    entries = []
+
+    def _accept(line_upper: str) -> bool:
+        if want == "ERROR":
+            return "ERROR" in line_upper or "EXCEPTION" in line_upper or "TRACEBACK" in line_upper or "FAILED" in line_upper
+        if want == "WARNING":
+            return "WARNING" in line_upper
+        if want == "INFO":
+            # Include INFO but not noise from DEBUG
+            return "INFO" in line_upper and "DEBUG" not in line_upper
+        return "DEBUG" in line_upper
+
+    for path in log_files:
         try:
-            with open(log_file, 'r') as f:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
                 for line in f:
-                    # Parse log line format: [timestamp] LEVEL module: message
-                    if '[' in line and ']' in line:
-                        try:
-                            # Extract timestamp and level
-                            timestamp_str = line[1:line.find(']')]
-                            timestamp = datetime.strptime(timestamp_str, '%Y-%m-%d %H:%M:%S,%f')
-                            
-                            if timestamp >= cutoff_time:
-                                # Check if line contains the specified log level
-                                if log_level in line:
-                                    log_entries.append({
-                                        "timestamp": timestamp.isoformat(),
-                                        "level": log_level,
-                                        "file": os.path.basename(log_file),
-                                        "message": line.strip()
-                                    })
-                        except ValueError:
-                            # Skip lines that don't match expected format
+                    if "[" not in line or "]" not in line:
+                        continue
+                    # Expect format: [YYYY-mm-dd HH:MM:SS,ms] LEVEL NAME: msg
+                    try:
+                        ts_str = line[1:line.find("]")]
+                        ts = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S,%f")
+                        # stored without tz in file; compare in naive
+                        if ts < cutoff_time.replace(tzinfo=None):
                             continue
-        except Exception as e:
+                    except Exception:
+                        continue
+
+                    up = line.upper()
+                    if _accept(up):
+                        lvl = "ERROR" if "ERROR" in up or "EXCEPTION" in up or "TRACEBACK" in up or "FAILED" in up else (
+                            "WARNING" if "WARNING" in up else ("INFO" if "INFO" in up else "DEBUG")
+                        )
+                        entries.append({
+                            "timestamp": ts.isoformat(),
+                            "level": lvl,
+                            "file": os.path.basename(path),
+                            "message": line.strip()
+                        })
+        except Exception:
             continue
-    
-    # Sort by timestamp (newest first)
-    log_entries.sort(key=lambda x: x["timestamp"], reverse=True)
-    
+
+    # Sort newest first, cap to 1000
+    entries.sort(key=lambda x: x["timestamp"], reverse=True)
     return {
-        "log_entries": log_entries[:1000],  # Limit to 1000 entries
-        "total_entries": len(log_entries),
+        "log_entries": entries[:1000],
+        "total_entries": len(entries),
         "hours_back": hours_back,
-        "log_level": log_level,
-        "files_searched": [os.path.basename(f) for f in log_files]
+        "log_level": want,
+        "files_searched": [os.path.basename(f) for f in log_files] if log_files else [],
     }
 
 
@@ -308,8 +707,8 @@ def get_monthly_summary() -> dict:
         try:
             monthly_stats = db.db.execute(text("""
                 SELECT 
-                    EXTRACT(YEAR FROM end_ts) as year,
-                    EXTRACT(MONTH FROM end_ts) as month,
+                    CAST(strftime('%Y', end_ts) AS INT) as year,
+                    CAST(strftime('%m', end_ts) AS INT) as month,
                     COUNT(*) as result_count,
                     AVG(final_pnl_amount) as avg_pnl_amount,
                     AVG(final_pnl_percent) as avg_pnl_percent,
@@ -317,11 +716,28 @@ def get_monthly_summary() -> dict:
                     SUM(trades_count) as total_trades
                 FROM analytics_results 
                 WHERE end_ts IS NOT NULL
-                GROUP BY EXTRACT(YEAR FROM end_ts), EXTRACT(MONTH FROM end_ts)
+                GROUP BY CAST(strftime('%Y', end_ts) AS INT), CAST(strftime('%m', end_ts) AS INT)
                 ORDER BY year DESC, month DESC
             """)).fetchall()
         except Exception:
-            monthly_stats = []
+            # Fallback for Postgres
+            try:
+                monthly_stats = db.db.execute(text("""
+                    SELECT 
+                        EXTRACT(YEAR FROM end_ts) as year,
+                        EXTRACT(MONTH FROM end_ts) as month,
+                        COUNT(*) as result_count,
+                        AVG(final_pnl_amount) as avg_pnl_amount,
+                        AVG(final_pnl_percent) as avg_pnl_percent,
+                        SUM(final_pnl_amount) as total_pnl_amount,
+                        SUM(trades_count) as total_trades
+                    FROM analytics_results 
+                    WHERE end_ts IS NOT NULL
+                    GROUP BY EXTRACT(YEAR FROM end_ts), EXTRACT(MONTH FROM end_ts)
+                    ORDER BY year DESC, month DESC
+                """)).fetchall()
+            except Exception:
+                monthly_stats = []
         
         # Group by year
         yearly_data = {}
@@ -350,7 +766,7 @@ def get_monthly_summary() -> dict:
 def test_bootstrap() -> dict:
     """Test endpoint to bootstrap runners manually."""
     import logging
-    logger = logging.getLogger(__name__)
+    logger = logging.getLogger("api-gateway")
     
     try:
         with DBManager() as db:
@@ -372,13 +788,13 @@ def test_bootstrap() -> dict:
 
 
 @router.post("/simulation/force-tick")
-def force_simulation_tick(fast: bool = False) -> dict:
+async def force_simulation_tick(fast: bool = False) -> dict:
     """Force one simulation tick manually."""
     import os
     import logging
     import asyncio
     
-    logger = logging.getLogger(__name__)
+    logger = logging.getLogger("api-gateway")
     
     try:
         # Get current simulation state
@@ -409,7 +825,17 @@ def force_simulation_tick(fast: bool = False) -> dict:
             db.db.commit()
             
             if fast:
-                # Fast mode: just advance time, minimal processing
+                # Fast mode: advance time and run strategies but skip heavy result processing
+                try:
+                    from backend.analytics.mock_broker import MockBusinessManager
+                    from backend.runner_service import run_due_runners
+                    
+                    bm = MockBusinessManager(user)
+                    await run_due_runners(user, None, bm)
+                    
+                except Exception as e:
+                    logger.debug(f"Fast tick runner execution failed: {e}")
+                
                 return {
                     "success": True,
                     "new_time": new_ts,
@@ -421,45 +847,41 @@ def force_simulation_tick(fast: bool = False) -> dict:
                 from backend.analytics.mock_broker import MockBusinessManager
                 from backend.runner_service import run_due_runners
                 
-                async def _run_tick():
-                    bm = MockBusinessManager(user)
-                    await run_due_runners(user, None, bm)
-                    
-                    # Process results for runners (every 10th tick only for performance)
-                    if new_ts % (step_seconds * 10) == 0:
-                        from backend.analytics.pnl_aggregator import compute_final_pnl_for_runner
-                        from backend.analytics.result_writer import upsert_result
-                        
-                        runners = db.get_runners_by_user(user_id=user.id)
-                        results_written = 0
-                        
-                        for r in runners[:10]:  # Process only first 10 runners for speed
-                            try:
-                                amt, pct, trades, avg_pnl, avg_dur = compute_final_pnl_for_runner(runner_id=r.id)
-                                if trades > 0:
-                                    tf = str(r.time_frame or "").lower()
-                                    tf = "1d" if tf in {"d", "1day", "1440"} else ("5m" if tf in {"5", "5min"} else str(tf))
-                                    upsert_result(
-                                        symbol=r.stock,
-                                        strategy=str(r.strategy),
-                                        timeframe=tf,
-                                        start_ts=r.time_range_from,
-                                        end_ts=new_dt,
-                                        final_pnl_amount=amt,
-                                        final_pnl_percent=pct,
-                                        trades_count=trades,
-                                        max_drawdown=None,
-                                        avg_pnl_per_trade=avg_pnl,
-                                        avg_trade_duration_sec=avg_dur,
-                                    )
-                                    results_written += 1
-                            except Exception:
-                                continue
-                        
-                        return results_written
-                    return 0
+                bm = MockBusinessManager(user)
+                await run_due_runners(user, None, bm)
                 
-                results_count = asyncio.run(_run_tick())
+                # Process results for runners on every tick (write when trades exist)
+                results_written = 0
+                try:
+                    from backend.analytics.pnl_aggregator import compute_final_pnl_for_runner
+                    from backend.analytics.result_writer import upsert_result
+                    runners = db.get_runners_by_user(user_id=user.id)
+                    for r in runners:
+                        try:
+                            amt, pct, trades, avg_pnl, avg_dur = compute_final_pnl_for_runner(runner_id=r.id)
+                            if trades and trades > 0:
+                                tf = str(r.time_frame or "").lower()
+                                tf = "1d" if tf in {"d", "1day", "1440"} else ("5m" if tf in {"5", "5min", "5m"} else str(tf))
+                                upsert_result(
+                                    symbol=r.stock,
+                                    strategy=str(r.strategy),
+                                    timeframe=tf,
+                                    start_ts=r.time_range_from,
+                                    end_ts=new_dt,
+                                    final_pnl_amount=amt,
+                                    final_pnl_percent=pct,
+                                    trades_count=trades,
+                                    max_drawdown=None,
+                                    avg_pnl_per_trade=avg_pnl,
+                                    avg_trade_duration_sec=avg_dur,
+                                )
+                                results_written += 1
+                        except Exception:
+                            continue
+                except Exception:
+                    results_written = 0
+                
+                results_count = results_written
                 
                 return {
                     "success": True,
@@ -549,73 +971,117 @@ def get_partial_results(
     limit: int = Query(50, ge=1, le=500),
     days_back: int = Query(7, ge=1, le=365),
 ) -> dict:
-    """Get partial results for development - shows recent results and progress."""
+    """Recent partial results + execution stats; DB-agnostic and safe when stopped."""
+    from datetime import datetime, timezone, timedelta
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days_back)
+
     with DBManager() as db:
-        # Get recent results
+        # Recent results (safe ORM)
         try:
-            recent_results = db.db.execute(text(f"""
-                SELECT 
-                    symbol, strategy, timeframe, 
-                    final_pnl_amount, final_pnl_percent, trades_count,
-                    end_ts,
-                    EXTRACT(EPOCH FROM (end_ts - start_ts))/86400 as days_duration
-                FROM analytics_results 
-                WHERE end_ts > (NOW() - INTERVAL '{days_back} days')
-                ORDER BY end_ts DESC
-                LIMIT {limit}
-            """)).fetchall()
+            recents = (
+                db.db.query(
+                    AnalyticsResult.symbol,
+                    AnalyticsResult.strategy,
+                    AnalyticsResult.timeframe,
+                    AnalyticsResult.final_pnl_amount,
+                    AnalyticsResult.final_pnl_percent,
+                    AnalyticsResult.trades_count,
+                    AnalyticsResult.end_ts,
+                    AnalyticsResult.start_ts,
+                )
+                .filter(AnalyticsResult.end_ts != None, AnalyticsResult.end_ts >= cutoff)
+                .order_by(desc(AnalyticsResult.end_ts))
+                .limit(limit)
+                .all()
+            )
         except Exception:
-            recent_results = []
-        
-        # Get execution stats for the same period
+            recents = []
+
+        recent_results = []
+        for r in recents:
+            end_ts = r[6]
+            start_ts = r[7]
+            days_duration = 0.0
+            try:
+                if end_ts and start_ts:
+                    # Both columns are datetimes already
+                    days_duration = max(0.0, (end_ts - start_ts).total_seconds() / 86400.0)
+            except Exception:
+                days_duration = 0.0
+
+            recent_results.append({
+                "symbol": r[0],
+                "strategy": r[1],
+                "timeframe": r[2],
+                "final_pnl_amount": float(r[3]) if r[3] is not None else 0.0,
+                "final_pnl_percent": float(r[4]) if r[4] is not None else 0.0,
+                "trades_count": int(r[5]) if r[5] is not None else 0,
+                "end_ts": end_ts.isoformat() if end_ts else None,
+                "days_duration": round(days_duration, 3),
+            })
+
+        # Execution stats (safe ORM + Python)
         try:
-            execution_stats = db.db.execute(text(f"""
-                SELECT 
-                    COUNT(*) as total_executions,
-                    COUNT(CASE WHEN status = 'completed' THEN 1 END) as completed,
-                    COUNT(CASE WHEN status = 'error' THEN 1 END) as errors,
-                    COUNT(CASE WHEN status = 'skipped_build_failed' THEN 1 END) as skipped,
-                    AVG(EXTRACT(EPOCH FROM (execution_time - created_at))) as avg_execution_time_seconds
-                FROM runner_executions 
-                WHERE execution_time > (NOW() - INTERVAL '{days_back} days')
-            """)).fetchone()
+            exec_rows = (
+                db.db.query(
+                    RunnerExecution.status,
+                    RunnerExecution.execution_time,
+                    RunnerExecution.created_at,
+                )
+                .filter(RunnerExecution.execution_time >= cutoff)
+                .all()
+            )
         except Exception:
-            execution_stats = (0, 0, 0, 0, 0)
-        
-        # Get current simulation state
+            exec_rows = []
+
+        total = len(exec_rows)
+        completed = 0
+        errors = 0
+        skipped = 0
+        durations = []
+
+        for s, exec_time, created_at in exec_rows:
+            if s == "completed":
+                completed += 1
+            elif s in {"error", "failed"}:
+                errors += 1
+            elif str(s or "").startswith("skipped"):
+                skipped += 1
+            # average execution time (seconds)
+            try:
+                if exec_time and created_at:
+                    durations.append(max(0.0, (exec_time - created_at).total_seconds()))
+            except Exception:
+                pass
+
+        avg_exec_time = (sum(durations) / len(durations)) if durations else 0.0
+
+        # Sim state (safe)
         user = db.get_user_by_username("analytics")
-        sim_state = None
-        if user:
-            sim_state = db.db.query(SimulationState).filter(SimulationState.user_id == user.id).first()
-        
+        sim_state = db.db.query(SimulationState).filter(SimulationState.user_id == user.id).first() if user else None
+
         return {
-            "recent_results": [
-                {
-                    "symbol": r[0],
-                    "strategy": r[1],
-                    "timeframe": r[2],
-                    "final_pnl_amount": float(r[3]) if r[3] else 0.0,
-                    "final_pnl_percent": float(r[4]) if r[4] else 0.0,
-                    "trades_count": int(r[5]) if r[5] else 0,
-                    "end_ts": r[6].isoformat() if r[6] else None,
-                    "days_duration": float(r[7]) if r[7] else 0.0,
-                }
-                for r in recent_results
-            ],
+            "recent_results": recent_results,
             "execution_stats": {
-                "total_executions": execution_stats[0] if execution_stats else 0,
-                "completed": execution_stats[1] if execution_stats else 0,
-                "errors": execution_stats[2] if execution_stats else 0,
-                "skipped": execution_stats[3] if execution_stats else 0,
-                "avg_execution_time_seconds": float(execution_stats[4]) if execution_stats and execution_stats[4] else 0.0,
+                "total_executions": total,
+                "completed": completed,
+                "errors": errors,
+                "skipped": skipped,
+                "avg_execution_time_seconds": round(avg_exec_time, 3),
+            },
+            "counters": {
+                "executions_all_time": int(db.db.query(func.count(RunnerExecution.id)).scalar() or 0),
+                "trades_all_time": int(db.db.query(func.count(ExecutedTrade.id)).scalar() or 0),
             },
             "simulation_state": {
                 "running": (sim_state.is_running == "true") if sim_state else False,
                 "last_ts": sim_state.last_ts.isoformat() if sim_state and sim_state.last_ts else None,
             },
             "period_days": days_back,
-            "results_count": len(recent_results)
+            "results_count": len(recent_results),
         }
+
 
 
 @router.get("/summary")
@@ -629,12 +1095,16 @@ def get_summary() -> dict:
         errors     = db.db.execute(
             select(func.count(RunnerExecution.id)).where(RunnerExecution.status.in_(["error", "skipped_build_failed"]))
         ).scalar() or 0
+        execs_all  = db.db.query(func.count(RunnerExecution.id)).scalar() or 0
+        trades_all = db.db.query(func.count(ExecutedTrade.id)).scalar() or 0
     return {
         "symbols": int(syms),
         "strategies": int(strategies),
         "timeframes": int(timeframes),
         "results": int(results),
         "errors": int(errors),
+        "executions_all_time": int(execs_all),
+        "trades_all_time": int(trades_all),
     }
 
 
@@ -644,23 +1114,39 @@ def start_simulation() -> dict:
     import os
     import logging
     
-    logger = logging.getLogger(__name__)
+    logger = logging.getLogger("api-gateway")
     
-    # Initialize simulation time to earliest data point if not set
-    sim_ts = os.getenv("SIM_TIME_EPOCH")
-    if not sim_ts:
+    # Always initialize simulation time to earliest data point for clean start
+    logger.info("🚀 Initializing simulation time...")
+    
+    with engine.connect() as conn:
         # Get earliest timestamp from historical data
-        with engine.connect() as conn:
-            earliest_minute = conn.execute(select(func.min(HistoricalMinuteBar.ts))).scalar()
-            if earliest_minute:
-                sim_ts = str(int(earliest_minute.timestamp()))
-                os.environ["SIM_TIME_EPOCH"] = sim_ts
-                logger.info(f"Initialized SIM_TIME_EPOCH to earliest data: {sim_ts} ({earliest_minute})")
-            else:
-                # Fallback to a fixed date if no data
-                sim_ts = "1597392000"  # 2020-08-14
-                os.environ["SIM_TIME_EPOCH"] = sim_ts
-                logger.info(f"Fallback: Set SIM_TIME_EPOCH to {sim_ts}")
+        earliest_minute = conn.execute(select(func.min(HistoricalMinuteBar.ts))).scalar()
+        latest_minute = conn.execute(select(func.max(HistoricalMinuteBar.ts))).scalar()
+        
+        if earliest_minute and latest_minute:
+            sim_ts = str(int(earliest_minute.timestamp()))
+            os.environ["SIM_TIME_EPOCH"] = sim_ts
+            logger.info(f"📅 Data range: {earliest_minute} to {latest_minute}")
+            logger.info(f"🎯 Set SIM_TIME_EPOCH to earliest: {sim_ts} ({earliest_minute})")
+        else:
+            # Fallback to a fixed date if no data
+            sim_ts = "1577836800"  # 2020-01-01
+            os.environ["SIM_TIME_EPOCH"] = sim_ts
+            logger.warning(f"⚠️ No historical data found! Fallback: Set SIM_TIME_EPOCH to {sim_ts}")
+    
+    # Clear any existing simulation state to start fresh
+    try:
+        with DBManager() as db:
+            user = db.get_user_by_username("analytics")
+            if user:
+                st = db.db.query(SimulationState).filter(SimulationState.user_id == user.id).first()
+                if st:
+                    db.db.delete(st)
+                    db.db.commit()
+                    logger.info("🧹 Cleared existing simulation state for fresh start")
+    except Exception as e:
+        logger.warning(f"⚠️ Could not clear simulation state: {e}")
     
     val = datetime.fromtimestamp(int(sim_ts), tz=timezone.utc) if sim_ts else None
     
@@ -723,6 +1209,8 @@ def start_simulation() -> dict:
 
 @router.post("/simulation/stop")
 def stop_simulation() -> dict:
+    logger = logging.getLogger("api-gateway")
+    
     with DBManager() as db:
         user = db.get_user_by_username("analytics")
         if not user:
@@ -734,6 +1222,27 @@ def stop_simulation() -> dict:
         else:
             st.is_running = "false"
         db.db.commit()
+        
+        # Disable auto-advance flag file
+        import json
+        import os
+        flag_file = "/tmp/sim_auto_advance.json"
+        try:
+            if os.path.exists(flag_file):
+                with open(flag_file, 'w') as f:
+                    json.dump({
+                        'enabled': False,
+                        'last_update': datetime.now(tz=timezone.utc).isoformat(),
+                        'stopped_by': 'stop_simulation_api'
+                    }, f)
+                logger.info("Auto-advance disabled via stop simulation")
+            else:
+                # Create disabled flag file
+                with open(flag_file, 'w') as f:
+                    json.dump({'enabled': False}, f)
+        except Exception as e:
+            logger.warning(f"Failed to disable auto-advance: {e}")
+        
         return {"running": False}
 
 
@@ -759,8 +1268,10 @@ def get_database_status() -> dict:
     Check database readiness for analytics simulation.
     Returns status of database tables and data availability.
     """
-    with engine.connect() as conn:
-        try:
+    logger = logging.getLogger("api-gateway")
+    
+    try:
+        with engine.connect() as conn:
             # Check if tables exist and have data
             daily_count = conn.execute(select(func.count()).select_from(HistoricalDailyBar)).scalar() or 0
             minute_count = conn.execute(select(func.count()).select_from(HistoricalMinuteBar)).scalar() or 0
@@ -881,11 +1392,13 @@ def get_database_status() -> dict:
                 "status": "ready" if is_ready else ("importing" if not import_completed else ("setup_needed" if not has_setup else "waiting"))
             }
             
-        except Exception as e:
-            return {
-                "ready": False,
-                "error": str(e),
-                "status": "error"
-            }
+    except Exception as e:
+        logger.error(f"Database status check failed: {e}")
+        return {
+            "ready": False,
+            "error": str(e),
+            "status": "error",
+            "message": "Database connection failed. Check if PostgreSQL is running and accessible."
+        }
 
 

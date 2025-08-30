@@ -145,7 +145,7 @@ services:
     environment:
       DATABASE_URL_DOCKER: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
       RUNNING_ENV: production
-      ANALYTICS_MODE: "true"
+
       DB_ALLOW_AUTO_CREATE_DB: "false"
       DB_ALLOW_AUTO_CREATE_TABLES: "false"
     depends_on:
@@ -186,7 +186,7 @@ services:
     environment:
       DATABASE_URL_DOCKER: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
       RUNNING_ENV: production
-      ANALYTICS_MODE: "true"
+
 
       DB_ALLOW_AUTO_CREATE_DB: "false"
       DB_ALLOW_AUTO_CREATE_TABLES: "false"

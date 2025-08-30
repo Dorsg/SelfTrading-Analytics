@@ -27,7 +27,6 @@ MKT = MarketDataManager()
 log = logging.getLogger("runner-service")
 
 _MAX_PARALLEL = int(os.getenv("RUNNER_PARALLELISM", "8"))
-_SEM          = asyncio.Semaphore(_MAX_PARALLEL)
 
 COMMISSION_BUFFER_PCT       = float(os.getenv("COMMISSION_BUFFER_PCT", "0.001"))
 GLOBAL_SELL_LIMIT_WIGGLE    = float(os.getenv("GLOBAL_SELL_LIMIT_WIGGLE", "0.0005"))
@@ -44,8 +43,11 @@ async def run_due_runners(user: User, db_unused, ib: IBBusinessManager) -> None:
 
         log.info("tick user=%s actives=%d", user.username, len(actives))
 
+        # Create a semaphore bound to the CURRENT event loop (avoid cross-loop errors)
+        sem = asyncio.Semaphore(_MAX_PARALLEL)
+
         async def _wrap(r: Runner):
-            async with _SEM:
+            async with sem:
                 # Create separate DB connection per runner for thread safety
                 with DBManager() as db:
                     # Always use mock broker for analytics simulation

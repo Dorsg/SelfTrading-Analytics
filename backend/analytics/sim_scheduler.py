@@ -1,6 +1,8 @@
 from __future__ import annotations
 import asyncio
 import logging
+import sys
+from logging.handlers import RotatingFileHandler
 import os
 from datetime import datetime, timezone, timedelta
 from typing import Sequence
@@ -9,6 +11,7 @@ from sqlalchemy import text
 from database.db_manager import DBManager, get_users_with_ib_safe
 from database.models import User, SimulationState
 from backend.runner_service import run_due_runners
+from backend.logger_config import setup_logging as setup_analytics_logging
 from backend.analytics.mock_broker import MockBusinessManager
 from backend.analytics.pnl_aggregator import compute_final_pnl_for_runner
 from backend.analytics.result_writer import upsert_result
@@ -79,32 +82,43 @@ async def _tick_users(ts_epoch: int) -> None:
 
 
 async def main() -> None:
-    # Set up logging with file handler for sim_scheduler
-    import logging.config
-    import sys
+    # Set up logging with rotating file handler for sim_scheduler
     import os
-    
-    # Ensure logs directory exists
     os.makedirs('/app/logs', exist_ok=True)
+
+    # Use shared analytics logger config (mirrors main app)
+    setup_analytics_logging()
     
-    # Set up logging
-    logging.basicConfig(
-        level=logging.INFO,
-        format='[%(asctime)s] %(levelname)-8s %(name)s: %(message)s',
-        handlers=[
-            logging.FileHandler('/app/logs/sim_scheduler.log'),
-            logging.StreamHandler(sys.stdout)
-        ]
-    )
-    
-    log.info("Starting Analytics Simulation Scheduler")
+    log.info("🚀 Starting Analytics Simulation Scheduler")
     
     try:
-        # Test database connection early
+        # Test database connection early and show data state
         with DBManager() as db:
             # Test basic query
             db.db.execute(text("SELECT 1")).scalar()
-            log.info("Database connection successful")
+            log.info("✅ Database connection successful")
+            
+            # Show data availability
+            from database.models import HistoricalMinuteBar, HistoricalDailyBar
+            from sqlalchemy import select, func
+            
+            minute_count = db.db.execute(select(func.count()).select_from(HistoricalMinuteBar)).scalar() or 0
+            daily_count = db.db.execute(select(func.count()).select_from(HistoricalDailyBar)).scalar() or 0
+            
+            log.info(f"📊 Available data: {minute_count:,} minute bars, {daily_count:,} daily bars")
+            
+            if minute_count > 0:
+                earliest = db.db.execute(select(func.min(HistoricalMinuteBar.ts))).scalar()
+                latest = db.db.execute(select(func.max(HistoricalMinuteBar.ts))).scalar()
+                log.info(f"📅 Data range: {earliest} to {latest}")
+            
+            # Show current simulation time
+            sim_ts = os.getenv("SIM_TIME_EPOCH")
+            if sim_ts:
+                sim_dt = datetime.fromtimestamp(int(sim_ts), tz=timezone.utc)
+                log.info(f"🕐 Current simulation time: {sim_dt} (ts: {sim_ts})")
+            else:
+                log.warning("⚠️ No SIM_TIME_EPOCH set")
     except Exception as e:
         log.error(f"Database connection failed: {e}")
         raise

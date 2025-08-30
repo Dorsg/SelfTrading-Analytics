@@ -101,7 +101,6 @@ services:
     restart: "no"
     env_file: .env
     environment:
-      DATABASE_URL_DOCKER: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
       DB_ALLOW_AUTO_CREATE_DB: "true"
       DB_ALLOW_AUTO_CREATE_TABLES: "true"
     depends_on:
@@ -118,7 +117,6 @@ services:
     restart: "no"
     env_file: .env
     environment:
-      DATABASE_URL_DOCKER: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
       ANALYTICS_SQLITE_PATH: /app/tools/finnhub_downloader/data/daily_bars.sqlite
     volumes:
       - ./logs:/app/logs
@@ -152,9 +150,8 @@ services:
       - "8000:8000"
     env_file: .env
     environment:
-      DATABASE_URL_DOCKER: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
       RUNNING_ENV: analytics
-      ANALYTICS_MODE: "true"
+
       DB_ALLOW_AUTO_CREATE_DB: "true"
       DB_ALLOW_AUTO_CREATE_TABLES: "true"
       SIM_STEP_SECONDS: "300"
@@ -191,9 +188,8 @@ services:
     restart: always
     env_file: .env
     environment:
-      DATABASE_URL_DOCKER: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
       RUNNING_ENV: analytics
-      ANALYTICS_MODE: "true"
+
 
       DB_ALLOW_AUTO_CREATE_DB: "true"
       DB_ALLOW_AUTO_CREATE_TABLES: "true"

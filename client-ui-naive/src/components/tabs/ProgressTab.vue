@@ -81,18 +81,52 @@
         </n-space>
       </n-card>
 
+      <!-- Debug Information -->
+      <n-card title="Debug Information" size="small" :bordered="false" v-if="progress.debug_info || progress.simulation_status">
+        <n-space vertical size="small">
+          <div v-if="progress.data_range">
+            <n-text strong>Data Range:</n-text>
+            <n-text>{{ progress.data_range.start_readable }} to {{ progress.data_range.end_readable }}</n-text>
+            <n-text>({{ progress.data_range.total_days }} days)</n-text>
+          </div>
+          <div v-if="progress.simulation_status">
+            <n-text strong>Time Position:</n-text>
+            <n-tag :type="progress.simulation_status.time_position === 'within_range' ? 'success' : 'error'">
+              {{ progress.simulation_status.time_position }}
+            </n-tag>
+            <n-text v-if="progress.simulation_status.days_simulated">
+              Simulated: {{ progress.simulation_status.days_simulated }} days
+            </n-text>
+            <n-text v-if="progress.simulation_status.days_remaining">
+              Remaining: {{ progress.simulation_status.days_remaining }} days
+            </n-text>
+          </div>
+          <div v-if="progress.debug_info">
+            <n-text strong>Debug:</n-text>
+            <n-text>Sim TS: {{ progress.debug_info.sim_timestamp }}</n-text>
+            <n-text>State: {{ progress.debug_info.has_simulation_state ? 'Yes' : 'No' }}</n-text>
+            <n-text>Running: {{ progress.debug_info.simulation_state_running }}</n-text>
+          </div>
+        </n-space>
+      </n-card>
+
       <n-card title="Simulation Progress" size="small" :bordered="false">
         <n-space vertical>
-          <!-- Simulation Time Display -->
-          <div v-if="progress.sim_time_readable">
-            <n-text strong>Current Simulation Time:</n-text>
-            <n-text>{{ progress.sim_time_readable }}</n-text>
+          <!-- Current Context Above Bars -->
+          <div v-if="progress.current || progress.sim_time_readable">
+            <n-text strong>Current:</n-text>
+            <n-text>
+              <template v-if="progress.current">
+                {{ progress.current.symbol }} · {{ progress.current.strategy }} · {{ progress.current.timeframe }} · 
+              </template>
+              {{ progress.sim_time_readable || '' }}
+            </n-text>
           </div>
           
-          <!-- Current Runner Display -->
-          <div v-if="progress.current_runner_info">
-            <n-text strong>Last Runner:</n-text>
-            <n-text>{{ progress.current_runner_info }}</n-text>
+          <!-- Estimated Finish Time -->
+          <div v-if="progress.estimated_finish && state.running">
+            <n-text strong>Estimated Finish:</n-text>
+            <n-text>{{ progress.estimated_finish }}</n-text>
           </div>
           
           <!-- Progress Bars -->
@@ -115,6 +149,15 @@
               <n-text depth="3">Completed: {{ progress.execution_stats.completed_executions }}</n-text>
               <n-text depth="3">Errors: {{ progress.execution_stats.error_executions }}</n-text>
               <n-text depth="3">Skipped: {{ progress.execution_stats.skipped_executions }}</n-text>
+            </n-space>
+          </div>
+
+          <!-- Global Counters -->
+          <div v-if="progress.counters">
+            <n-text strong>Counters (All time):</n-text>
+            <n-space vertical size="small">
+              <n-text depth="3">Executions: {{ progress.counters.executions_all_time }}</n-text>
+              <n-text depth="3">Trades: {{ progress.counters.trades_all_time }}</n-text>
             </n-space>
           </div>
         </n-space>
@@ -159,7 +202,7 @@ const logHoursOptions = [
 // Caching
 const dbStatusCache = ref(null);
 const dbStatusCacheTime = ref(0);
-const CACHE_DURATION = 30000; // 30 seconds
+const CACHE_DURATION = Number.MAX_SAFE_INTEGER; // cache for the whole session
 
 async function loadDatabaseStatus() {
   const now = Date.now();
@@ -236,6 +279,9 @@ async function load() {
     if (p.data.current_runner_info) {
       progress.value.current_runner_info = p.data.current_runner_info;
     }
+    if (p.data.estimated_finish) {
+      progress.value.estimated_finish = p.data.estimated_finish;
+    }
     state.value = { running: !!s.data.running, last_ts: s.data.last_ts };
   } catch (err) {
     message.error('Failed to load progress');
@@ -264,23 +310,23 @@ let autoAdvanceTimer = null;
 function startAutoAdvance() {
   if (autoAdvanceTimer) return; // Already running
   
-  // Run very fast - every 50ms for rapid progression
+  // Run at moderate speed - every 500ms for stable progression
   autoAdvanceTimer = setInterval(async () => {
     if (state.value.running) {
       try {
-        // Use fast mode for rapid progression
-        await axios.post('/api/analytics/simulation/force-tick?fast=true');
-        // Refresh progress every 20 ticks to avoid overwhelming the UI
-        if (Math.random() < 0.05) {
+        // Use regular mode for proper execution
+        await axios.post('/api/analytics/simulation/force-tick');
+        // Refresh progress every 5 ticks
+        if (Math.random() < 0.2) {
           await load();
         }
       } catch (err) {
         console.error('Auto-advance error:', err);
       }
     }
-  }, 50); // Every 50ms = 20 ticks per second
+  }, 500); // Every 500ms = 2 ticks per second
   
-  console.log('Fast auto-advance started (10 ticks/second)');
+  console.log('Auto-advance started (2 ticks/second)');
 }
 
 function stopAutoAdvance() {
@@ -302,24 +348,32 @@ const logsText = computed(() => {
   ).join('\n');
 });
 
-onMounted(() => {
-  load();
-  loadDatabaseStatus();
-  loadLogs();
+onMounted(async () => {
+  // Load initial data
+  await load();
+  await loadDatabaseStatus();
+  await loadLogs();
+  
+  // Check if simulation was already running and restart auto-advance
+  if (state.value.running) {
+    console.log('Simulation was running, restarting auto-advance');
+    startAutoAdvance();
+  }
   
   // Refresh progress every 3 seconds
   const progressTimer = setInterval(load, 3000);
   
-  // Refresh database status less frequently (cached)
-  const dbTimer = setInterval(loadDatabaseStatus, 30000); // 30 seconds
+  // No periodic DB status checks; cache once per session
+  const dbTimer = null;
   
   // Refresh logs every 10 seconds
   const logsTimer = setInterval(loadLogs, 10000);
   
   window.addEventListener('beforeunload', () => {
     clearInterval(progressTimer);
-    clearInterval(dbTimer);
+    if (dbTimer) clearInterval(dbTimer);
     clearInterval(logsTimer);
+    stopAutoAdvance();
   });
 });
 </script>
