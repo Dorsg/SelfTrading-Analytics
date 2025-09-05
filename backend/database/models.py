@@ -1,289 +1,208 @@
-# database/models.py
 from __future__ import annotations
-from sqlalchemy.dialects.postgresql import JSONB
-from datetime import datetime, timezone
+
+from datetime import datetime
+from typing import Optional
+
 from sqlalchemy import (
-    Column,
-    DateTime,
-    Float,
-    ForeignKey,
-    Integer,
-    String,
-    UniqueConstraint,
+    String, Integer, Float, DateTime, ForeignKey, UniqueConstraint, Index, JSON, Text,
+    BigInteger, Numeric
 )
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import relationship, foreign 
+from sqlalchemy.orm import Mapped, mapped_column
+from database.db_core import Base
 
-
-aware_utc_now = lambda: datetime.now(timezone.utc)
-
-Base = declarative_base()
-
-# ───────────────────────────── Users ─────────────────────────────
+# ───────── Users ─────────
 class User(Base):
     __tablename__ = "users"
 
-    id              = Column(Integer, primary_key=True, index=True)
-    email           = Column(String, unique=True, nullable=False, index=True)
-    username        = Column(String, unique=True, nullable=False, index=True)
-    hashed_password = Column(String, nullable=False)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    username: Mapped[str] = mapped_column(String(50), unique=True, index=True, nullable=False)
+    email: Mapped[str] = mapped_column(String(200), unique=True, nullable=False)
+    password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
 
-    # optional IB creds (NULL → read-only / paper user)
-    ib_account_id = Column(String)
-    ib_username   = Column(String)
-    ib_password   = Column(String)
 
-    created_at = Column(DateTime(timezone=True), default=aware_utc_now)
-    updated_at = Column(DateTime(timezone=True), default=aware_utc_now, onupdate=aware_utc_now)
-
-    runners = relationship(
-        "Runner", back_populates="user", cascade="all, delete-orphan"
-    )
-
-# ───────────────────── Account snapshots ─────────────────────
-class AccountSnapshot(Base):
-    __tablename__ = "account_snapshots"
-
-    id        = Column(Integer, primary_key=True, index=True)
-    user_id   = Column(
-        Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
-    )
-    timestamp = Column(DateTime(timezone=True), default=aware_utc_now)
-    account   = Column(String, nullable=False)
-
-    total_cash_value     = Column(Float)
-    net_liquidation      = Column(Float)
-    available_funds      = Column(Float)
-    buying_power         = Column(Float)
-    unrealized_pnl       = Column(Float)
-    realized_pnl         = Column(Float)
-    excess_liquidity     = Column(Float)
-    gross_position_value = Column(Float)
-
-# ─────────────────────── Open positions ───────────────────────
-class OpenPosition(Base):
-    __tablename__ = "open_positions"
-
-    id      = Column(Integer, primary_key=True, index=True)
-    user_id = Column(
-        Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
-    )
-
-    symbol      = Column(String, nullable=False)
-    quantity    = Column(Float, nullable=False)
-    avg_price   = Column(Float, nullable=False)
-    account     = Column(String, nullable=False)
-    last_update = Column(DateTime(timezone=True), default=aware_utc_now)
-
-# ─────────────────────────── Runner ────────────────────────────
+# ───────── Runners ─────────
 class Runner(Base):
-    __tablename__  = "runners"
-    __table_args__ = (UniqueConstraint("user_id", "name", name="uix_user_runner_name"),)
+    __tablename__ = "runners"
 
-    id      = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    name: Mapped[str] = mapped_column(String(200))
+    strategy: Mapped[str] = mapped_column(String(100), index=True)
+    budget: Mapped[float] = mapped_column(Float, default=0.0)
+    # NEW: track remaining budget; legacy DBs may already have NOT NULL constraint
+    current_budget: Mapped[float] = mapped_column(Float, default=0.0)
+    stock: Mapped[str] = mapped_column(String(20), index=True)
+    time_frame: Mapped[int] = mapped_column(Integer, default=5)  # minutes; 1440 = 1d
+    parameters: Mapped[dict] = mapped_column(JSON, default=dict)  # ← safe default
+    time_range_from: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    time_range_to:   Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    exit_strategy: Mapped[str] = mapped_column(String(100), default="hold_forever")
+    activation: Mapped[str] = mapped_column(String(20), default="active")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
 
-    name             = Column(String, nullable=False, index=True)
-    strategy         = Column(String, nullable=False)
-    budget           = Column(Float,  nullable=False)
-    current_budget  = Column(Float,   nullable=False)         
-    stock            = Column(String, nullable=False)
-    time_frame       = Column(Integer, nullable=False)
-    time_range_from  = Column(DateTime(timezone=True))
-    time_range_to    = Column(DateTime(timezone=True))
-    exit_strategy    = Column(String,  nullable=False)
-    activation       = Column(String,  default="active", nullable=False)
-    created_at       = Column(DateTime(timezone=True), default=aware_utc_now)
-    updated_at       = Column(DateTime(timezone=True), default=aware_utc_now, onupdate=aware_utc_now)
-    parameters = Column(JSONB, nullable=False, default=dict)
-
-    user    = relationship("User", back_populates="runners")
-    orders  = relationship(                       # live / open orders only
-        "Order",
-        back_populates="runner",
-        cascade="all, delete-orphan",
-        passive_deletes=True,
-    )
-    trades  = relationship(                       # full trade history
-        "ExecutedTrade",
-        primaryjoin="Runner.id==ExecutedTrade.runner_id",
-        back_populates="runner",
-        viewonly=True,
-    )
+    __table_args__ = (Index("ix_runner_user_active", "user_id", "activation"),)
 
 
-# ─────────────────────────── Order ────────────────────────────
-class Order(Base):
-    """
-    Live / open orders only.  Row is deleted as soon as IBKR stops
-    reporting it, so never relied upon for trade history.
-    """
-    __tablename__ = "orders"
+# ───────── Simulation state ─────────
+class SimulationState(Base):
+    __tablename__ = "simulation_state"
 
-    id        = Column(Integer, primary_key=True, index=True)
-    user_id   = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
-    runner_id = Column(Integer, ForeignKey("runners.id", ondelete="SET NULL"), nullable=True, index=True)
-
-    ibkr_perm_id = Column(Integer, nullable=False, unique=True, index=True)
-
-    symbol      = Column(String, nullable=False)
-    action      = Column(String, nullable=False)
-    order_type  = Column(String, nullable=False)
-    quantity    = Column(Float,  nullable=False)
-    limit_price = Column(Float)
-    stop_price  = Column(Float)
-
-    status          = Column(String, nullable=False)
-    filled_quantity = Column(Float)
-    avg_fill_price  = Column(Float)
-
-    account      = Column(String)
-    created_at   = Column(DateTime(timezone=True), default=aware_utc_now)
-    last_updated = Column(DateTime(timezone=True), default=aware_utc_now, onupdate=aware_utc_now)
-
-    runner = relationship("Runner", back_populates="orders")
-
-    # view-only helper so legacy code can still reach order.trades if the
-    # row survives; has **no** FK, so nothing breaks when the order is gone.
-    trades = relationship(
-        "ExecutedTrade",
-        primaryjoin="foreign(Order.ibkr_perm_id)==ExecutedTrade.perm_id",
-        viewonly=True,
-    )
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), unique=True)
+    is_running: Mapped[str] = mapped_column(String(5), default="false")  # "true"/"false"
+    last_ts: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
-# ─────────────────────── Executed trade ───────────────────────
-class ExecutedTrade(Base):
-    """
-    Permanent, append-only record of every fill.
-
-    • `commission` is stored per merged fill ( **positive number** → fee paid ).
-    • `pnl_amount` / `pnl_percent` are written **only** on the SELL/BUY
-      that reduces the open position (FIFO).
-    """
-    __tablename__  = "executed_trades"
-    __table_args__ = (
-        UniqueConstraint("perm_id", "price", name="uix_perm_id_price"),
-    )
-
-    id        = Column(Integer, primary_key=True)
-    user_id   = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"),
-                       nullable=False, index=True)
-    runner_id = Column(Integer, ForeignKey("runners.id", ondelete="SET NULL"),
-                       index=True)
-
-    perm_id    = Column(Integer, nullable=False, index=True)
-    symbol     = Column(String, index=True)
-    action     = Column(String)              # BUY | SELL
-    order_type = Column(String)
-    quantity   = Column(Float)               # always “positive” shares
-    price      = Column(Float)
-    commission = Column(Float, default=0.0)  # broker fee for *this* fill (always ≥0)
-    fill_time  = Column(DateTime(timezone=True), index=True)
-    account    = Column(String)
-
-    # realised profit / loss **for this closing trade**
-    pnl_amount  = Column(Float)              # +10.42 / –7.25 (account currency)
-    pnl_percent = Column(Float)              # +0.032  / –0.018 (vs. entry cost)
-
-    # 👉 legacy convenience; may be None once the Order row is gone
-    order = relationship(
-        "Order",
-        primaryjoin="foreign(ExecutedTrade.perm_id)==Order.ibkr_perm_id",
-        viewonly=True,
-    )
-    runner = relationship("Runner", back_populates="trades")
-
-
-
-
-# ─────────────────── Runner execution log ────────────────────
-class RunnerExecution(Base):
-    __tablename__ = "runner_executions"
-
-    id             = Column(Integer, primary_key=True, index=True)
-    user_id        = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
-    runner_id      = Column(Integer, ForeignKey("runners.id", ondelete="CASCADE"), nullable=False, index=True)
-
-    cycle_seq      = Column(String(36), nullable=False, index=True)
-
-    execution_time = Column(DateTime(timezone=True), default=aware_utc_now, nullable=False)
-    perm_id        = Column(Integer, index=True)
-    status         = Column(String, nullable=False)
-    limit_price    = Column(Float)
-    symbol         = Column(String)
-    reason         = Column(String)
-    details        = Column(String)
-    strategy       = Column(String)
-
-    # easy join back to the runner if needed
-    runner = relationship("Runner", lazy="joined")
-
-
-# ─────────────────────── Analytics / Historical ───────────────────────
+# ───────── Historical data ─────────
 class HistoricalDailyBar(Base):
     __tablename__ = "historical_daily_bars"
-    __table_args__ = (
-        UniqueConstraint("symbol", "date", name="uix_hist_daily_symbol_date"),
-    )
 
-    id      = Column(Integer, primary_key=True, index=True)
-    symbol  = Column(String, nullable=False, index=True)
-    date    = Column(DateTime(timezone=True), nullable=False, index=True)  # UTC midnight
-    open    = Column(Float, nullable=False)
-    high    = Column(Float, nullable=False)
-    low     = Column(Float, nullable=False)
-    close   = Column(Float, nullable=False)
-    volume  = Column(Integer, nullable=False)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    symbol: Mapped[str] = mapped_column(String(20), index=True)
+    date: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    open: Mapped[float] = mapped_column(Float)
+    high: Mapped[float] = mapped_column(Float)
+    low:  Mapped[float] = mapped_column(Float)
+    close: Mapped[float] = mapped_column(Float)
+    volume: Mapped[int] = mapped_column(Integer)
+
+    __table_args__ = (UniqueConstraint("symbol", "date", name="uq_daily_symbol_date"),)
 
 
 class HistoricalMinuteBar(Base):
     __tablename__ = "historical_minute_bars"
-    __table_args__ = (
-        UniqueConstraint("symbol", "ts", "interval_min", name="uix_hist_min_symbol_ts_interval"),
-    )
 
-    id           = Column(Integer, primary_key=True, index=True)
-    symbol       = Column(String, nullable=False, index=True)
-    ts           = Column(DateTime(timezone=True), nullable=False, index=True)  # UTC timestamp
-    interval_min = Column(Integer, nullable=False, index=True)  # e.g., 5
-    open         = Column(Float, nullable=False)
-    high         = Column(Float, nullable=False)
-    low          = Column(Float, nullable=False)
-    close        = Column(Float, nullable=False)
-    volume       = Column(Integer, nullable=False)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    symbol: Mapped[str] = mapped_column(String(20), index=True)
+    ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    interval_min: Mapped[int] = mapped_column(Integer, index=True)  # 5 for 5m
+    open: Mapped[float] = mapped_column(Float)
+    high: Mapped[float] = mapped_column(Float)
+    low:  Mapped[float] = mapped_column(Float)
+    close: Mapped[float] = mapped_column(Float)
+    volume: Mapped[int] = mapped_column(Integer)
+
+    __table_args__ = (UniqueConstraint("symbol", "ts", "interval_min", name="uq_min_symbol_ts_interval"),)
+
+
+# ───────── Mock Broker ─────────
+class Account(Base):
+    __tablename__ = "accounts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    name: Mapped[str] = mapped_column(String(50), default="mock")
+    cash: Mapped[float] = mapped_column(Float, default=0.0)
+    equity: Mapped[float] = mapped_column(Float, default=0.0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
+
+    __table_args__ = (UniqueConstraint("user_id", "name", name="uq_account_user_name"),)
+
+
+class OpenPosition(Base):
+    __tablename__ = "open_positions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    runner_id: Mapped[int] = mapped_column(ForeignKey("runners.id", ondelete="CASCADE"), index=True, unique=True)
+    symbol: Mapped[str] = mapped_column(String(20), index=True)
+
+    # IMPORTANT: 'account' exists in the DB and is NOT NULL; reflect it here.
+    account: Mapped[str] = mapped_column(String(50), default="mock", nullable=False, index=True)
+
+    quantity: Mapped[int] = mapped_column(Integer)
+    avg_price: Mapped[float] = mapped_column(Float)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
+
+    stop_price: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    trail_percent: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    highest_price: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+
+
+class Order(Base):
+    __tablename__ = "orders"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(Integer, index=True)
+    runner_id: Mapped[int] = mapped_column(Integer, index=True)
+    symbol: Mapped[str] = mapped_column(String(20), index=True)
+    side: Mapped[str] = mapped_column(String(4))  # BUY/SELL
+    order_type: Mapped[str] = mapped_column(String(20))  # MKT/LMT/etc
+    quantity: Mapped[int] = mapped_column(Integer)
+    limit_price: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    stop_price: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default="filled")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
+    filled_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    details: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+
+class ExecutedTrade(Base):
+    __tablename__ = "executed_trades"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+
+    # BROKER permanent id (live). Optional in simulation.
+    perm_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)  # ← sim-safe
+
+    # Ownership / attribution
+    user_id: Mapped[Optional[int]] = mapped_column(Integer, index=True, nullable=True)
+    runner_id: Mapped[Optional[int]] = mapped_column(Integer, index=True, nullable=True)
+
+    # Instrument
+    symbol: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+
+    # Timestamps
+    buy_ts: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    sell_ts: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+
+    # Prices & qty
+    buy_price: Mapped[Optional[float]] = mapped_column(Numeric(18, 6), nullable=True)
+    sell_price: Mapped[Optional[float]] = mapped_column(Numeric(18, 6), nullable=True)
+    quantity: Mapped[Optional[float]] = mapped_column(Numeric(18, 6), nullable=True)
+
+    # PnL (absolute and percent)
+    pnl_amount: Mapped[Optional[float]] = mapped_column(Numeric(18, 6), nullable=True)
+    pnl_percent: Mapped[Optional[float]] = mapped_column(Numeric(9, 6), nullable=True)
+
+    # Strategy labeling
+    strategy: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    timeframe: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+
+
+class RunnerExecution(Base):
+    __tablename__ = "runner_executions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    runner_id: Mapped[int] = mapped_column(Integer, index=True)
+    user_id: Mapped[int] = mapped_column(Integer, index=True)
+    symbol: Mapped[str] = mapped_column(String(20))
+    strategy: Mapped[str] = mapped_column(String(100))
+    status: Mapped[str] = mapped_column(String(50))
+    reason: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
+    details: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    # NEW: simulation cycle sequence (e.g., epoch seconds of the tick)
+    cycle_seq: Mapped[int] = mapped_column(Integer, index=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
+    execution_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow, index=True)
 
 
 class AnalyticsResult(Base):
     __tablename__ = "analytics_results"
-    __table_args__ = (
-        UniqueConstraint("symbol", "strategy", "timeframe", name="uix_analytics_unique_combo"),
-    )
 
-    id        = Column(Integer, primary_key=True, index=True)
-    symbol    = Column(String, nullable=False, index=True)
-    strategy  = Column(String, nullable=False, index=True)
-    timeframe = Column(String, nullable=False, index=True)  # "1d" / "5m"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    symbol: Mapped[str] = mapped_column(String(20), index=True)
+    strategy: Mapped[str] = mapped_column(String(100), index=True)
+    timeframe: Mapped[str] = mapped_column(String(10), index=True)
 
-    start_ts  = Column(DateTime(timezone=True))
-    end_ts    = Column(DateTime(timezone=True))
+    start_ts: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    end_ts:   Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
-    final_pnl_amount  = Column(Float)
-    final_pnl_percent = Column(Float)
-    trades_count      = Column(Integer)
-    max_drawdown      = Column(Float)
-    details           = Column(String)
-    created_at        = Column(DateTime(timezone=True), default=aware_utc_now)
-    updated_at        = Column(DateTime(timezone=True), default=aware_utc_now, onupdate=aware_utc_now)
+    final_pnl_amount: Mapped[float] = mapped_column(Float, default=0.0)
+    final_pnl_percent: Mapped[float] = mapped_column(Float, default=0.0)
+    trades_count: Mapped[int] = mapped_column(Integer, default=0)
 
-
-# ─────────────────────── Simulation State ───────────────────────
-class SimulationState(Base):
-    __tablename__ = "simulation_state"
-    __table_args__ = (UniqueConstraint("user_id", name="uix_sim_state_user"),)
-
-    id         = Column(Integer, primary_key=True, index=True)
-    user_id    = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
-    is_running = Column(String, default="false")  # "true" / "false"
-    last_ts    = Column(DateTime(timezone=True))    # last simulated timestamp
-    updated_at = Column(DateTime(timezone=True), default=aware_utc_now, onupdate=aware_utc_now)
+    __table_args__ = (UniqueConstraint("symbol", "strategy", "timeframe", name="uq_result_key"),)

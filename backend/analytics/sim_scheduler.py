@@ -1,291 +1,449 @@
 from __future__ import annotations
+
 import asyncio
+import json
 import logging
-import sys
-from logging.handlers import RotatingFileHandler
 import os
-from datetime import datetime, timezone, timedelta
-from typing import Sequence
-from sqlalchemy import text
+from datetime import datetime, timezone, timedelta, date, time
 
-from database.db_manager import DBManager, get_users_with_ib_safe
-from database.models import User, SimulationState
-from backend.runner_service import run_due_runners
-from backend.logger_config import setup_logging as setup_analytics_logging
-from backend.analytics.mock_broker import MockBusinessManager
-from backend.analytics.pnl_aggregator import compute_final_pnl_for_runner
-from backend.analytics.result_writer import upsert_result
+from logger_config import setup_logging  # ← ensure file handlers & levels
+from database.db_manager import DBManager
+from database.models import SimulationState
+from backend.analytics.runner_service import RunnerService
+from backend.ib_manager.market_data_manager import MarketDataManager
 
+# Configure logging for this process
+setup_logging()
 log = logging.getLogger("AnalyticsScheduler")
 
+PACE_FILE = "/tmp/sim_auto_advance.json"
+HEARTBEAT_FILE = "/tmp/sim_scheduler.heartbeat"
 
-def _set_sim_time(ts: int) -> None:
-    os.environ["SIM_TIME_EPOCH"] = str(ts)
+# ──────────────────────────────────────────────────────────────────────────────
+# Tunables (sane defaults; all overridable via env)
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Minimum fully-completed bars strategies expect (RSI14/MA/Fib/Donchian windows).
+# Keep this at 21 unless you change strategy periods materially.
+MIN_REQUIRED_BARS = int(os.getenv("SIM_MIN_REQUIRED_BARS", "21"))
+
+# Default: use the next real 5m market candle as our step; still keep this for warmup math.
+def _step_seconds() -> int:
+    return int(os.getenv("SIM_STEP_SECONDS", "300"))  # 5 minutes per tick
 
 
-def _get_earliest_timestamp() -> int | None:
-    from sqlalchemy import select, func
-    from database.db_core import engine
-    from database.models import HistoricalMinuteBar, HistoricalDailyBar
-    with engine.connect() as conn:
-        t1 = conn.execute(select(func.min(HistoricalMinuteBar.ts))).scalar()
-        t2 = conn.execute(select(func.min(HistoricalDailyBar.date))).scalar()
-        candidates = [int(t.timestamp()) for t in [t1, t2] if isinstance(t, datetime)]
-        return min(candidates) if candidates else None
+def _read_pace_seconds() -> float:
+    try:
+        if os.path.exists(PACE_FILE):
+            with open(PACE_FILE, "r") as f:
+                data = json.load(f)
+                if not data.get("enabled", True):
+                    # If disabled, sleep a little so we don't hot-spin the loop
+                    return 0.5
+                pace = float(data.get("pace_seconds", 0.0))
+                return max(0.0, pace)
+    except Exception:
+        pass
+    return float(os.getenv("SIM_PACE_SECONDS", "0"))  # default: run at full speed
 
 
-async def _tick_users(ts_epoch: int) -> None:
-    _set_sim_time(ts_epoch)
-    users: Sequence[User] = await asyncio.to_thread(get_users_with_ib_safe)
-    # If none, create a synthetic in-memory user for analytics runs
-    if not users:
-        with DBManager() as db:
-            # Try to find any user, else create one
-            u = db.get_user_by_username("analytics")
-            if u is None:
-                try:
-                    u = db.create_user(username="analytics", email="analytics@example.com", password="analytics")
-                except Exception:
-                    u = db.get_user_by_username("analytics")
-            users = [u] if u else []
+def _warmup_bars_default() -> int:
+    """
+    Bars to skip from the global min 5m timestamp so strategies have enough data.
+    Default = 50 (> 21) so first indicator windows are fully stable.
+    Override with SIM_WARMUP_BARS or WARMUP_BARS.
+    """
+    return int(os.getenv("SIM_WARMUP_BARS", os.getenv("WARMUP_BARS", "50")))
 
-    if not users:
-        log.warning("No users available; skipping tick")
-        return
 
-    async def _run_for_user(u: User):
-        bm = MockBusinessManager(u)
-        # DB connection is created inside run_due_runners
-        await run_due_runners(u, None, bm)
-        # After runners tick, aggregate and write results per runner
-        with DBManager() as db:
-            runners = db.get_runners_by_user(user_id=u.id)
-            for r in runners:
-                amt, pct, trades, avg_pnl, avg_dur = compute_final_pnl_for_runner(runner_id=r.id)
-                tf = str(r.time_frame or "").lower()
-                tf = "1d" if tf in {"d", "1day", "1440"} else ("5m" if tf in {"5", "5min"} else str(tf))
-                upsert_result(
-                    symbol=r.stock,
-                    strategy=str(r.strategy),
-                    timeframe=tf,
-                    start_ts=r.time_range_from,
-                    end_ts=datetime.fromtimestamp(ts_epoch, tz=timezone.utc),
-                    final_pnl_amount=amt,
-                    final_pnl_percent=pct,
-                    trades_count=trades,
-                    max_drawdown=None,
-                    avg_pnl_per_trade=avg_pnl,
-                    avg_trade_duration_sec=avg_dur,
-                )
+def _daily_warmup_days_default() -> int:
+    """
+    Extra guard for DAILY runners: start the whole sim only after at least this
+    many daily candles exist globally. Default 30 days. Override via:
+      SIM_DAILY_WARMUP_DAYS or DAILY_WARMUP_DAYS
+    """
+    return int(os.getenv("SIM_DAILY_WARMUP_DAYS", os.getenv("DAILY_WARMUP_DAYS", "30")))
 
-    await asyncio.gather(*(_run_for_user(u) for u in users))
+
+def _session_warmup_bars_default() -> int:
+    """
+    Number of 5m bars to have **after NYSE open** in the *current day* before we run strategies.
+    We require MIN_REQUIRED_BARS completed bars **plus one** to avoid off-by-one when a bar
+    is still forming or the data provider is mid-commit.
+    Default 22; override via SIM_SESSION_WARMUP_BARS or SESSION_WARMUP_BARS.
+    """
+    fallback = max(MIN_REQUIRED_BARS + 1, 22)
+    return int(os.getenv("SIM_SESSION_WARMUP_BARS", os.getenv("SESSION_WARMUP_BARS", str(fallback))))
+
+
+def _ny_open_epoch_for_day(dt_utc: datetime) -> int:
+    """
+    Return the UTC epoch for 09:30 ET on the ET calendar date of dt_utc.
+    """
+    dt_utc = dt_utc if dt_utc.tzinfo else dt_utc.replace(tzinfo=timezone.utc)
+    try:
+        from zoneinfo import ZoneInfo  # type: ignore
+        ny = ZoneInfo("America/New_York")
+        et = dt_utc.astimezone(ny)
+        et_day = et.date()
+        open_et = datetime(et_day.year, et_day.month, et_day.day, 9, 30, tzinfo=ny)
+        open_utc = open_et.astimezone(timezone.utc)
+        return int(open_utc.timestamp())
+    except Exception:
+        # Conservative fallback if zoneinfo unavailable: 13:30 UTC ≈ 09:30 ET (no DST correction)
+        approx = dt_utc.replace(hour=13, minute=30, second=0, microsecond=0, tzinfo=timezone.utc)
+        return int(approx.timestamp())
+
+
+async def _heartbeat() -> None:
+    try:
+        with open(HEARTBEAT_FILE, "w") as f:
+            f.write(datetime.now(timezone.utc).isoformat())
+    except Exception:
+        pass
+
+
+async def _advance_one_tick(rs: RunnerService, ts: int) -> tuple[int, dict]:
+    # NOTE: this is now controlled by session-aware stepping outside; we keep the signature
+    stats = await rs.run_tick(datetime.fromtimestamp(ts, tz=timezone.utc))
+    return ts, stats  # next epoch chosen separately
+
+
+def _ts(dt: datetime | None) -> int | None:
+    if not dt:
+        return None
+    return int((dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)).timestamp())
 
 
 async def main() -> None:
-    # Set up logging with rotating file handler for sim_scheduler
-    import os
-    os.makedirs('/app/logs', exist_ok=True)
-
-    # Use shared analytics logger config (mirrors main app)
-    setup_analytics_logging()
-    
-    log.info("🚀 Starting Analytics Simulation Scheduler")
-    
+    # Ensure tiny migrations also run when the scheduler/runner is started without the API process.
     try:
-        # Test database connection early and show data state
-        with DBManager() as db:
-            # Test basic query
-            db.db.execute(text("SELECT 1")).scalar()
-            log.info("✅ Database connection successful")
-            
-            # Show data availability
-            from database.models import HistoricalMinuteBar, HistoricalDailyBar
-            from sqlalchemy import select, func
-            
-            minute_count = db.db.execute(select(func.count()).select_from(HistoricalMinuteBar)).scalar() or 0
-            daily_count = db.db.execute(select(func.count()).select_from(HistoricalDailyBar)).scalar() or 0
-            
-            log.info(f"📊 Available data: {minute_count:,} minute bars, {daily_count:,} daily bars")
-            
-            if minute_count > 0:
-                earliest = db.db.execute(select(func.min(HistoricalMinuteBar.ts))).scalar()
-                latest = db.db.execute(select(func.max(HistoricalMinuteBar.ts))).scalar()
-                log.info(f"📅 Data range: {earliest} to {latest}")
-            
-            # Show current simulation time
-            sim_ts = os.getenv("SIM_TIME_EPOCH")
-            if sim_ts:
-                sim_dt = datetime.fromtimestamp(int(sim_ts), tz=timezone.utc)
-                log.info(f"🕐 Current simulation time: {sim_dt} (ts: {sim_ts})")
-            else:
-                log.warning("⚠️ No SIM_TIME_EPOCH set")
-    except Exception as e:
-        log.error(f"Database connection failed: {e}")
-        raise
+        from backend.database.init_db import _apply_light_migrations
+        _apply_light_migrations()
+    except Exception:
+        log.exception("Failed to apply light migrations at scheduler startup")
 
-    pace_seconds = int(os.getenv("SIM_PACE_SECONDS", "0"))  # 0 = as fast as possible
-    step_seconds = int(os.getenv("SIM_STEP_SECONDS", "300"))  # 5 minutes default
-    
-    log.info(f"Configuration: pace_seconds={pace_seconds}, step_seconds={step_seconds}")
+    tick_log_every = max(1, int(os.getenv("TICK_LOG_EVERY", "1")))
+    boundary_refresh_ticks = int(os.getenv("SIM_BOUNDARY_REFRESH_TICKS", "0"))  # 0 = never refresh
 
-    start_ts = os.getenv("SIM_START_EPOCH")
-    if start_ts:
-        ts = int(start_ts)
-    else:
-        earliest = _get_earliest_timestamp()
-        if earliest is None:
-            log.error("No historical data found. Exiting.")
-            return
-        ts = earliest
+    rs = RunnerService()
+    mkt = MarketDataManager()
 
-    end_ts_env = os.getenv("SIM_END_EPOCH")
-    end_ts = int(end_ts_env) if end_ts_env else None
-
-    # Bootstrap default user and runners if none exist
-    with DBManager() as db:
-        u = db.get_user_by_username("analytics")
-        if u is None:
-            try:
-                u = db.create_user(username="analytics", email="analytics@example.com", password="analytics")
-            except Exception:
-                u = db.get_user_by_username("analytics")
-        if u:
-            existing = db.get_runners_by_user(user_id=u.id)
-            if not existing:
-                _bootstrap_runners(db, u)
-
-    log.info("Analytics simulation initialized at %s", datetime.fromtimestamp(ts, tz=timezone.utc))
-    
-    # Initialize simulation state as stopped - user will start manually from UI
-    with DBManager() as db:
-        u = db.get_user_by_username("analytics")
-        if u:
-            st = db.db.query(SimulationState).filter(SimulationState.user_id == u.id).first()
-            if not st:
-                st = SimulationState(user_id=u.id, is_running="false")
-                db.db.add(st)
-            else:
-                st.is_running = "false"
-            st.last_ts = datetime.fromtimestamp(ts, tz=timezone.utc)
-            db.db.commit()
-
-    tick_count = 0
-    last_log_time = 0
-    
-    while True:
-        # Respect persisted start/stop state
-        with DBManager() as db:
-            u = db.get_user_by_username("analytics")
-            st = db.db.query(SimulationState).filter(SimulationState.user_id == (u.id if u else -1)).first() if u else None
-            if not st or st.is_running != "true":
-                await asyncio.sleep(1.0)
-                continue
-        
-        current_dt = datetime.fromtimestamp(ts, tz=timezone.utc)
-        
-        if end_ts and ts > end_ts:
-            log.info("Reached end of simulation at %s", current_dt)
-            break
-            
-        try:
-            # Log every tick for now to see progress
-            log.info("Processing tick #%d at %s (epoch: %d)", tick_count, current_dt, ts)
-            await _tick_users(ts)
-            tick_count += 1
-            
-            # Log progress more frequently for visibility
-            if tick_count % 10 == 0 or (ts - last_log_time) >= 3600:  # Every 10 ticks or every hour
-                log.info("Simulation progress: Tick #%d, Time: %s, Epoch: %d", tick_count, current_dt, ts)
-                last_log_time = ts
-                
-        except Exception:
-            log.exception("Tick failed at %s", current_dt)
-
-        ts += step_seconds
-        
-        # Persist last ts every 10 ticks to reduce DB load
-        if tick_count % 10 == 0:
-            with DBManager() as db:
-                u = db.get_user_by_username("analytics")
-                if u:
-                    st = db.db.query(SimulationState).filter(SimulationState.user_id == u.id).first()
-                    if not st:
-                        st = SimulationState(user_id=u.id, is_running="true")
-                        db.db.add(st)
-                    st.last_ts = datetime.fromtimestamp(ts, tz=timezone.utc)
-                    db.db.commit()
-                    log.debug("Persisted simulation time: %s", st.last_ts)
-                
-        if pace_seconds:
-            await asyncio.sleep(pace_seconds)
-
-
-def _bootstrap_runners(db: DBManager, user: User) -> None:
-    from sqlalchemy import select
-    from database.db_core import engine
-    from database.models import HistoricalDailyBar
-
-    # Strategies to include (exclude Fibonacci)
-    strategies = [
-        "test",
-        "triple_top_break",
-        "below_above",
-        "chatgpt_5_strategy",
-        "grok_4_strategy",
-    ]
-    timeframes = [(5, "5m"), (1440, "1d")]
-    default_budget = float(os.getenv("SIM_DEFAULT_BUDGET", "10000"))
-    symbol_limit = int(os.getenv("SIM_SYMBOL_LIMIT", "0"))  # 0 = all
-
-    try:
-        with engine.connect() as conn:
-            syms = [r[0] for r in conn.execute(select(HistoricalDailyBar.symbol).distinct().order_by(HistoricalDailyBar.symbol.asc())).all()]
-        log.info(f"Found {len(syms)} symbols for bootstrapping runners")
-        
-        if symbol_limit > 0:
-            syms = syms[:symbol_limit]
-            log.info(f"Limited to {len(syms)} symbols due to SIM_SYMBOL_LIMIT")
-
-        created = 0
-        errors = 0
-        
-        for sym in syms:
-            for strat in strategies:
-                for tf_val, tf_name in timeframes:
-                    name = f"{sym}-{strat}-{tf_name}"
-                    try:
-                        db.create_runner(
-                            user_id=user.id,
-                            data={
-                                "name": name,
-                                "strategy": strat,
-                                "budget": default_budget,
-                                "stock": sym,
-                                "time_frame": tf_val,
-                                "time_range_from": None,
-                                "time_range_to": None,
-                                "exit_strategy": "hold_forever",
-                                "parameters": {},
-                            },
-                        )
-                        created += 1
-                    except Exception as e:
-                        errors += 1
-                        log.debug(f"Failed to create runner {name}: {e}")
-                        # Skip duplicates and continue
-                        continue
-        
-        if created:
-            log.info("Bootstrapped %d runners for analytics user (errors: %d)", created, errors)
+    # Decide the session clock symbol up-front (resilient)
+    step_sec = _step_seconds()
+    tf_min = step_sec // 60
+    requested_clock = os.getenv("SIM_REFERENCE_CLOCK_SYMBOL", "SPY").upper()
+    clock_sym = requested_clock
+    if not mkt.has_minute_bars(clock_sym, tf_min):
+        picked = mkt.pick_reference_symbol(interval_min=tf_min)
+        if picked:
+            log.info(
+                "Session clock '%s' unavailable at %dm — switching to '%s'. "
+                "Provide SIM_REFERENCE_CLOCK_SYMBOL to override.",
+                requested_clock, tf_min, picked
+            )
+            clock_sym = picked
         else:
-            log.warning("No runners were created during bootstrap (errors: %d)", errors)
-            
-    except Exception as e:
-        log.error(f"Failed to bootstrap runners: {e}")
-        raise
+            log.warning(
+                "No obvious clock symbol found for %dm. Will rely on GLOBAL fallback (any symbol).",
+                tf_min
+            )
+
+    log.info(
+        "Simulation scheduler loop started. LOG_LEVEL=%s  tick_log_every=%s  boundary_refresh_ticks=%s  clock_symbol=%s",
+        os.getenv("LOG_LEVEL", "DEBUG"),
+        tick_log_every,
+        boundary_refresh_ticks,
+        (clock_sym or "<global>"),
+    )
+
+    # Log 5m data boundaries once at startup (and fetch daily min date)
+    min_5m_dt = max_5m_dt = min_daily_dt = None
+    try:
+        from sqlalchemy import select, func
+        from database.models import HistoricalMinuteBar, HistoricalDailyBar
+        with DBManager() as db:
+            with db.db.bind.connect() as conn:  # type: ignore[attr-defined]
+                min_5m_dt = conn.execute(select(func.min(HistoricalMinuteBar.ts))).scalar()
+                max_5m_dt = conn.execute(select(func.max(HistoricalMinuteBar.ts))).scalar()
+                min_daily_dt = conn.execute(select(func.min(HistoricalDailyBar.date))).scalar()
+        log.info("Historical 5m data range: start=%s end=%s", min_5m_dt, max_5m_dt)
+    except Exception:
+        log.exception("Failed to log historical range at startup")
+
+    # Cached boundaries reused across ticks; optionally refreshed by env
+    cached_min_ts = min_5m_dt
+    cached_max_ts = max_5m_dt
+    cached_min_daily = min_daily_dt
+
+    # ── Internal monotonic clock (source of truth for advancing) ──
+    state_epoch: int | None = None  # seconds since epoch, UTC
+
+    tick = 0
+    while True:
+        pace = _read_pace_seconds()
+        try:
+            await _heartbeat()
+
+            from sqlalchemy import select, func, text
+            from database.models import HistoricalMinuteBar, HistoricalDailyBar
+
+            with DBManager() as db:
+                user = db.get_user_by_username("analytics")
+                if not user:
+                    await asyncio.sleep(1.0)
+                    continue
+
+                uid = int(getattr(user, "id"))
+                st = db.db.query(SimulationState).filter(SimulationState.user_id == uid).first()
+                if not st:
+                    st = SimulationState(user_id=uid, is_running="false")
+                    db.db.add(st)
+                    db.db.commit()
+                    await asyncio.sleep(1.0)
+                    continue
+
+                if str(st.is_running).lower() not in {"true", "1"}:
+                    if tick % 10 == 0:
+                        log.debug("Idle: simulation not running")
+                    await asyncio.sleep(1.0)
+                    tick += 1
+                    continue
+
+                # ── Boundaries: optionally refresh on a cadence ───────────────
+                if (
+                    cached_min_ts is None or
+                    cached_max_ts is None or
+                    (boundary_refresh_ticks > 0 and tick % boundary_refresh_ticks == 0)
+                ):
+                    with db.db.bind.connect() as conn:  # type: ignore[attr-defined]
+                        cached_min_ts = conn.execute(select(func.min(HistoricalMinuteBar.ts))).scalar()
+                        cached_max_ts = conn.execute(select(func.max(HistoricalMinuteBar.ts))).scalar()
+                        cached_min_daily = conn.execute(select(func.min(HistoricalDailyBar.date))).scalar()
+
+                if not cached_min_ts or not cached_max_ts:
+                    log.warning("No minute bars present; pausing run.")
+                    await asyncio.sleep(1.0)
+                    tick += 1
+                    continue
+
+                step_sec = _step_seconds()
+                warmup_bars = _warmup_bars_default()
+                daily_warmup_days = _daily_warmup_days_default()
+                session_warmup_bars = _session_warmup_bars_default()
+
+                min_epoch = int(cached_min_ts.replace(tzinfo=timezone.utc).timestamp())
+                max_epoch = int(cached_max_ts.replace(tzinfo=timezone.utc).timestamp())
+
+                # Base: earliest 5m + warmup bars (raw)
+                base_start_epoch = min_epoch + warmup_bars * step_sec
+
+                # Daily guard: earliest daily + N days
+                if cached_min_daily:
+                    min_daily_epoch = int(cached_min_daily.replace(tzinfo=timezone.utc).timestamp())
+                    daily_guard_epoch = min_daily_epoch + daily_warmup_days * 86400
+                    desired_start = max(base_start_epoch, daily_guard_epoch)
+                else:
+                    desired_start = base_start_epoch
+
+                # Align to the **next real market candle** (preferred clock or global fallback)
+                aligned_dt = mkt.get_next_session_ts(
+                    datetime.fromtimestamp(desired_start, tz=timezone.utc),
+                    interval_min=step_sec // 60,
+                    reference_symbol=clock_sym if clock_sym else None,
+                )
+                if aligned_dt is None:
+                    aligned_dt = mkt.get_next_session_ts_global(
+                        datetime.fromtimestamp(desired_start, tz=timezone.utc),
+                        interval_min=step_sec // 60,
+                    )
+                if aligned_dt is not None:
+                    desired_start = min(int(aligned_dt.timestamp()), max_epoch)
+
+                # Normalize DB value (if any)
+                db_epoch = _ts(st.last_ts)
+
+                # Initialize internal clock once
+                if state_epoch is None:
+                    base = db_epoch if (db_epoch is not None) else desired_start
+                    base_dt = datetime.fromtimestamp(min(max(base, desired_start), max_epoch), tz=timezone.utc)
+                    next_dt = mkt.get_next_session_ts(
+                        base_dt,
+                        interval_min=step_sec // 60,
+                        reference_symbol=clock_sym if clock_sym else None,
+                    )
+                    if next_dt is None:
+                        next_dt = mkt.get_next_session_ts_global(base_dt, interval_min=step_sec // 60)
+                    if next_dt is None:
+                        st.is_running = "false"
+                        db.db.commit()
+                        log.info("No session ticks available at/after %s. Stopping.", base_dt.isoformat())
+                        await asyncio.sleep(1.0)
+                        tick += 1
+                        continue
+
+                    state_epoch = int(next_dt.timestamp())
+
+                    # Per-day session warmup anchored to **NY open**
+                    open_epoch = _ny_open_epoch_for_day(next_dt)
+                    warmup_epoch = open_epoch + session_warmup_bars * step_sec
+                    if state_epoch < warmup_epoch <= max_epoch:
+                        log.debug(
+                            "Session warmup: skipping to %s after NY open (%d bars).",
+                            datetime.fromtimestamp(warmup_epoch, tz=timezone.utc).isoformat(),
+                            session_warmup_bars,
+                        )
+                        state_epoch = warmup_epoch
+
+                    # Persist start monotonically
+                    target_dt = datetime.fromtimestamp(state_epoch, tz=timezone.utc)
+                    db.db.execute(
+                        text(
+                            "UPDATE simulation_state "
+                            "   SET last_ts = CASE WHEN last_ts IS NULL OR last_ts < :ts THEN :ts ELSE last_ts END "
+                            " WHERE user_id = :uid"
+                        ),
+                        {"ts": target_dt, "uid": uid},
+                    )
+                    db.db.commit()
+
+                    st.last_ts = target_dt
+                    log.info(
+                        "Initialized simulation clock: db_epoch=%s desired_start(aligned)=%s -> start_at=%s (clock=%s)",
+                        db_epoch, desired_start, st.last_ts.isoformat(), (clock_sym or "<global>")
+                    )
+                else:
+                    # Re-read fresh DB value for comparison
+                    db_epoch = _ts(
+                        db.db.query(SimulationState.last_ts)
+                        .filter(SimulationState.user_id == uid)
+                        .scalar()
+                    )
+
+                    # Guard against DB regression (someone wrote an earlier ts)
+                    if db_epoch is not None and (db_epoch + step_sec) < state_epoch:
+                        log.warning(
+                            "Detected DB last_ts regression (%s < %s). Overwriting with monotonic clock.",
+                            db_epoch, state_epoch
+                        )
+                        target_dt = datetime.fromtimestamp(state_epoch, tz=timezone.utc)
+                        db.db.execute(
+                            text(
+                                "UPDATE simulation_state "
+                                "   SET last_ts = CASE WHEN last_ts IS NULL OR last_ts < :ts THEN :ts ELSE last_ts END "
+                                " WHERE user_id = :uid"
+                            ),
+                            {"ts": target_dt, "uid": uid},
+                        )
+                        db.db.commit()
+
+                    # If DB jumped forward (manual fast-forward), adopt it (align to next session)
+                    if db_epoch is not None and db_epoch > state_epoch + step_sec:
+                        log.info(
+                            "Adopting DB fast-forward: state_epoch=%s -> db_epoch=%s",
+                            state_epoch, db_epoch
+                        )
+                        jump_dt = datetime.fromtimestamp(db_epoch, tz=timezone.utc)
+                        next_dt = mkt.get_next_session_ts(
+                            jump_dt,
+                            interval_min=step_sec // 60,
+                            reference_symbol=clock_sym if clock_sym else None,
+                        )
+                        if next_dt is None:
+                            next_dt = mkt.get_next_session_ts_global(jump_dt, interval_min=step_sec // 60)
+                        if next_dt is None:
+                            st.is_running = "false"
+                            db.db.commit()
+                            log.info("No session ticks available at/after %s. Stopping.", jump_dt.isoformat())
+                            await asyncio.sleep(1.0)
+                            tick += 1
+                            continue
+                        state_epoch = int(next_dt.timestamp())
+
+                # End-of-data check
+                if state_epoch >= max_epoch:
+                    st.is_running = "false"
+                    db.db.commit()
+                    log.info("Reached end of historical data (%s). Stopping simulation.", cached_max_ts.isoformat())
+                    await asyncio.sleep(1.0)
+                    tick += 1
+                    continue
+
+                # ── Session-aware selection of the current tick ────────────────
+                cur_dt = datetime.fromtimestamp(state_epoch, tz=timezone.utc)
+
+                # Advance **one** tick (the one at state_epoch)
+                cur_ts, stats = await _advance_one_tick(rs, state_epoch)
+
+                # Compute the **next** market-session tick strictly after cur_dt
+                next_dt = mkt.get_next_session_ts(
+                    cur_dt,
+                    interval_min=_step_seconds() // 60,
+                    reference_symbol=clock_sym if clock_sym else None,
+                )
+                if next_dt is None:
+                    next_dt = mkt.get_next_session_ts_global(cur_dt, interval_min=_step_seconds() // 60)
+                if next_dt is None:
+                    st.is_running = "false"
+                    db.db.commit()
+                    log.info("No further session ticks after %s. Stopping simulation.", cur_dt.isoformat())
+                    await asyncio.sleep(1.0)
+                    tick += 1
+                    continue
+
+                state_epoch = int(next_dt.timestamp())
+
+                # Persist next_ts monotonically
+                target_dt = datetime.fromtimestamp(state_epoch, tz=timezone.utc)
+                db.db.execute(
+                    text(
+                        "UPDATE simulation_state "
+                        "   SET last_ts = CASE WHEN last_ts IS NULL OR last_ts < :ts THEN :ts ELSE last_ts END "
+                        " WHERE user_id = :uid"
+                    ),
+                    {"ts": target_dt, "uid": uid},
+                )
+                db.db.commit()
+                st.last_ts = target_dt
+
+                # ── Progress indicator ───────────────
+                start_epoch = int(desired_start)
+                total_span = max(1, max_epoch - start_epoch)
+                done_span = max(0, cur_ts - start_epoch)
+                pct = max(0.0, min(100.0, (done_span / total_span) * 100.0))
+
+                if tick % tick_log_every == 0:
+                    as_of_s = datetime.fromtimestamp(cur_ts, tz=timezone.utc).isoformat()
+                    next_s = datetime.fromtimestamp(state_epoch, tz=timezone.utc).isoformat()
+                    pace_label = "full-speed" if pace <= 0 else f"{pace:.2f}s delay"
+                    log.debug(
+                        "TICK #%d as_of=%s → next=%s | runners: processed=%d buys=%d sells=%d "
+                        "no_action=%d skipped_no_data=%d skipped_no_budget=%d errors=%d | "
+                        "progress=%.4f%% (session-aware; clock=%s; pace=%s)",
+                        tick,
+                        as_of_s,
+                        next_s,
+                        int(stats.get("processed", 0)),
+                        int(stats.get("buys", 0)),
+                        int(stats.get("sells", 0)),
+                        int(stats.get("no_action", 0)),
+                        int(stats.get("skipped_no_data", 0)),
+                        int(stats.get("skipped_no_budget", 0)),
+                        int(stats.get("errors", 0)),
+                        pct,
+                        (clock_sym or "<global>"),
+                        pace_label,
+                    )
+
+                await asyncio.sleep(pace if pace > 0 else 0)
+                tick += 1
+
+        except Exception:
+            log.exception("Scheduler loop error")
+            # brief back-off so we don't spin on same exception
+            await asyncio.sleep(0.5)
+            tick += 1
 
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-

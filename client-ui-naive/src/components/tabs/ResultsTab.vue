@@ -5,11 +5,20 @@
       <n-card title="Monthly P&L Summary by Year" :bordered="false" size="small">
         <n-space vertical>
           <n-button @click="loadMonthlySummary" :loading="loadingMonthly">Refresh Monthly Summary</n-button>
+
           <div v-if="monthlySummary">
-            <div v-for="(yearData, year) in monthlySummary" :key="year" class="year-section">
+            <div
+              v-for="(yearData, year) in monthlySummary"
+              :key="String(year)"
+              class="year-section"
+            >
               <n-text strong>{{ year }}</n-text>
               <n-space vertical size="small">
-                <div v-for="(monthData, month) in yearData" :key="`${year}-${month}`" class="month-row">
+                <div
+                  v-for="(monthData, month) in yearData"
+                  :key="`${year}-${month}`"
+                  class="month-row"
+                >
                   <n-text>{{ getMonthName(month) }}:</n-text>
                   <n-text>Results: {{ monthData.result_count }}</n-text>
                   <n-text>Avg P&L: ${{ monthData.avg_pnl_amount.toFixed(2) }}</n-text>
@@ -27,6 +36,7 @@
       <n-card title="Development Results (Recent)" :bordered="false" size="small">
         <n-space vertical>
           <n-button @click="loadPartialResults" :loading="loadingPartial">Refresh Partial Results</n-button>
+
           <div v-if="partialResults">
             <n-text strong>Execution Stats ({{ partialResults.period_days }} days):</n-text>
             <n-space vertical size="small">
@@ -36,9 +46,14 @@
               <n-text>Skipped: {{ partialResults.execution_stats.skipped }}</n-text>
               <n-text>Avg Execution Time: {{ (partialResults.execution_stats.avg_execution_time_seconds || 0).toFixed(2) }}s</n-text>
             </n-space>
-            
+
             <n-text strong>Recent Results ({{ partialResults.results_count }}):</n-text>
-            <n-data-table :columns="partialColumns" :data="partialResults.recent_results" :bordered="false" size="small" />
+            <n-data-table
+              :columns="partialColumns"
+              :data="partialResults.recent_results"
+              :bordered="false"
+              size="small"
+            />
           </div>
         </n-space>
       </n-card>
@@ -52,7 +67,14 @@
             <n-select v-model:value="filters.timeframe" :options="tfOptions" placeholder="Timeframe" clearable style="width: 140px" />
             <n-button type="primary" @click="load">Apply</n-button>
           </n-space>
-          <n-data-table :columns="columns" :data="rows" :bordered="false" size="small" :single-line="false" />
+
+          <n-data-table
+            :columns="columns"
+            :data="rows"
+            :bordered="false"
+            size="small"
+            :single-line="false"
+          />
         </n-space>
       </n-card>
     </n-space>
@@ -65,8 +87,13 @@ import axios from 'axios';
 import { useMessage } from 'naive-ui';
 
 const message = useMessage();
+
 const filters = ref({ symbol: '', strategy: '', timeframe: null });
-const tfOptions = [ { label: '5m', value: '5m' }, { label: '1d', value: '1d' } ];
+const tfOptions = [
+  { label: '5m', value: '5m' },
+  { label: '1d', value: '1d' }
+];
+
 const rows = ref([]);
 const monthlySummary = ref(null);
 const partialResults = ref(null);
@@ -81,7 +108,7 @@ const columns = [
   { title: 'Final P&L', key: 'final_pnl_amount', sorter: 'default' },
   { title: 'Final %', key: 'final_pnl_percent', sorter: 'default' },
   { title: 'Start', key: 'start_ts' },
-  { title: 'End', key: 'end_ts' },
+  { title: 'End', key: 'end_ts' }
 ];
 
 const partialColumns = [
@@ -92,22 +119,23 @@ const partialColumns = [
   { title: '%', key: 'final_pnl_percent' },
   { title: 'Trades', key: 'trades_count' },
   { title: 'Duration (days)', key: 'days_duration' },
-  { title: 'End Date', key: 'end_ts' },
+  { title: 'End Date', key: 'end_ts' }
 ];
 
 function getMonthName(month) {
+  const m = parseInt(month, 10);
   const months = [
-    'January', 'February', 'March', 'April', 'May', 'June',
-    'July', 'August', 'September', 'October', 'November', 'December'
+    'January','February','March','April','May','June',
+    'July','August','September','October','November','December'
   ];
-  return months[parseInt(month) - 1] || month;
+  return months[(m - 1) % 12] || String(month);
 }
 
 async function loadMonthlySummary() {
   loadingMonthly.value = true;
   try {
     const res = await axios.get('/api/analytics/results/monthly-summary');
-    monthlySummary.value = res.data.monthly_summary;
+    monthlySummary.value = res.data?.monthly_summary || {};
   } catch (err) {
     message.error('Failed to load monthly summary');
   } finally {
@@ -133,7 +161,10 @@ async function load() {
     if (filters.value.symbol) params.append('symbol', filters.value.symbol);
     if (filters.value.strategy) params.append('strategy', filters.value.strategy);
     if (filters.value.timeframe) params.append('timeframe', filters.value.timeframe);
-    const res = await axios.get(`/api/analytics/results?${params.toString()}`);
+    const url = params.toString()
+      ? `/api/analytics/results?${params.toString()}`
+      : '/api/analytics/results';
+    const res = await axios.get(url);
     rows.value = res.data || [];
   } catch (err) {
     message.error('Failed to load results');
@@ -149,24 +180,17 @@ onMounted(() => {
 
 <style scoped>
 .wrap { padding: 8px; }
-
 .year-section {
   margin-bottom: 16px;
   padding: 8px;
   border: 1px solid #444;
   border-radius: 4px;
 }
-
 .month-row {
   display: flex;
   gap: 16px;
   padding: 4px 0;
   border-bottom: 1px solid #333;
 }
-
-.month-row:last-child {
-  border-bottom: none;
-}
+.month-row:last-child { border-bottom: none; }
 </style>
-
-

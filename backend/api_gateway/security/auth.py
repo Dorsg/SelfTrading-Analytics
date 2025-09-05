@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta, timezone
 from typing import Optional
+import os
 
 from jose import jwt, JWTError          # pip install python-jose
 from passlib.context import CryptContext  # pip install passlib[bcrypt]
@@ -10,9 +11,9 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from database.models import User
 
 # ───── settings (put real values in .env) ────────────────────────────
-SECRET_KEY  = "CHANGE_ME"                # env: AUTH_SECRET_KEY
-ALGORITHM   = "HS256"
-ACCESS_TTL  = 60 * 24                    # minutes (1 day)
+SECRET_KEY  = os.getenv("AUTH_SECRET_KEY", "CHANGE_ME")
+ALGORITHM   = os.getenv("AUTH_ALGORITHM", "HS256")
+ACCESS_TTL  = int(os.getenv("AUTH_ACCESS_TTL_MINUTES", str(60 * 24)))  # minutes (default 1 day)
 
 pwd_ctx  = CryptContext(schemes=["bcrypt"], deprecated="auto")
 bearer   = HTTPBearer(auto_error=False)  # we’ll raise ourselves
@@ -56,10 +57,10 @@ def get_current_user(
                 raise HTTPException(status.HTTP_401_UNAUTHORIZED, "User not found")
             return user
     except HTTPException:
-        # Re-raise HTTP exceptions (401) as-is
         raise
     except Exception:
         # Database connection issues should return 503 Service Unavailable
-        # rather than 500 Internal Server Error for auth issues
-        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, 
-                           "Authentication service temporarily unavailable")
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE, 
+            "Authentication service temporarily unavailable"
+        )

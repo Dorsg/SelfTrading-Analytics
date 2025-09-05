@@ -1,99 +1,74 @@
-"""
-Analytics logger configuration
-──────────────────────────────────────────────────────────────────────────────
-• Rotating file handlers mirroring the main app
-• Root logger also writes WARN/ERROR to errors_warnings.log
-• Stdlib warnings routed into logging
-• Safe if coloredlogs is missing
-"""
-
-from __future__ import annotations
-import logging, logging.config, os, time
+import logging
+import os
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-# Optional pretty console logs
-try:
-    import coloredlogs  # type: ignore
-except Exception:  # pragma: no cover
-    coloredlogs = None  # type: ignore
+LOG_DIR = Path(os.getenv("LOG_DIR", "/root/projects/SelfTrading Analytics/logs"))
+LOG_DIR.mkdir(parents=True, exist_ok=True)
 
-# ───────────────────────── directories ──────────────────────────
-DEFAULT_LOG_DIR = Path(os.getenv("LOG_DIR", "/app/logs"))
-DEFAULT_LOG_DIR.mkdir(parents=True, exist_ok=True)
 
-# ───────────────────────── env toggles ──────────────────────────
-DISABLE_STDOUT  = os.getenv("NO_STDOUT_LOG", "0") == "1"
-LOG_LEVEL       = os.getenv("LOG_LEVEL",      "INFO").upper()
-
-# Rotation settings
-LOG_MAX_BYTES   = int(os.getenv("LOG_MAX_BYTES", str(50 * 1024 * 1024)))
-LOG_BACKUP_COUNT= int(os.getenv("LOG_BACKUP_COUNT", "10"))
-
-def _handler_file(path: Path, level: str | None = None) -> dict:
-    h = {
-        "class": "logging.handlers.RotatingFileHandler",
-        "filename": str(path),
-        "maxBytes": LOG_MAX_BYTES,
-        "backupCount": LOG_BACKUP_COUNT,
-        "formatter": "detailed",
-        "encoding": "utf-8",
-    }
-    if level:
-        h["level"] = level
-    return h
-
-LOGGING_CONFIG: dict = {
-    "version": 1,
-    "disable_existing_loggers": False,
-
-    "formatters": {
-        "detailed": {"format": "[%(asctime)s] %(levelname)-7s %(name)s: %(message)s"},
-    },
-
-    "handlers": {
-        # generic
-        "console": {"class": "logging.StreamHandler", "formatter": "detailed"},
-        "file_root": _handler_file(DEFAULT_LOG_DIR / "app.log"),
-        "file_warn_error": _handler_file(DEFAULT_LOG_DIR / "errors_warnings.log", level="WARNING"),
-
-        # components
-        "file_scheduler": _handler_file(DEFAULT_LOG_DIR / "sim_scheduler.log"),
-        "file_runner_service": _handler_file(DEFAULT_LOG_DIR / "runner-service.log"),
-        "file_basic_strategy": _handler_file(DEFAULT_LOG_DIR / "basic-strategy.log"),
-        "file_below_above_strategy": _handler_file(DEFAULT_LOG_DIR / "below-above-strategy.log"),
-        "file_chatgpt_5_strategy": _handler_file(DEFAULT_LOG_DIR / "chatgpt-5-strategy.log"),
-        "file_grok_4_strategy": _handler_file(DEFAULT_LOG_DIR / "grok-4-strategy.log"),
-        "file_sync_service": _handler_file(DEFAULT_LOG_DIR / "sync-service.log"),
-        "file_api_gateway": _handler_file(DEFAULT_LOG_DIR / "api_gateway.log"),
-        "file_db_debug": _handler_file(DEFAULT_LOG_DIR / "db-debug.log"),
-    },
-
-    "loggers": {
-        "": {"level": LOG_LEVEL, "handlers": (["console"] if not DISABLE_STDOUT else []) + ["file_root", "file_warn_error"]},
-        "AnalyticsScheduler": {"level": "INFO", "handlers": (["console"] if not DISABLE_STDOUT else []) + ["file_scheduler", "file_warn_error"], "propagate": False},
-        "runner-service": {"level": "INFO", "handlers": (["console"] if not DISABLE_STDOUT else []) + ["file_runner_service", "file_warn_error"], "propagate": False},
-        "basic-strategy": {"level": "INFO", "handlers": (["console"] if not DISABLE_STDOUT else []) + ["file_basic_strategy", "file_warn_error"], "propagate": False},
-        "below-above-strategy": {"level": "INFO", "handlers": (["console"] if not DISABLE_STDOUT else []) + ["file_below_above_strategy", "file_warn_error"], "propagate": False},
-        "chatgpt-5-strategy": {"level": "INFO", "handlers": (["console"] if not DISABLE_STDOUT else []) + ["file_chatgpt_5_strategy", "file_warn_error"], "propagate": False},
-        "grok-4-strategy": {"level": "INFO", "handlers": (["console"] if not DISABLE_STDOUT else []) + ["file_grok_4_strategy", "file_warn_error"], "propagate": False},
-        "sync-service": {"level": "INFO", "handlers": (["console"] if not DISABLE_STDOUT else []) + ["file_sync_service", "file_warn_error"], "propagate": False},
-        "api-gateway": {"level": "INFO", "handlers": (["console"] if not DISABLE_STDOUT else []) + ["file_api_gateway", "file_warn_error"], "propagate": False},
-        "market-data-manager": {"level": "INFO", "handlers": (["console"] if not DISABLE_STDOUT else []) + ["file_api_gateway", "file_warn_error"], "propagate": False},
-        "runner-decision-builder": {"level": "INFO", "handlers": (["console"] if not DISABLE_STDOUT else []) + ["file_runner_service", "file_warn_error"], "propagate": False},
-        "sqlalchemy": {"level": os.getenv("DB_DEBUG_ENABLED", "false").lower() == "true" and "DEBUG" or "WARNING", "handlers": ["file_db_debug", "file_warn_error"] + (["console"] if not DISABLE_STDOUT else []), "propagate": False},
-    },
-
-    "root": {"level": "WARNING", "handlers": (["console"] if not DISABLE_STDOUT else []) + ["file_warn_error", "file_root"]},
-}
+def _mk_handler(filename: str, level: int) -> RotatingFileHandler:
+    fh = RotatingFileHandler(
+        LOG_DIR / filename,
+        maxBytes=int(os.getenv("LOG_MAX_BYTES", str(10 * 1024 * 1024))),
+        backupCount=int(os.getenv("LOG_BACKUP_COUNT", "5")),
+        encoding="utf-8",
+    )
+    # NOTE: Use %(asctime)s and %(msecs)03d — strftime-based %f is not supported here.
+    fmt = logging.Formatter(
+        fmt="[%(asctime)s,%(msecs)03d] %(levelname)-7s %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    fh.setFormatter(fmt)
+    fh.setLevel(level)
+    return fh
 
 
 def setup_logging() -> None:
-    logging.config.dictConfig(LOGGING_CONFIG)
-    # capture stdlib warnings
-    import warnings
-    logging.captureWarnings(True)
-    # colored console if available
-    if coloredlogs:
-        coloredlogs.install(level=LOG_LEVEL, fmt="[%(asctime)s] %(levelname)-7s %(name)s: %(message)s")
+    root_level = getattr(logging, os.getenv("LOG_LEVEL", "DEBUG").upper(), logging.DEBUG)
+    logging.basicConfig(level=root_level)
 
+    # Core logs
+    loggers = {
+        "AnalyticsScheduler": ("sim_scheduler.log", logging.DEBUG),
+        "runner-service": ("runner-service.log", logging.DEBUG),
+        "mock-broker": (
+            "mock-broker.log",
+            getattr(logging, os.getenv("LOG_MOCK_BROKER_LEVEL", "INFO").upper(), logging.INFO),
+        ),
+        "grok-4-strategy": ("grok-4-strategy.log", logging.DEBUG),
+        "chatgpt-5-strategy": ("chatgpt-5-strategy.log", logging.INFO),
+        "api-gateway": ("api_gateway.log", logging.INFO),
+        "errors_warnings": ("errors_warnings.log", logging.WARNING),
+        "app": ("app.log", logging.INFO),
+        "trades": ("trades.log", logging.INFO),
 
+        # Data / session clock visibility
+        "market-data-manager": ("market_data_manager.log", logging.INFO),
+
+        # NEW: you already mirrored runner execution lines to a dedicated logger — give it a sink.
+        "runner-executions": ("runner_executions.log", logging.INFO),
+    }
+
+    for name, (file, level) in loggers.items():
+        lg = logging.getLogger(name)
+        lg.setLevel(level)
+        if not any(
+            isinstance(h, RotatingFileHandler) and getattr(h, "baseFilename", "").endswith(file)
+            for h in lg.handlers
+        ):
+            lg.addHandler(_mk_handler(file, level))
+
+    # Ensure all WARNING+ logs from any logger also go to errors_warnings.log
+    root_logger = logging.getLogger()
+    root_logger.setLevel(root_level)
+    ew_file = "errors_warnings.log"
+    if not any(
+        isinstance(h, RotatingFileHandler) and getattr(h, "baseFilename", "").endswith(ew_file)
+        for h in root_logger.handlers
+    ):
+        root_logger.addHandler(_mk_handler(ew_file, logging.WARNING))
+
+    # Quiet noisy libs unless explicitly raised
+    logging.getLogger("uvicorn.error").setLevel(logging.INFO)
+    logging.getLogger("asyncio").setLevel(logging.WARNING)

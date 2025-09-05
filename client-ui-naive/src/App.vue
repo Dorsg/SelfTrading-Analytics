@@ -37,7 +37,6 @@
 import {
   ref,
   computed,
-  watch,
   onMounted,
   onBeforeUnmount,
 } from "vue";
@@ -47,25 +46,12 @@ import {
   AnalyticsOutline
 } from "@vicons/ionicons5";
 
-
-// Analytics mode - no inactivity timer needed
-
-
-const router = useRouter();
-
-
 // Analytics mode - no authentication required
+const router = useRouter();
 const user = ref({ username: "analytics" });
 const isAuth = ref(true); // Always authenticated in analytics mode
 
-/* Capitalized username */
-const capitalizedUsername = computed(() => {
-  if (!user.value?.username) return "";
-  return user.value.username.charAt(0).toUpperCase() + user.value.username.slice(1);
-});
-
 /* ───────── helpers ───────── */
-
 function goHome() {
   try {
     localStorage.setItem("activeTab", "account");
@@ -79,13 +65,9 @@ function resetInactivityTimer() {
   // No-op in analytics mode
 }
 
-
-
 onMounted(() => {
   // Analytics mode - no authentication events needed
 });
-
-
 
 onBeforeUnmount(() => {
   // Analytics mode - no cleanup needed

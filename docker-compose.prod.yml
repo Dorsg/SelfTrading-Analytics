@@ -81,7 +81,6 @@ services:
     stop_grace_period: 60s
     volumes:
       - pg_data:/var/lib/postgresql/data
-      - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/00-init-db.sql:ro
       - ./scripts/10-init-app-user.sh:/docker-entrypoint-initdb.d/10-init-app-user.sh:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB} && psql -U ${POSTGRES_USER} -d ${POSTGRES_DB} -c 'SELECT 1' || exit 1"]
@@ -89,7 +88,6 @@ services:
       timeout: 5s
       retries: 10
       start_period: 45s
-
 
   db-init-tables:
     build:
@@ -100,13 +98,11 @@ services:
     env_file: .env
     environment:
       DATABASE_URL_DOCKER: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
-      DB_ALLOW_AUTO_CREATE_DB: "true"
       DB_ALLOW_AUTO_CREATE_TABLES: "true"
     depends_on:
       db:
         condition: service_healthy
     entrypoint: ["python", "-m", "backend.database.init_db"]
-
 
   import-historical-bars:
     build:
@@ -118,64 +114,28 @@ services:
     environment:
       DATABASE_URL_DOCKER: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
       ANALYTICS_SQLITE_PATH: /app/tools/finnhub_downloader/data/daily_bars.sqlite
-    volumes:
-      - ./logs:/app/logs
-      - .:/app
     depends_on:
       db:
         condition: service_healthy
       db-init-tables:
         condition: service_completed_successfully
-    # Prevent Docker from timing out on long-running import
-    stop_grace_period: 300s
-    healthcheck:
-      disable: true  # Disable health checks for long-running import
-    entrypoint: ["python", "-m", "backend.analytics_importer"]
+    volumes:
+      - ./tools/finnhub_downloader/data:/app/tools/finnhub_downloader/data:ro
+      - ./logs:/app/logs
+    command: ["python", "-m", "backend.analytics_importer"]
 
-  api_gateway:
+  api:
     build:
       context: .
       dockerfile: Dockerfile.api
-    container_name: analytics-api-gateway
-    restart: unless-stopped
-    env_file:
-      - .env
-    volumes:
-      - ./logs:/app/logs
+    container_name: analytics-api
+    restart: always
+    env_file: .env
     environment:
       DATABASE_URL_DOCKER: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
-      RUNNING_ENV: production
-
-      DB_ALLOW_AUTO_CREATE_DB: "false"
-      DB_ALLOW_AUTO_CREATE_TABLES: "false"
-    depends_on:
-      db:
-        condition: service_healthy
-      db-init-tables:
-        condition: service_completed_successfully
-
-  client-ui:
-    build:
-      context: .
-      dockerfile: Dockerfile.client-ui-naive
-    container_name: analytics-client-ui
-    restart: unless-stopped
-    ports:
-      - "8080:80"
-    depends_on:
-      - api_gateway
-
-  scheduler:
-    build:
-      context: .
-      dockerfile: Dockerfile.scheduler
-    container_name: analytics-scheduler
-    restart: always
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-      - ./logs:/app/logs
-    env_file:
-      - .env
+      DB_ALLOW_AUTO_CREATE_TABLES: "true"
+      EXTERNAL_SCHEDULER: "1"
+      SIM_AUTO_START: "1"
     depends_on:
       db:
         condition: service_healthy
@@ -183,16 +143,25 @@ services:
         condition: service_completed_successfully
       import-historical-bars:
         condition: service_completed_successfully
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./logs:/app/logs
+
+  scheduler:
+    build:
+      context: .
+      dockerfile: Dockerfile.scheduler
+    container_name: analytics-scheduler
+    restart: always
+    env_file: .env
     environment:
       DATABASE_URL_DOCKER: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
-      RUNNING_ENV: production
-
-
-      DB_ALLOW_AUTO_CREATE_DB: "false"
-      DB_ALLOW_AUTO_CREATE_TABLES: "false"
-
-
-
-networks:
-  default:
-    name: selftrading_analytics_default
+      # How chatty the scheduler should be:
+      TICK_LOG_EVERY: ${TICK_LOG_EVERY:-1}
+    depends_on:
+      api:
+        condition: service_started
+    command: ["python", "-m", "backend.analytics.sim_scheduler"]
+    volumes:
+      - ./logs:/app/logs

@@ -72,13 +72,21 @@ def validate_decision(decision: Dict[str, Any] | None, *, is_exit: bool) -> Stra
         except Exception as e:
             raise StrategyDecisionError("limit_price must be a positive number for LMT") from e
 
-    # BUY must include either trailing stop or static stop
+    # BUY must include either trailing stop or static stop in live mode
     if action == "BUY":
         ts = out.get("trail_stop_order")
         ss = out.get("static_stop_order")
-        
-        if not isinstance(ts, dict) and not isinstance(ss, dict):
-            raise StrategyDecisionError("BUY decision must include either 'trail_stop_order' or 'static_stop_order' dict")
+
+        # In analytics-only mode we allow BUY without stop specs to keep simulations simple.
+        # Be tolerant: if RUNNING_ENV is missing, default to analytics to avoid accidental strict blocking
+        import os
+        running_env = os.getenv("RUNNING_ENV", "analytics").lower()
+        if running_env == "analytics":
+            # nothing to enforce here for analytics
+            pass
+        else:
+            if not isinstance(ts, dict) and not isinstance(ss, dict):
+                raise StrategyDecisionError("BUY decision must include either 'trail_stop_order' or 'static_stop_order' dict")
         
         # Validate trailing stop if provided
         if isinstance(ts, dict):
