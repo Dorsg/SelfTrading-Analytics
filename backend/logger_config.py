@@ -46,8 +46,14 @@ def setup_logging() -> None:
         # Data / session clock visibility
         "market-data-manager": ("market_data_manager.log", logging.INFO),
 
-        # NEW: you already mirrored runner execution lines to a dedicated logger — give it a sink.
+        # Runner execution mirroring
         "runner-executions": ("runner_executions.log", logging.INFO),
+
+        # Universe + importer (added sinks)
+        "universe": ("universe.log", logging.INFO),
+        "analytics-importer": ("analytics_importer.log", logging.INFO),
+        # Back-compat if any code still uses underscore variant
+        "analytics_importer": ("analytics_importer.log", logging.INFO),
     }
 
     for name, (file, level) in loggers.items():

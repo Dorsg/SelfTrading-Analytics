@@ -189,6 +189,10 @@ class RunnerExecution(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
     execution_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow, index=True)
 
+    __table_args__ = (
+        UniqueConstraint("runner_id", "symbol", "strategy", "execution_time", name="uq_runner_exec_key"),
+    )
+
 
 class AnalyticsResult(Base):
     __tablename__ = "analytics_results"

@@ -6,11 +6,13 @@ import logging
 import os
 from datetime import datetime, timezone, timedelta, date, time
 
-from logger_config import setup_logging  # ← ensure file handlers & levels
+from logger_config import setup_logging  # ensure file handlers & levels
 from database.db_manager import DBManager
 from database.models import SimulationState
+from database.db_core import engine
 from backend.analytics.runner_service import RunnerService
 from backend.ib_manager.market_data_manager import MarketDataManager
+from backend.universe import UniverseManager
 
 # Configure logging for this process
 setup_logging()
@@ -128,6 +130,7 @@ async def main() -> None:
 
     rs = RunnerService()
     mkt = MarketDataManager()
+    uni = UniverseManager()
 
     # Decide the session clock symbol up-front (resilient)
     step_sec = _step_seconds()
@@ -162,11 +165,10 @@ async def main() -> None:
     try:
         from sqlalchemy import select, func
         from database.models import HistoricalMinuteBar, HistoricalDailyBar
-        with DBManager() as db:
-            with db.db.bind.connect() as conn:  # type: ignore[attr-defined]
-                min_5m_dt = conn.execute(select(func.min(HistoricalMinuteBar.ts))).scalar()
-                max_5m_dt = conn.execute(select(func.max(HistoricalMinuteBar.ts))).scalar()
-                min_daily_dt = conn.execute(select(func.min(HistoricalDailyBar.date))).scalar()
+        with engine.connect() as conn:
+            min_5m_dt = conn.execute(select(func.min(HistoricalMinuteBar.ts))).scalar()
+            max_5m_dt = conn.execute(select(func.max(HistoricalMinuteBar.ts))).scalar()
+            min_daily_dt = conn.execute(select(func.min(HistoricalDailyBar.date))).scalar()
         log.info("Historical 5m data range: start=%s end=%s", min_5m_dt, max_5m_dt)
     except Exception:
         log.exception("Failed to log historical range at startup")
@@ -178,6 +180,9 @@ async def main() -> None:
 
     # ── Internal monotonic clock (source of truth for advancing) ──
     state_epoch: int | None = None  # seconds since epoch, UTC
+
+    # One-time daily resample gate (P1 hygiene)
+    daily_resample_done = False
 
     tick = 0
     while True:
@@ -216,7 +221,7 @@ async def main() -> None:
                     cached_max_ts is None or
                     (boundary_refresh_ticks > 0 and tick % boundary_refresh_ticks == 0)
                 ):
-                    with db.db.bind.connect() as conn:  # type: ignore[attr-defined]
+                    with engine.connect() as conn:
                         cached_min_ts = conn.execute(select(func.min(HistoricalMinuteBar.ts))).scalar()
                         cached_max_ts = conn.execute(select(func.max(HistoricalMinuteBar.ts))).scalar()
                         cached_min_daily = conn.execute(select(func.min(HistoricalDailyBar.date))).scalar()
@@ -246,7 +251,7 @@ async def main() -> None:
                 else:
                     desired_start = base_start_epoch
 
-                # Align to the **next real market candle** (preferred clock or global fallback)
+                # Align to the next real market candle (preferred clock or global fallback)
                 aligned_dt = mkt.get_next_session_ts(
                     datetime.fromtimestamp(desired_start, tz=timezone.utc),
                     interval_min=step_sec // 60,
@@ -257,6 +262,13 @@ async def main() -> None:
                         datetime.fromtimestamp(desired_start, tz=timezone.utc),
                         interval_min=step_sec // 60,
                     )
+                # Ensure the returned ts has a clock bar; otherwise advance once
+                if aligned_dt is not None and clock_sym:
+                    if not mkt.has_bar_at(clock_sym, step_sec // 60, aligned_dt):
+                        maybe = mkt.get_next_session_ts(aligned_dt, interval_min=step_sec // 60, reference_symbol=clock_sym)
+                        if maybe is not None:
+                            aligned_dt = maybe
+
                 if aligned_dt is not None:
                     desired_start = min(int(aligned_dt.timestamp()), max_epoch)
 
@@ -274,6 +286,13 @@ async def main() -> None:
                     )
                     if next_dt is None:
                         next_dt = mkt.get_next_session_ts_global(base_dt, interval_min=step_sec // 60)
+                    # Ensure the chosen next_dt has a clock bar; if not, advance again
+                    if next_dt is not None and clock_sym:
+                        if not mkt.has_bar_at(clock_sym, step_sec // 60, next_dt):
+                            maybe = mkt.get_next_session_ts(next_dt, interval_min=step_sec // 60, reference_symbol=clock_sym)
+                            if maybe is not None:
+                                next_dt = maybe
+
                     if next_dt is None:
                         st.is_running = "false"
                         db.db.commit()
@@ -282,9 +301,27 @@ async def main() -> None:
                         tick += 1
                         continue
 
+                    # Universe hygiene + daily resample before we start
+                    if not daily_resample_done:
+                        runner_syms = [r.stock for r in db.get_runners_by_user(user_id=uid, activation="active")]
+                        uni.ensure_loaded(runner_syms, mkt)
+                        allowed = sorted(uni.allowed_symbols())
+                        if allowed:
+                            try:
+                                mkt.ensure_daily_bars_for_symbols(
+                                    allowed,
+                                    end_date=next_dt,
+                                    lookback_days=int(os.getenv("DAILY_RESAMPLE_LOOKBACK_DAYS", "1460")),  # 4 years
+                                    source_interval_min=int(os.getenv("DAILY_RESAMPLE_SOURCE_MIN", "5")),
+                                    rth_only=True,
+                                )
+                            except Exception:
+                                log.exception("Pre-run daily resample failed")
+                        daily_resample_done = True
+
                     state_epoch = int(next_dt.timestamp())
 
-                    # Per-day session warmup anchored to **NY open**
+                    # Per-day session warmup anchored to NY open
                     open_epoch = _ny_open_epoch_for_day(next_dt)
                     warmup_epoch = open_epoch + session_warmup_bars * step_sec
                     if state_epoch < warmup_epoch <= max_epoch:
@@ -351,6 +388,11 @@ async def main() -> None:
                         )
                         if next_dt is None:
                             next_dt = mkt.get_next_session_ts_global(jump_dt, interval_min=step_sec // 60)
+                        if next_dt is not None and clock_sym:
+                            if not mkt.has_bar_at(clock_sym, step_sec // 60, next_dt):
+                                maybe = mkt.get_next_session_ts(next_dt, interval_min=step_sec // 60, reference_symbol=clock_sym)
+                                if maybe is not None:
+                                    next_dt = maybe
                         if next_dt is None:
                             st.is_running = "false"
                             db.db.commit()
@@ -372,10 +414,10 @@ async def main() -> None:
                 # ── Session-aware selection of the current tick ────────────────
                 cur_dt = datetime.fromtimestamp(state_epoch, tz=timezone.utc)
 
-                # Advance **one** tick (the one at state_epoch)
+                # Advance one tick (the one at state_epoch)
                 cur_ts, stats = await _advance_one_tick(rs, state_epoch)
 
-                # Compute the **next** market-session tick strictly after cur_dt
+                # Compute the next market-session tick strictly after cur_dt
                 next_dt = mkt.get_next_session_ts(
                     cur_dt,
                     interval_min=_step_seconds() // 60,
@@ -383,6 +425,12 @@ async def main() -> None:
                 )
                 if next_dt is None:
                     next_dt = mkt.get_next_session_ts_global(cur_dt, interval_min=_step_seconds() // 60)
+                if next_dt is not None and clock_sym:
+                    if not mkt.has_bar_at(clock_sym, _step_seconds() // 60, next_dt):
+                        maybe = mkt.get_next_session_ts(next_dt, interval_min=_step_seconds() // 60, reference_symbol=clock_sym)
+                        if maybe is not None:
+                            next_dt = maybe
+
                 if next_dt is None:
                     st.is_running = "false"
                     db.db.commit()
@@ -406,7 +454,7 @@ async def main() -> None:
                 db.db.commit()
                 st.last_ts = target_dt
 
-                # ── Progress indicator ───────────────
+                # Progress indicator
                 start_epoch = int(desired_start)
                 total_span = max(1, max_epoch - start_epoch)
                 done_span = max(0, cur_ts - start_epoch)
@@ -418,7 +466,7 @@ async def main() -> None:
                     pace_label = "full-speed" if pace <= 0 else f"{pace:.2f}s delay"
                     log.debug(
                         "TICK #%d as_of=%s → next=%s | runners: processed=%d buys=%d sells=%d "
-                        "no_action=%d skipped_no_data=%d skipped_no_budget=%d errors=%d | "
+                        "no_action=%d skipped_no_data=%d skipped_no_budget=%d errors=%d post_tick_errors=%d | "
                         "progress=%.4f%% (session-aware; clock=%s; pace=%s)",
                         tick,
                         as_of_s,
@@ -430,6 +478,7 @@ async def main() -> None:
                         int(stats.get("skipped_no_data", 0)),
                         int(stats.get("skipped_no_budget", 0)),
                         int(stats.get("errors", 0)),
+                        int(stats.get("post_tick_errors", 0)),
                         pct,
                         (clock_sym or "<global>"),
                         pace_label,
@@ -440,10 +489,9 @@ async def main() -> None:
 
         except Exception:
             log.exception("Scheduler loop error")
-            # brief back-off so we don't spin on same exception
             await asyncio.sleep(0.5)
             tick += 1
 
-
 if __name__ == "__main__":
+    import asyncio
     asyncio.run(main())

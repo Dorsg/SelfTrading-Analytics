@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
 from sqlalchemy import select, func
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from database.db_core import SessionLocal
 from database.models import (
@@ -260,65 +261,118 @@ class DBManager(AbstractContextManager["DBManager"]):
         )
         return int(self._session.execute(stmt).scalar() or 0)
 
-
     def bulk_record_runner_executions(self, records: List[Dict[str, Any]]) -> None:
         """
         Fast path: insert many RunnerExecution rows in one commit.
 
         Expected keys per record:
-          runner_id, user_id, symbol, strategy, status, reason, details,
-          execution_time (datetime), cycle_seq (int)
+        runner_id, user_id, symbol, strategy, status, reason, details,
+        execution_time (datetime), cycle_seq (int)
 
         Notes:
-          • `symbol` is uppercased here.
-          • `created_at` is set to now.
-          • Mirrors compact lines to the 'runner-executions' logger, but
+        • `symbol` is uppercased here.
+        • `created_at` is set to now.
+        • Mirrors compact lines to the 'runner-executions' logger, but
             avoids per-row flush/commit overhead.
+        • Summary rows and runner_id<=0 rows are NOT persisted (only logged).
+        • Upsert de-dupes on (runner_id, symbol, strategy, execution_time).
+        • Self-healing: if the ON CONFLICT target is missing in this DB (older schema),
+            we fall back to a plain INSERT so we don't crash ticks.
         """
         if not records:
             return
 
-        objs: List[RunnerExecution] = []
         now = _now_utc()
+        # Filter out rows that will violate FK or are summaries; still mirror them to logs
+        clean_rows: List[dict] = []
         for rec in records:
             try:
-                objs.append(
-                    RunnerExecution(
-                        runner_id=int(rec.get("runner_id", 0)),
-                        user_id=int(rec.get("user_id", 0)),
-                        symbol=str(rec.get("symbol", "UNKNOWN")).upper(),
-                        strategy=str(rec.get("strategy", "")),
-                        status=str(rec.get("status", "")),
-                        reason=rec.get("reason"),
-                        details=rec.get("details"),
-                        cycle_seq=int(rec.get("cycle_seq", int(now.timestamp()))),
-                        execution_time=rec.get("execution_time") or now,
-                        created_at=now,
-                    )
+                runner_id = int(rec.get("runner_id", 0) or 0)
+                strategy = str(rec.get("strategy", "") or "")
+                if runner_id <= 0 or strategy.lower() == "summary":
+                    # mirror to log only; do not persist
+                    try:
+                        _exec_log.info(
+                            "cycle=%s time=%s runner=%s user=%s symbol=%s strategy=%s status=%s reason=%s",
+                            int(rec.get("cycle_seq", int(now.timestamp()))),
+                            (rec.get("execution_time") or now).isoformat(),
+                            runner_id,
+                            int(rec.get("user_id", 0) or 0),
+                            str(rec.get("symbol", "UNKNOWN")).upper(),
+                            strategy,
+                            str(rec.get("status", "")),
+                            str(rec.get("reason", "") or ""),
+                        )
+                    except Exception:
+                        pass
+                    continue
+
+                clean_rows.append(
+                    {
+                        "runner_id": runner_id,
+                        "user_id": int(rec.get("user_id", 0) or 0),
+                        "symbol": str(rec.get("symbol", "UNKNOWN")).upper(),
+                        "strategy": strategy,
+                        "status": str(rec.get("status", "")),
+                        "reason": rec.get("reason"),
+                        "details": rec.get("details"),
+                        "cycle_seq": int(rec.get("cycle_seq", int(now.timestamp()))),
+                        "execution_time": rec.get("execution_time") or now,
+                        "created_at": now,
+                    }
                 )
             except Exception:
-                # skip malformed rows safely
                 continue
 
-        if not objs:
+        if not clean_rows:
             return
 
-        self._session.add_all(objs)
-        self._session.commit()
-
-        # Lightweight mirror log (aggregated to reduce I/O)
+        # Module-scoped one-time flag to avoid log spam when falling back
+        global _RUNNER_EXEC_UPSERT_FALLBACK
         try:
-            for o in objs:
+            _RUNNER_EXEC_UPSERT_FALLBACK
+        except NameError:
+            _RUNNER_EXEC_UPSERT_FALLBACK = False  # type: ignore
+
+        table = RunnerExecution.__table__
+
+        # Try ON CONFLICT first (preferred, idempotent)
+        try:
+            stmt = pg_insert(table).values(clean_rows)
+            stmt = stmt.on_conflict_do_nothing(
+                index_elements=["runner_id", "symbol", "strategy", "execution_time"]
+            )
+            self._session.execute(stmt)
+            self._session.commit()
+        except Exception as e:
+            # If the DB doesn't have the unique/exclusion constraint, Postgres raises:
+            # psycopg2.errors.InvalidColumnReference (seen wrapped by SQLAlchemy).
+            self._session.rollback()
+            if not _RUNNER_EXEC_UPSERT_FALLBACK:
+                log.warning(
+                    "Upsert ON CONFLICT failed (likely missing unique key). "
+                    "Falling back to plain INSERT for runner_executions. Error=%s",
+                    getattr(e, "orig", e),
+                )
+                _RUNNER_EXEC_UPSERT_FALLBACK = True  # type: ignore
+            # Plain INSERT (may create duplicates across replays, but keeps the run healthy)
+            self._session.execute(table.insert(), clean_rows)
+            self._session.commit()
+
+        # Mirror clean rows to the execution log
+        try:
+            for r in clean_rows:
                 _exec_log.info(
                     "cycle=%s time=%s runner=%s user=%s symbol=%s strategy=%s status=%s reason=%s",
-                    o.cycle_seq,
-                    o.execution_time.isoformat(),
-                    o.runner_id,
-                    o.user_id,
-                    o.symbol,
-                    o.strategy,
-                    o.status,
-                    (o.reason or "")
+                    r["cycle_seq"],
+                    r["execution_time"].isoformat(),
+                    r["runner_id"],
+                    r["user_id"],
+                    r["symbol"],
+                    r["strategy"],
+                    r["status"],
+                    (r.get("reason") or ""),
                 )
         except Exception:
             pass
+

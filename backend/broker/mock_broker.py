@@ -1,135 +1,67 @@
 from __future__ import annotations
 
 import logging
+import math
+import os
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Optional, Dict, Any, List
+from datetime import datetime, timezone, timedelta
+from typing import Optional, Dict, Any, Tuple, Literal
 
 from database.db_manager import DBManager
-from database.models import Account, OpenPosition, Order, ExecutedTrade, Runner
-from trades_logger import log_buy, log_sell
+from database.models import OpenPosition, Order, ExecutedTrade, Account
 from backend.ib_manager.market_data_manager import MarketDataManager
+from backend.trades_logger import log_buy, log_sell
 
 log = logging.getLogger("mock-broker")
+
+SideT = Literal["LONG", "SHORT"]
 
 
 def _utc(dt: datetime) -> datetime:
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
+def _round4(x: float) -> float:
+    try:
+        return round(float(x), 4)
+    except Exception:
+        return x
+
+
 @dataclass(slots=True)
-class _RunnerLite:
-    id: int
-    user_id: int
-    stock: str
-    parameters: dict
+class _TrailMeta:
+    # Do not evaluate the trailing stop until this timestamp (activation delay)
+    do_not_trigger_before: datetime
+    # Track best price since entry (highest for long, lowest for short)
+    best_price: float
 
 
 class MockBroker:
     """
-    Lightweight fill-at-mid mock broker with:
-      • BUY/SELL market/limit fills (assumed immediate at provided `price`)
-      • Trailing and static stop management (evaluated on each tick)
-      • Mark-to-market account equity (cash + sum(position_value))
+    Lightweight simulation broker with trailing stop logic that mirrors live-broker behavior:
+
+      • For LONGS: stop starts BELOW price and trails up:  stop = max(prev_stop, best_price * (1 - pct))
+      • For SHORTS: stop starts ABOVE price and trails down: stop = min(prev_stop, best_price * (1 + pct))
+      • Guardrails ensure a stop never arms on the wrong side of price and never triggers on the entry tick.
+      • One-bar activation delay: the trailing stop is not evaluated until the *next* completed bar.
+
+    The broker stores trailing state with open positions and uses an in-memory meta table for per-position timing.
     """
 
     def __init__(self) -> None:
-        self.mkt = MarketDataManager()
+        self._trail_meta: Dict[int, _TrailMeta] = {}
+        self._mkt = MarketDataManager()
 
-    # ───────────────────────── helpers ─────────────────────────
+        # Safety epsilon to ensure "valid side" comparisons never equal on float edges
+        self._eps = float(os.getenv("TRAIL_STOP_EPS", "1e-6"))
 
-    def _runner_lite(self, runner: Any) -> _RunnerLite:
-        return _RunnerLite(
-            id=int(getattr(runner, "id", 0) or 0),
-            user_id=int(getattr(runner, "user_id", 0) or 0),
-            stock=str(getattr(runner, "stock", "UNKNOWN") or "UNKNOWN").upper(),
-            parameters=dict(getattr(runner, "parameters", {}) or {}),
-        )
-
-    def _get_acct(self, db: DBManager, user_id: int) -> Account:
-        # Ensure an account exists; RunnerService also ensures, but be defensive.
-        return db.ensure_account(user_id=user_id, name="mock")
-
-    # ───────────────────────── public API ─────────────────────────
-
-    def on_tick(self, *, user_id: int, runner: Runner | _RunnerLite, price: float, at: datetime) -> None:
-        """
-        Update trailing/static stops for the position and execute if hit.
-        """
-        at = _utc(at)
-        rl = self._runner_lite(runner)
-
-        with DBManager() as db:
-            pos: Optional[OpenPosition] = (
-                db.db.query(OpenPosition)
-                .filter(OpenPosition.user_id == user_id, OpenPosition.runner_id == rl.id)
-                .first()
-            )
-            if not pos:
-                return
-
-            # Update highest_price for trailing stops
-            if (pos.trail_percent or 0) > 0:
-                hp = float(pos.highest_price or pos.avg_price or price)
-                if price > hp:
-                    pos.highest_price = price
-                    db.db.commit()
-
-                trail_pct = float(pos.trail_percent or 0.0)
-                stop_trail = float((pos.highest_price or hp) * (1.0 - trail_pct / 100.0))
-                if price <= stop_trail and pos.quantity > 0:
-                    log.info("Trailing stop hit for runner=%s %s at %.4f <= stop %.4f", rl.id, rl.stock, price, stop_trail)
-                    self.sell_all(
-                        user_id=user_id,
-                        runner=runner,
-                        symbol=rl.stock,
-                        price=price,
-                        decision={"reason": "trailing_stop_hit"},
-                        at=at,
-                        reason_override="trailing_stop_hit",
-                    )
-                    return  # Position closed; nothing else to check
-
-            # Static stop
-            if (pos.stop_price or 0) > 0 and pos.quantity > 0:
-                if price <= float(pos.stop_price):
-                    log.info("Static stop hit for runner=%s %s at %.4f <= stop %.4f", rl.id, rl.stock, price, float(pos.stop_price))
-                    self.sell_all(
-                        user_id=user_id,
-                        runner=runner,
-                        symbol=rl.stock,
-                        price=price,
-                        decision={"reason": "static_stop_hit"},
-                        at=at,
-                        reason_override="static_stop_hit",
-                    )
-
-    def arm_trailing_stop_once(self, *, user_id: int, runner: Runner | _RunnerLite, entry_price: float, trail_pct: float, at: datetime) -> None:
-        """
-        If a position exists and has no trailing stop, arm one.
-        """
-        at = _utc(at)
-        rl = self._runner_lite(runner)
-        with DBManager() as db:
-            pos: Optional[OpenPosition] = (
-                db.db.query(OpenPosition)
-                .filter(OpenPosition.user_id == user_id, OpenPosition.runner_id == rl.id)
-                .first()
-            )
-            if not pos:
-                return
-            if (pos.trail_percent or 0) > 0:
-                return  # already armed
-            pos.trail_percent = float(trail_pct)
-            pos.highest_price = float(entry_price)
-            db.db.commit()
-            log.info("Armed trailing stop %.2f%% for runner=%s %s", float(trail_pct), rl.id, rl.stock)
+    # ─────────────────────────── Public API ───────────────────────────
 
     def buy(
         self,
         *,
         user_id: int,
-        runner: Runner | _RunnerLite,
+        runner,
         symbol: str,
         price: float,
         quantity: int,
@@ -137,107 +69,265 @@ class MockBroker:
         at: datetime,
     ) -> bool:
         at = _utc(at)
-        rl = self._runner_lite(runner)
-        symbol = (symbol or rl.stock).upper()
+        symbol = (symbol or "").upper()
         if quantity <= 0 or price <= 0:
+            log.warning("BUY rejected: invalid qty/price (qty=%s price=%s) %s", quantity, price, symbol)
             return False
 
         with DBManager() as db:
-            acct = self._get_acct(db, user_id)
-            cost = float(price) * int(quantity)
-            try:
-                if float(acct.cash or 0.0) < cost:
-                    log.info("BUY rejected (insufficient cash) user=%s runner=%s need=%.2f have=%.2f", user_id, rl.id, cost, float(acct.cash or 0.0))
-                    return False
-            except Exception:
+            # One open position per runner; skip if exists
+            pos = db.get_open_position(runner_id=int(getattr(runner, "id")))
+            if pos:
+                log.info("BUY ignored: position already open for runner_id=%s symbol=%s", runner.id, symbol)
                 return False
 
-            # Upsert position (1 position per runner)
-            pos: Optional[OpenPosition] = (
-                db.db.query(OpenPosition)
-                .filter(OpenPosition.user_id == user_id, OpenPosition.runner_id == rl.id)
-                .first()
+            # Basic cash guard
+            acct: Account = db.ensure_account(user_id=user_id, name="mock")
+            notional = float(quantity) * float(price)
+            if float(acct.cash or 0.0) < notional:
+                log.info("BUY rejected: insufficient cash (need=%.2f have=%.2f)", notional, float(acct.cash or 0.0))
+                return False
+
+            # Create position
+            pos = OpenPosition(
+                user_id=user_id,
+                runner_id=int(getattr(runner, "id")),
+                symbol=symbol,
+                account="mock",
+                quantity=int(quantity),
+                avg_price=float(price),
+                created_at=at,
+                stop_price=None,
+                trail_percent=None,
+                highest_price=float(price),  # for LONGs; shorts will maintain best in meta
             )
-            if pos:
-                # Aggregate into existing position with new avg price
-                new_qty = int((pos.quantity or 0) + quantity)
-                if new_qty <= 0:
-                    return False
-                new_cost = (float(pos.avg_price) * int(pos.quantity)) + cost
-                pos.quantity = new_qty
-                pos.avg_price = new_cost / new_qty
-                # Reset stops to the most conservative values from decision (if provided)
-            else:
-                pos = OpenPosition(
-                    user_id=user_id,
-                    runner_id=rl.id,
-                    symbol=symbol,
-                    account="mock",
-                    quantity=int(quantity),
-                    avg_price=float(price),
-                    created_at=at,
-                    stop_price=None,
-                    trail_percent=None,
-                    highest_price=None,
-                )
-                db.db.add(pos)
+            db.db.add(pos)
 
-            # Apply stop specs from decision
-            if isinstance(decision, dict):
-                ss = decision.get("static_stop_order") or {}
-                tp = decision.get("trail_stop_order") or {}
-                try:
-                    sp = ss.get("stop_price")
-                    if sp is not None and float(sp) > 0:
-                        pos.stop_price = float(sp)
-                except Exception:
-                    pass
-                try:
-                    trailing_percent = tp.get("trailing_percent")
-                    if trailing_percent is not None and float(trailing_percent) > 0:
-                        pos.trail_percent = float(trailing_percent)
-                        pos.highest_price = max(float(pos.highest_price or 0.0), float(price))
-                except Exception:
-                    pass
+            # Account movement and a BUY order record
+            acct.cash = float(acct.cash or 0.0) - notional
+            acct.equity = float(acct.equity or 0.0) + notional  # mark-to-market will keep refining this
 
-            # Create an order record (filled)
             ord = Order(
                 user_id=user_id,
-                runner_id=rl.id,
+                runner_id=int(getattr(runner, "id")),
                 symbol=symbol,
                 side="BUY",
-                order_type=(str(decision.get("order_type")) if decision else "MKT"),
+                order_type=str((decision or {}).get("order_type", "MKT")).upper(),
                 quantity=int(quantity),
-                limit_price=decision.get("limit_price") if decision else None,
-                stop_price=(decision.get("stop_price") or (decision.get("static_stop_order") or {}).get("stop_price")) if decision else None,
+                limit_price=float((decision or {}).get("limit_price") or 0) or None,
+                stop_price=None,
                 status="filled",
                 created_at=at,
                 filled_at=at,
                 details=None,
             )
             db.db.add(ord)
-
-            # Deduct cash; equity recalculated in mark_to_market
-            acct.cash = float(acct.cash or 0.0) - cost
             db.db.commit()
 
             log_buy(
                 user_id=user_id,
-                runner_id=rl.id,
+                runner_id=int(getattr(runner, "id")),
                 symbol=symbol,
                 qty=float(quantity),
                 price=float(price),
                 as_of=at,
-                reason=str((decision or {}).get("reason") or (decision or {}).get("explanation") or ""),
+                reason=(decision or {}).get("reason", "") or "strategy_buy",
             )
-            log.info("BUY filled user=%s runner=%s %s x%d @ %.4f", user_id, rl.id, symbol, int(quantity), float(price))
             return True
+
+    def arm_trailing_stop_once(
+        self,
+        *,
+        user_id: int,
+        runner,
+        entry_price: float,
+        trail_pct: float,
+        at: datetime,
+        interval_min: Optional[int] = None,
+    ) -> None:
+        """
+        Initialize trailing stop fields and arm the 1-bar activation delay.
+
+        LONG:  initial stop = entry * (1 - pct)
+        SHORT: initial stop = entry * (1 + pct)
+
+        Guardrail: if computed stop is on the wrong side of price, clamp to the valid side and DO NOT trigger on this bar.
+        """
+        at = _utc(at)
+        rid = int(getattr(runner, "id"))
+        tf_min = int(interval_min or int(os.getenv("SIM_STEP_SECONDS", "300")) // 60 or 5)
+        delay = timedelta(minutes=tf_min)
+
+        with DBManager() as db:
+            pos = db.get_open_position(runner_id=rid)
+            if not pos:
+                return  # nothing to arm
+
+            # If already armed, do not rearm
+            if (pos.trail_percent or 0) > 0 and pos.stop_price is not None:
+                # Refresh delay meta if missing (idempotent safety)
+                self._trail_meta.setdefault(
+                    rid,
+                    _TrailMeta(do_not_trigger_before=pos.created_at + delay, best_price=float(pos.highest_price or pos.avg_price)),
+                )
+                return
+
+            side = self._infer_side(pos)
+
+            pct = float(trail_pct) / 100.0
+            if pct <= 0:
+                return
+
+            if side == "LONG":
+                init_stop = entry_price * (1.0 - pct)
+                # Guardrail: ensure strictly below price
+                if init_stop >= entry_price:
+                    log.error(
+                        "Arming trail: invalid LONG stop computed >= price (stop=%.6f price=%.6f). Clamping.",
+                        init_stop,
+                        entry_price,
+                    )
+                    init_stop = entry_price - max(entry_price * pct, self._eps)
+
+                pos.highest_price = float(entry_price)
+                pos.stop_price = _round4(init_stop)
+                pos.trail_percent = float(trail_pct)
+                db.db.commit()
+
+                self._trail_meta[rid] = _TrailMeta(
+                    do_not_trigger_before=pos.created_at + delay,
+                    best_price=float(entry_price),
+                )
+                log.info(
+                    "Trailing armed LONG: runner=%s sym=%s entry=%.4f stop=%.4f pct=%.2f delay_until=%s",
+                    rid,
+                    pos.symbol,
+                    entry_price,
+                    pos.stop_price,
+                    trail_pct,
+                    (pos.created_at + delay).isoformat(),
+                )
+                return
+
+            # SHORT (supported for compute parity; sim engine is long-only today)
+            init_stop = entry_price * (1.0 + pct)
+            if init_stop <= entry_price:
+                log.error(
+                    "Arming trail: invalid SHORT stop computed <= price (stop=%.6f price=%.6f). Clamping.",
+                    init_stop,
+                    entry_price,
+                )
+                init_stop = entry_price + max(entry_price * pct, self._eps)
+
+            # We store best_price in meta; DB only has highest_price column—leave it as entry for observability
+            pos.highest_price = float(entry_price)
+            pos.stop_price = _round4(init_stop)
+            pos.trail_percent = float(trail_pct)
+            db.db.commit()
+
+            self._trail_meta[rid] = _TrailMeta(
+                do_not_trigger_before=pos.created_at + delay,
+                best_price=float(entry_price),
+            )
+            log.info(
+                "Trailing armed SHORT: runner=%s sym=%s entry=%.4f stop=%.4f pct=%.2f delay_until=%s",
+                rid,
+                pos.symbol,
+                entry_price,
+                pos.stop_price,
+                trail_pct,
+                (pos.created_at + delay).isoformat(),
+            )
+
+    def on_tick(self, *, user_id: int, runner, price: float, at: datetime) -> None:
+        """
+        Update trailing stops and flatten if hit.
+        """
+        at = _utc(at)
+        rid = int(getattr(runner, "id"))
+
+        with DBManager() as db:
+            pos = db.get_open_position(runner_id=rid)
+            if not pos:
+                return
+
+            side = self._infer_side(pos)
+            pct = float(pos.trail_percent or 0.0)
+            if pct <= 0.0:
+                return  # no trailing stop for this position
+
+            meta = self._trail_meta.get(rid)
+            if not meta:
+                meta = _TrailMeta(do_not_trigger_before=pos.created_at, best_price=float(pos.highest_price or pos.avg_price))
+                self._trail_meta[rid] = meta
+
+            # Update "best price" in the favorable direction
+            if side == "LONG":
+                meta.best_price = max(float(meta.best_price), float(price))
+                pos.highest_price = float(meta.best_price)
+                new_stop = max(float(pos.stop_price or -math.inf), float(meta.best_price) * (1.0 - pct / 100.0))
+                new_stop = _round4(new_stop)
+
+                # Guardrail: if somehow stop is not strictly below price, clamp and avoid triggering on this tick
+                if new_stop >= price:
+                    log.error(
+                        "Trailing LONG guard: computed stop >= price (stop=%.6f price=%.6f). Clamping and skipping this tick.",
+                        new_stop,
+                        price,
+                    )
+                    pos.stop_price = _round4(min(price - self._eps, new_stop))
+                    db.db.commit()
+                    return
+
+                # Persist any trail-up
+                if pos.stop_price is None or new_stop > float(pos.stop_price):
+                    pos.stop_price = new_stop
+                    db.db.commit()
+                    log.debug(
+                        "Trail update LONG: runner=%s %s best=%.4f stop=%.4f",
+                        rid, pos.symbol, meta.best_price, pos.stop_price
+                    )
+
+                # Activation delay: do not evaluate until next bar
+                if at < meta.do_not_trigger_before:
+                    return
+
+                # Trigger?
+                if price <= float(pos.stop_price):
+                    self._exit_trailing_stop(db, pos, user_id, runner, price, at)
+                return
+
+            # SHORT
+            meta.best_price = min(float(meta.best_price), float(price))
+            new_stop = min(float(pos.stop_price or math.inf), float(meta.best_price) * (1.0 + pct / 100.0))
+            new_stop = _round4(new_stop)
+
+            if new_stop <= price:
+                log.error(
+                    "Trailing SHORT guard: computed stop <= price (stop=%.6f price=%.6f). Clamping and skipping this tick.",
+                    new_stop,
+                    price,
+                )
+                pos.stop_price = _round4(max(price + self._eps, new_stop))
+                db.db.commit()
+                return
+
+            if pos.stop_price is None or new_stop < float(pos.stop_price):
+                pos.stop_price = new_stop
+                db.db.commit()
+                log.debug("Trail update SHORT: runner=%s %s best=%.4f stop=%.4f", rid, pos.symbol, meta.best_price, pos.stop_price)
+
+            if at < meta.do_not_trigger_before:
+                return
+
+            if price >= float(pos.stop_price):
+                self._exit_trailing_stop(db, pos, user_id, runner, price, at)
 
     def sell_all(
         self,
         *,
         user_id: int,
-        runner: Runner | _RunnerLite,
+        runner,
         symbol: str,
         price: float,
         decision: Dict[str, Any] | None,
@@ -245,31 +335,38 @@ class MockBroker:
         reason_override: Optional[str] = None,
     ) -> bool:
         at = _utc(at)
-        rl = self._runner_lite(runner)
-        symbol = (symbol or rl.stock).upper()
+        symbol = (symbol or "").upper()
+        rid = int(getattr(runner, "id"))
 
         with DBManager() as db:
-            pos: Optional[OpenPosition] = (
-                db.db.query(OpenPosition)
-                .filter(OpenPosition.user_id == user_id, OpenPosition.runner_id == rl.id)
-                .first()
-            )
-            if not pos or int(pos.quantity or 0) <= 0:
+            pos = db.get_open_position(runner_id=rid)
+            if not pos:
                 return False
 
-            qty = int(pos.quantity)
-            avg_price = float(pos.avg_price or 0.0)
+            qty = float(pos.quantity or 0)
+            if qty == 0:
+                return False
 
-            # Create order record (filled)
+            avg = float(pos.avg_price or 0.0)
+            pnl = (float(price) - avg) * qty
+            pnl_pct = 0.0 if avg == 0 else ((float(price) / avg) - 1.0) * 100.0
+
+            # Account
+            acct: Account = db.ensure_account(user_id=user_id, name="mock")
+            notional = qty * float(price)
+            acct.cash = float(acct.cash or 0.0) + notional
+            acct.equity = float(acct.equity or 0.0)  # mark-to-market will update later
+
+            # Order + ExecutedTrade
             ord = Order(
                 user_id=user_id,
-                runner_id=rl.id,
+                runner_id=rid,
                 symbol=symbol,
                 side="SELL",
-                order_type=(str(decision.get("order_type")) if decision else "MKT"),
-                quantity=qty,
-                limit_price=decision.get("limit_price") if decision else None,
-                stop_price=decision.get("stop_price") if decision else None,
+                order_type=str((decision or {}).get("order_type", "MKT")).upper(),
+                quantity=int(qty),
+                limit_price=float((decision or {}).get("limit_price") or 0) or None,
+                stop_price=None,
                 status="filled",
                 created_at=at,
                 filled_at=at,
@@ -277,103 +374,158 @@ class MockBroker:
             )
             db.db.add(ord)
 
-            # Credit cash for the sale
-            acct = self._get_acct(db, user_id)
-            proceeds = float(price) * qty
-            acct.cash = float(acct.cash or 0.0) + proceeds
+            tr = ExecutedTrade(
+                perm_id=None,
+                user_id=user_id,
+                runner_id=rid,
+                symbol=symbol,
+                buy_ts=pos.created_at,
+                sell_ts=at,
+                buy_price=_round4(avg),
+                sell_price=_round4(price),
+                quantity=qty,
+                pnl_amount=_round4(pnl),
+                pnl_percent=_round4(pnl_pct),
+                strategy=str(getattr(runner, "strategy", "")),
+                timeframe=str(int(getattr(runner, "time_frame", 5) or 5)) + "m",
+            )
+            db.db.add(tr)
 
-            # Record execution summary (optional in analytics)
-            try:
-                db.db.add(
-                    ExecutedTrade(
-                        user_id=user_id,
-                        runner_id=rl.id,
-                        symbol=symbol,
-                        buy_ts=None,
-                        sell_ts=at,
-                        buy_price=avg_price,
-                        sell_price=float(price),
-                        quantity=float(qty),
-                        pnl_amount=(float(price) - avg_price) * float(qty),
-                        pnl_percent=(0.0 if avg_price == 0 else ((float(price) / avg_price) - 1.0) * 100.0),
-                        strategy=None,
-                        timeframe=None,
-                    )
-                )
-            except Exception:
-                pass
-
-            # Delete the open position
-            try:
-                db.db.delete(pos)
-            except Exception:
-                # In rare cases (constraints), zero it out instead
-                pos.quantity = 0
+            # Remove open position
+            db.db.delete(pos)
             db.db.commit()
 
-            reason = reason_override or str((decision or {}).get("reason") or (decision or {}).get("explanation") or "strategy_sell")
+            # Clear meta
+            self._trail_meta.pop(rid, None)
+
             log_sell(
                 user_id=user_id,
-                runner_id=rl.id,
+                runner_id=rid,
                 symbol=symbol,
-                qty=float(qty),
-                avg_price=avg_price,
+                qty=qty,
+                avg_price=avg,
                 price=float(price),
                 as_of=at,
-                reason=reason,
+                reason=(reason_override or (decision or {}).get("reason") or "strategy_sell"),
             )
-            log.info("SELL filled user=%s runner=%s %s x%d @ %.4f (%s)", user_id, rl.id, symbol, qty, float(price), reason)
             return True
 
     def mark_to_market_all(self, *, user_id: int, at: datetime) -> None:
         """
-        Refresh account equity and trailing-stop anchors based on last available prices.
-        Missing prices are skipped (WARN once); the routine must never raise.
+        Refresh account equity from last prices; cash unchanged.
         """
         at = _utc(at)
         with DBManager() as db:
-            positions: List[OpenPosition] = (
-                db.db.query(OpenPosition)
-                .filter(OpenPosition.user_id == user_id)
-                .all()
-            )
+            acct = db.ensure_account(user_id=user_id, name="mock")
+            # Get all open positions
+            from sqlalchemy import select
+            from database.models import OpenPosition
+            positions = db.db.execute(
+                select(OpenPosition.symbol, OpenPosition.quantity, OpenPosition.avg_price)
+                .where(OpenPosition.user_id == user_id)
+            ).all()
             if not positions:
-                # Keep equity == cash if flat
-                try:
-                    acct = self._get_acct(db, user_id)
-                    acct.equity = float(acct.cash or 0.0)
-                    db.db.commit()
-                except Exception:
-                    pass
+                # Equity equals cash when no positions
+                acct.equity = float(acct.cash or 0.0)
+                db.db.commit()
                 return
 
-            syms = [p.symbol.upper() for p in positions]
-            try:
-                # Use 5-minute prices by default for intraday MTM
-                last_px = self.mkt.get_last_close_for_symbols(syms, 5, at, regular_hours_only=True)
-            except Exception:
-                log.exception("mark_to_market_all: price fetch failed")
-                last_px = {}
+            symbols = [row._mapping["symbol"] for row in positions]
+            tf = 5  # use 5m for mark-to-market in sim window
+            last_prices = self._mkt.get_last_close_for_symbols(symbols, minutes=tf, as_of=at, regular_hours_only=True)
+            equity = float(acct.cash or 0.0)
+            for row in positions:
+                m = row._mapping
+                s = m["symbol"]
+                qty = float(m["quantity"] or 0)
+                avg = float(m["avg_price"] or 0.0)
+                px = float(last_prices.get(s, avg))
+                equity += qty * px
+            acct.equity = equity
+            db.db.commit()
 
-            # Revalue positions, update trailing anchors, recompute equity
-            total_mkt_value = 0.0
-            for p in positions:
-                px = float(last_px.get(p.symbol.upper(), 0.0) or 0.0)
-                if px > 0:
-                    total_mkt_value += px * int(p.quantity or 0)
+    # ─────────────────────────── Helpers ───────────────────────────
 
-                    # Bump highest_price for trailing stops
-                    if (p.trail_percent or 0) > 0:
-                        hp = float(p.highest_price or p.avg_price or px)
-                        if px > hp:
-                            p.highest_price = px
-                else:
-                    # No price available — skip; don't error
-                    pass
+    @staticmethod
+    def _infer_side(pos: OpenPosition) -> SideT:
+        """
+        LONG if quantity > 0, else SHORT (sim engine is long-only currently).
+        """
+        try:
+            return "LONG" if float(pos.quantity or 0.0) > 0 else "SHORT"
+        except Exception:
+            return "LONG"
 
-            try:
-                acct = self._get_acct(db, user_id)
-                acct.equity = float(acct.cash or 0.0) + total_mkt_value
-                db.db.commit()
-            except Exception:
-                log.exception("mark_to_market_all: failed to update account equity")
+    def _exit_trailing_stop(
+        self,
+        db: DBManager,
+        pos: OpenPosition,
+        user_id: int,
+        runner,
+        price: float,
+        at: datetime,
+    ) -> None:
+        """
+        Execute a trailing-stop exit, with clear logging.
+        """
+        rid = int(getattr(runner, "id"))
+        side = self._infer_side(pos)
+        stop = float(pos.stop_price or 0.0)
+        log.info(
+            "Exit via trailing stop: runner=%s sym=%s side=%s price=%.4f stop=%.4f at=%s",
+            rid, pos.symbol, side, float(price), stop, _utc(at).isoformat()
+        )
+        self.sell_all(
+            user_id=user_id,
+            runner=runner,
+            symbol=pos.symbol,
+            price=float(price),
+            decision={"order_type": "MKT", "reason": "trailing_stop"},
+            at=at,
+            reason_override="trailing_stop",
+        )
+
+    # ─────────────────────────── Pure helpers (unit-test friendly) ───────────────────────────
+
+    @staticmethod
+    def compute_trail_update(
+        *,
+        side: SideT,
+        price: float,
+        trail_pct: float,
+        prev_stop: Optional[float],
+        prev_best: float,
+        eps: float = 1e-6,
+    ) -> Tuple[float, float]:
+        """
+        Pure math for trailing stops (no DB side effects).
+
+        Returns: (new_stop, new_best)
+
+        LONG : new_best = max(prev_best, price); new_stop = max(prev_stop, new_best * (1 - pct))
+        SHORT: new_best = min(prev_best, price); new_stop = min(prev_stop, new_best * (1 + pct))
+
+        Guarded so the stop always stays strictly on the correct side of price.
+        """
+        pct = float(trail_pct) / 100.0
+        if side == "LONG":
+            best = max(float(prev_best), float(price))
+            candidate = best * (1.0 - pct)
+            stop = candidate if prev_stop is None else max(float(prev_stop), candidate)
+            if stop >= price:
+                stop = min(price - eps, stop)
+            return (_round4(stop), best)
+
+        # SHORT
+        best = min(float(prev_best), float(price))
+        candidate = best * (1.0 + pct)
+        stop = candidate if prev_stop is None else min(float(prev_stop), candidate)
+        if stop <= price:
+            stop = max(price + eps, stop)
+        return (_round4(stop), best)
+
+    @staticmethod
+    def should_trigger_stop(*, side: SideT, price: float, stop: float) -> bool:
+        if side == "LONG":
+            return float(price) <= float(stop)
+        return float(price) >= float(stop)

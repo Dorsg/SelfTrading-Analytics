@@ -3,9 +3,10 @@ from __future__ import annotations
 import os
 import logging
 from datetime import datetime, timezone, timedelta, time, date
-from typing import List, Dict, Any, Tuple, Optional, Iterable
+from typing import List, Dict, Any, Tuple, Optional, Iterable, DefaultDict
+from collections import defaultdict
 
-from sqlalchemy import select, func
+from sqlalchemy import select, func, and_
 
 from database.db_core import engine
 from database.models import HistoricalMinuteBar, HistoricalDailyBar
@@ -96,6 +97,16 @@ class MarketDataManager:
                 .where(HistoricalDailyBar.symbol == symbol)
             ).scalar()
             return dt is not None
+
+    def earliest_daily_date(self, symbol: str) -> Optional[datetime]:
+        """Return the earliest daily 'date' for the symbol, or None if absent."""
+        symbol = (symbol or "").upper()
+        with engine.connect() as conn:
+            dt = conn.execute(
+                select(func.min(HistoricalDailyBar.date))
+                .where(HistoricalDailyBar.symbol == symbol)
+            ).scalar()
+            return dt
 
     def pick_reference_symbol(
         self,
@@ -345,6 +356,141 @@ class MarketDataManager:
                             out[s] = out[s][-lookback:]
 
         return out
+
+    # ─────────────────────────── resample helpers (5m → DAILY) ───────────────────────────
+
+    def _minutes_grouped_by_et_day(
+        self,
+        *,
+        symbol: str,
+        start: datetime,
+        end: datetime,
+        interval_min: int = 5,
+        rth_only: bool = True,
+    ) -> DefaultDict[date, List[Dict[str, Any]]]:
+        """
+        Return {ET_date: [minute bars]} within [start, end] (UTC datetimes).
+        """
+        symbol = symbol.upper()
+        start = _ensure_utc(start)
+        end = _ensure_utc(end)
+
+        grouped: DefaultDict[date, List[Dict[str, Any]]] = defaultdict(list)
+
+        with engine.connect() as conn:
+            rows = conn.execute(
+                select(
+                    HistoricalMinuteBar.ts,
+                    HistoricalMinuteBar.open,
+                    HistoricalMinuteBar.high,
+                    HistoricalMinuteBar.low,
+                    HistoricalMinuteBar.close,
+                    HistoricalMinuteBar.volume,
+                )
+                .where(HistoricalMinuteBar.symbol == symbol)
+                .where(HistoricalMinuteBar.interval_min == int(interval_min))
+                .where(and_(HistoricalMinuteBar.ts >= start, HistoricalMinuteBar.ts < end))
+                .order_by(HistoricalMinuteBar.ts.asc())
+            ).all()
+
+        for row in rows:
+            m = row._mapping
+            ts = m["ts"]
+            ts = ts if getattr(ts, "tzinfo", None) else ts.replace(tzinfo=timezone.utc)
+            if rth_only and not _is_regular_market_minute(ts):
+                continue
+            et_day = (ts.astimezone(_NY) if _NY else ts).date()
+            grouped[et_day].append(
+                {
+                    "ts": ts,
+                    "open": float(m["open"]),
+                    "high": float(m["high"]),
+                    "low": float(m["low"]),
+                    "close": float(m["close"]),
+                    "volume": int(m["volume"] or 0),
+                }
+            )
+        return grouped
+
+    def ensure_daily_bars_for_symbols(
+        self,
+        symbols: Iterable[str],
+        *,
+        end_date: datetime,
+        lookback_days: int = 3650,
+        source_interval_min: int = 5,
+        rth_only: bool = True,
+    ) -> int:
+        """
+        Ensure DAILY bars exist (derived from minutes) for all ET days within the
+        window [end_date - lookback_days, end_date] for the provided symbols.
+
+        Returns:
+            count of daily rows inserted across all symbols.
+        """
+        end_date = _ensure_utc(end_date)
+        start_date = end_date - timedelta(days=int(lookback_days))
+
+        total_inserted = 0
+
+        with engine.begin() as conn:
+            for raw in symbols:
+                s = (raw or "").upper()
+                if not s:
+                    continue
+
+                grouped = self._minutes_grouped_by_et_day(
+                    symbol=s, start=start_date, end=end_date,
+                    interval_min=source_interval_min, rth_only=rth_only
+                )
+                if not grouped:
+                    continue
+
+                # Existing daily dates to skip
+                existing = {
+                    r._mapping["date"].date()
+                    for r in conn.execute(
+                        select(HistoricalDailyBar.date)
+                        .where(HistoricalDailyBar.symbol == s)
+                        .where(and_(HistoricalDailyBar.date >= start_date, HistoricalDailyBar.date <= end_date))
+                    ).all()
+                }
+
+                for et_day, bars in grouped.items():
+                    # If we already have a daily row for this ET day, skip
+                    if any((d == et_day) for d in existing):
+                        continue
+                    bars.sort(key=lambda b: b["ts"])  # oldest → newest
+                    o = bars[0]["open"]
+                    h = max(b["high"] for b in bars)
+                    l = min(b["low"] for b in bars)
+                    c = bars[-1]["close"]
+                    v = sum(b["volume"] for b in bars)
+
+                    # Store daily 'date' as ET midnight (tz-aware), then to UTC
+                    if _NY is not None:
+                        dt_et = datetime(et_day.year, et_day.month, et_day.day, 0, 0, tzinfo=_NY)
+                        dt_store = dt_et.astimezone(timezone.utc)
+                    else:
+                        dt_store = datetime(et_day.year, et_day.month, et_day.day, 0, 0, tzinfo=timezone.utc)
+
+                    conn.execute(
+                        HistoricalDailyBar.__table__.insert().values(
+                            symbol=s,
+                            date=dt_store,
+                            open=float(o),
+                            high=float(h),
+                            low=float(l),
+                            close=float(c),
+                            volume=int(v),
+                        )
+                    )
+                    total_inserted += 1
+
+        if total_inserted > 0:
+            log.info("Resampled %d DAILY bars from minutes for %d symbols (up to %s).",
+                     total_inserted, len(list(symbols)), end_date.isoformat())
+        return total_inserted
 
     # ─────────────────────────── session-aware tick helpers ───────────────────────────
 
@@ -601,3 +747,48 @@ class MarketDataManager:
                 out[s] = items[0][1]
 
         return out
+
+
+    def earliest_minute_ts(self, symbol: str, interval_min: int) -> Optional[datetime]:
+        """Earliest timestamp for (symbol, interval_min) or None."""
+        symbol = (symbol or "").upper()
+        with engine.connect() as conn:
+            ts = conn.execute(
+                select(func.min(HistoricalMinuteBar.ts))
+                .where(HistoricalMinuteBar.symbol == symbol)
+                .where(HistoricalMinuteBar.interval_min == int(interval_min))
+            ).scalar()
+            if ts is None:
+                return None
+            return ts if getattr(ts, "tzinfo", None) else ts.replace(tzinfo=timezone.utc)
+
+    def latest_minute_ts(self, symbol: str, interval_min: int) -> Optional[datetime]:
+        """Latest timestamp for (symbol, interval_min) or None."""
+        symbol = (symbol or "").upper()
+        with engine.connect() as conn:
+            ts = conn.execute(
+                select(func.max(HistoricalMinuteBar.ts))
+                .where(HistoricalMinuteBar.symbol == symbol)
+                .where(HistoricalMinuteBar.interval_min == int(interval_min))
+            ).scalar()
+            if ts is None:
+                return None
+            return ts if getattr(ts, "tzinfo", None) else ts.replace(tzinfo=timezone.utc)
+
+    def has_bar_at(self, symbol: str, interval_min: int, ts_utc: datetime) -> bool:
+        """True iff a bar exists exactly at ts_utc for (symbol, interval_min)."""
+        symbol = (symbol or "").upper()
+        ts_utc = _ensure_utc(ts_utc)
+        with engine.connect() as conn:
+            exists = conn.execute(
+                select(func.count())
+                .select_from(HistoricalMinuteBar)
+                .where(HistoricalMinuteBar.symbol == symbol)
+                .where(HistoricalMinuteBar.interval_min == int(interval_min))
+                .where(HistoricalMinuteBar.ts == ts_utc)
+            ).scalar()
+            try:
+                return int(exists or 0) > 0
+            except Exception:
+                return bool(exists)
+

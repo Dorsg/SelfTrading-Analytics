@@ -10,7 +10,11 @@ log = logging.getLogger("app")
 
 
 def _exec(conn, sql: str, params: dict | None = None) -> None:
-    """Execute a statement and swallow errors so migrations are idempotent."""
+    """
+    Execute one DDL/DML statement in AUTOCOMMIT mode and swallow errors so that:
+      • migrations remain idempotent
+      • a single failure does not leave the connection in an aborted state
+    """
     with suppress(Exception):
         conn.execute(text(sql), params or {})
 
@@ -49,11 +53,16 @@ def _table_exists(conn, table: str) -> bool:
 def _apply_light_migrations() -> None:
     """
     Lightweight, idempotent migrations. Safe to run at every process start.
+    Uses AUTOCOMMIT so any individual failure does not abort the whole run.
     """
     try:
-        with engine.begin() as conn:
+        # Switch this Connection to AUTOCOMMIT so each statement is its own txn.
+        with engine.connect() as raw_conn:
+            conn = raw_conn.execution_options(isolation_level="AUTOCOMMIT")
+
             # ─────────────────────────────────────────────────────────────
             # orders.side (back-compat: 'action' relaxed to NULL)
+            # NOTE: Postgres supports "ALTER TABLE IF EXISTS" (not IF NOT EXISTS).
             # ─────────────────────────────────────────────────────────────
             _exec(conn, "ALTER TABLE IF EXISTS orders ADD COLUMN IF NOT EXISTS side VARCHAR(8)")
             _exec(conn, "ALTER TABLE IF EXISTS orders ALTER COLUMN action DROP NOT NULL")
@@ -61,7 +70,6 @@ def _apply_light_migrations() -> None:
             # ─────────────────────────────────────────────────────────────
             # executed_trades: ensure essential columns exist
             # (buy_ts, sell_ts, prices, qty, pnl_*, strategy, timeframe)
-            # Types chosen to be broadly compatible; adjust if your DDL differs.
             # ─────────────────────────────────────────────────────────────
             if _table_exists(conn, "executed_trades"):
                 _exec(conn, "ALTER TABLE executed_trades ADD COLUMN IF NOT EXISTS user_id INTEGER")
@@ -77,25 +85,61 @@ def _apply_light_migrations() -> None:
                 _exec(conn, "ALTER TABLE executed_trades ADD COLUMN IF NOT EXISTS strategy VARCHAR(64)")
                 _exec(conn, "ALTER TABLE executed_trades ADD COLUMN IF NOT EXISTS timeframe VARCHAR(16)")
 
-                # ─────────────────────────────────────────────────────────
                 # CRITICAL: relax NOT NULL on perm_id for simulation
-                # Keep the column if present, just allow NULLs.
-                # ─────────────────────────────────────────────────────────
                 nullable = _column_is_nullable(conn, "executed_trades", "perm_id")
                 if nullable is False:
                     _exec(conn, "ALTER TABLE executed_trades ALTER COLUMN perm_id DROP NOT NULL")
                     log.info("Light migrations: relaxed executed_trades.perm_id to NULL (sim-safe).")
 
-                # Optional helpful indexes (idempotent CREATE INDEX IF NOT EXISTS)
+                # Helpful indexes
                 _exec(conn, "CREATE INDEX IF NOT EXISTS ix_executed_trades_user_runner ON executed_trades (user_id, runner_id)")
                 _exec(conn, "CREATE INDEX IF NOT EXISTS ix_executed_trades_sell_ts ON executed_trades (sell_ts)")
             else:
                 log.warning("Light migrations: executed_trades table not found; skipping column checks.")
 
-        # Mirror the same lines that your logs already show for visibility
+            # ─────────────────────────────────────────────────────────────
+            # runners: ensure current_budget column exists
+            # ─────────────────────────────────────────────────────────────
+            if _table_exists(conn, "runners"):
+                _exec(conn, "ALTER TABLE runners ADD COLUMN IF NOT EXISTS current_budget DOUBLE PRECISION DEFAULT 0")
+                _exec(conn, "UPDATE runners SET current_budget = 0 WHERE current_budget IS NULL")
+            else:
+                log.warning("Light migrations: runners table not found; skipping current_budget check.")
+
+            # ─────────────────────────────────────────────────────────────
+            # open_positions: ensure 'account' column exists and is NOT NULL
+            # ─────────────────────────────────────────────────────────────
+            if _table_exists(conn, "open_positions"):
+                _exec(conn, "ALTER TABLE open_positions ADD COLUMN IF NOT EXISTS account VARCHAR(50)")
+                _exec(conn, "UPDATE open_positions SET account = 'mock' WHERE account IS NULL")
+                _exec(conn, "ALTER TABLE open_positions ALTER COLUMN account SET NOT NULL")
+                _exec(conn, "CREATE INDEX IF NOT EXISTS ix_open_positions_account ON open_positions (account)")
+            else:
+                log.warning("Light migrations: open_positions table not found; skipping account column check.")
+
+            # ─────────────────────────────────────────────────────────────
+            # runner_executions: ensure cycle_seq & execution_time (with indexes)
+            # and add a unique key for de-dupe + backstop unique index (satisfies ON CONFLICT)
+            # ─────────────────────────────────────────────────────────────
+            if _table_exists(conn, "runner_executions"):
+                _exec(conn, "ALTER TABLE runner_executions ADD COLUMN IF NOT EXISTS cycle_seq INTEGER")
+                _exec(conn, "ALTER TABLE runner_executions ADD COLUMN IF NOT EXISTS execution_time TIMESTAMPTZ")
+                _exec(conn, "CREATE INDEX IF NOT EXISTS ix_runner_exec_cycle ON runner_executions (cycle_seq)")
+                _exec(conn, "CREATE INDEX IF NOT EXISTS ix_runner_exec_exec_time ON runner_executions (execution_time)")
+                # ADD CONSTRAINT has no IF NOT EXISTS in Postgres; swallow duplicate errors safely
+                _exec(conn, "ALTER TABLE runner_executions ADD CONSTRAINT uq_runner_exec_key UNIQUE (runner_id, symbol, strategy, execution_time)")
+                _exec(conn, "CREATE UNIQUE INDEX IF NOT EXISTS uq_runner_exec_key_idx ON runner_executions (runner_id, symbol, strategy, execution_time)")
+            else:
+                log.warning("Light migrations: runner_executions table not found; skipping cycle_seq check.")
+
+        # Human-visible summary
         log.info("Light migrations: ensured orders.side (VARCHAR(8)).")
         log.info("Light migrations: relaxed orders.action to NULL (back-compat with 'side').")
         log.info("Light migrations: ensured executed_trades columns (buy_ts, sell_ts, buy/sell_price, qty, pnl_*, strategy, timeframe).")
+        log.info("Light migrations: ensured runners.current_budget (DOUBLE PRECISION).")
+        log.info("Light migrations: ensured open_positions.account (NOT NULL, default 'mock').")
+        log.info("Light migrations: ensured runner_executions.cycle_seq & execution_time (with indexes + unique key/index).")
 
     except Exception:
+        # If anything outside _exec() blows up (e.g., connection issue), surface once.
         log.exception("Light migrations failed")

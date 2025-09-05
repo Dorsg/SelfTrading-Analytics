@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 import os
 import sqlite3
 import logging
@@ -8,15 +9,13 @@ from typing import Iterable
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy import select, func
 
+from logger_config import setup_logging
 from database.db_core import engine
 from database.models import HistoricalDailyBar, HistoricalMinuteBar
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='[%(asctime)s] %(levelname)-8s %(name)s: %(message)s',
-    handlers=[logging.FileHandler('/app/logs/analytics_importer.log'), logging.StreamHandler()]
-)
-logger = logging.getLogger('analytics_importer')
+# Initialize logging using the shared RotatingFileHandler setup
+setup_logging()
+logger = logging.getLogger("analytics-importer")
 
 # Prefer container path; can still be overridden via env
 SQLITE_PATH = os.getenv(
@@ -75,6 +74,13 @@ def import_sqlite(sqlite_path: str = SQLITE_PATH, batch_size: int = 5000) -> Non
       • If DB is empty, requires a readable SQLite file and imports daily + 5m bars.
       • Creates a simple 'import completed' marker to avoid repeat work in the same container.
     """
+    # Run light migrations so required tables/columns exist before import
+    try:
+        from database.init_db import _apply_light_migrations
+        _apply_light_migrations()
+    except Exception:
+        logger.exception("Light migrations failed at importer startup")
+
     logger.info("=== Starting Analytics Data Import ===")
     logger.info("SQLite source: %s", sqlite_path)
 
@@ -86,7 +92,10 @@ def import_sqlite(sqlite_path: str = SQLITE_PATH, batch_size: int = 5000) -> Non
             daily_ct = int(pg_check.execute(select(func.count()).select_from(HistoricalDailyBar)).scalar() or 0)
             minute_ct = int(pg_check.execute(select(func.count()).select_from(HistoricalMinuteBar)).scalar() or 0)
             if (daily_ct + minute_ct) > 0:
-                logger.info("Existing historical data detected in Postgres (daily=%d, minute=%d) — skipping import.", daily_ct, minute_ct)
+                logger.info(
+                    "Existing historical data detected in Postgres (daily=%d, minute=%d) — skipping import.",
+                    daily_ct, minute_ct
+                )
                 # Create/refresh marker for observability
                 os.makedirs(os.path.dirname(import_marker), exist_ok=True)
                 with open(import_marker, "w") as f:

@@ -7,7 +7,6 @@ from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Dict, Any, Tuple, Set
 
-
 from database.db_manager import DBManager
 from database.models import Runner, OpenPosition, User
 from backend.ib_manager.market_data_manager import MarketDataManager
@@ -15,8 +14,10 @@ from backend.broker.mock_broker import MockBroker
 from backend.strategies.runner_decision_info import RunnerDecisionInfo
 from backend.strategies.factory import select_strategy, resolve_strategy_key
 from backend.strategies.contracts import validate_decision
+from backend.universe import UniverseManager
 
 log = logging.getLogger("runner-service")
+_exec_log = logging.getLogger("runner-executions")
 
 
 @dataclass(slots=True)
@@ -58,6 +59,15 @@ class RunnerService:
     • NEW: Only honor strategy-driven BUY/SELL when the candle/bar has advanced
       since the last action we evaluated for that runner+timeframe. Broker stops
       remain evaluated every tick.
+
+    P1:
+    • Universe hygiene: filter out post-cutoff IPOs and symbols lacking coverage.
+      Snapshot allowlist supported via UNIVERSE_SNAPSHOT_PATH.
+
+    P2:
+    • Reduce log noise: summarize same-bar skips; suppress 1440m same-bar spam.
+    • Re-entry cooldown: after a broker stop-out, wait N bars before next BUY.
+    • Enforce a minimum intraday trailing % when arming stops.
     """
 
     def __init__(self) -> None:
@@ -91,6 +101,24 @@ class RunnerService:
         # NEW: Warn once per (symbol, tf, ET date) if no candles available
         self._warn_no_data_once: Set[Tuple[str, int, str]] = set()
 
+        # NEW: Track when we had to fall back to extended hours to fetch candles
+        self._x_hours_fallback_used: Set[Tuple[str, int, int]] = set()  # (symbol, tf, cycle_seq)
+
+        # P1 Universe manager
+        self._uni = UniverseManager()
+
+        # P2 log noise controls
+        self._summarize_same_bar = os.getenv("SIM_SUMMARIZE_SAME_BAR", "1") == "1"
+        self._suppress_daily_same_bar = os.getenv("SIM_LOG_DAILY_SAMEBAR", "0") == "1"  # default: suppress
+
+        # P2 re-entry cooldown
+        self._cooldown_after_stop_bars = int(os.getenv("SIM_COOLDOWN_BARS_AFTER_STOP", "3"))
+        self._cooldown: Dict[Tuple[int, int], int] = {}  # (runner_id, tf) -> remaining bars
+
+        # P2 min intraday trailing percent (if strategy didn't enforce bigger)
+        self._min_intraday_trail_pct = float(os.getenv("SIM_MIN_INTRADAY_TRAIL_PCT", "1.25"))
+
+
     # ───────────────────────── internals ─────────────────────────
     def _get_candles_cached(
         self,
@@ -107,10 +135,12 @@ class RunnerService:
         if self._cache_seq != seq:
             self._cache_seq = seq
             self._candle_cache.clear()
+            self._x_hours_fallback_used.clear()
 
         if key in self._candle_cache:
             return self._candle_cache[key]
 
+        # First attempt respects regular-hours flag
         candles = self.mkt.get_candles_until(
             sym,
             int(interval_min),
@@ -118,6 +148,25 @@ class RunnerService:
             lookback=lookback,
             regular_hours_only=self._regular_hours_only,
         )
+
+        # One-shot retry: if RTH-only returned nothing but coverage exists, try extended hours
+        if (
+            not candles
+            and self._regular_hours_only
+            and int(interval_min) < 1440
+            and self.mkt.has_minute_bars(sym, int(interval_min))
+        ):
+            alt = self.mkt.get_candles_until(
+                sym,
+                int(interval_min),
+                as_of,
+                lookback=lookback,
+                regular_hours_only=False,
+            )
+            if alt:
+                candles = alt
+                self._x_hours_fallback_used.add(key)
+
         self._candle_cache[key] = candles
         return candles
 
@@ -131,8 +180,9 @@ class RunnerService:
         self._cache_seq = seq
         self._candle_cache.clear()
 
-        syms_5 = sorted({r.stock for r in runners if int(r.time_frame or 5) == 5})
-        syms_1d = sorted({r.stock for r in runners if int(r.time_frame or 5) == 1440})
+        # Map symbols via universe (e.g., META→FB) to avoid "no candles" spam
+        syms_5 = sorted({self._uni.map_symbol(r.stock, as_of=as_of) for r in runners if int(r.time_frame or 5) == 5})
+        syms_1d = sorted({self._uni.map_symbol(r.stock, as_of=as_of) for r in runners if int(r.time_frame or 5) == 1440})
 
         if syms_5:
             data5 = self.mkt.get_candles_bulk_until(
@@ -151,7 +201,6 @@ class RunnerService:
             self._candle_cache.setdefault((s, 5, seq), [])
         for s in syms_1d:
             self._candle_cache.setdefault((s, 1440, seq), [])
-
 
     @staticmethod
     def _last_candle_ts(candles: List[Dict[str, Any]]) -> Optional[datetime]:
@@ -257,9 +306,12 @@ class RunnerService:
             "skipped_no_data": 0,
             "skipped_no_budget": 0,
             "errors": 0,
+            "post_tick_errors": 0,
         }
 
         exec_buffer: List[dict] = []
+        same_bar_summary: Dict[Tuple[int, int], int] = {}  # (runner_id, tf) -> count
+        no_candles_by_tf: Dict[int, Set[str]] = {}  # NEW: aggregate per-tick no-candles
 
         with DBManager() as db:
             user = db.get_user_by_username("analytics")
@@ -286,11 +338,25 @@ class RunnerService:
                         )
                     except Exception:
                         log.exception("Failed to top-up mock account cash for user_id=%s", uid)
+                        try:
+                            db.db.rollback()
+                        except Exception:
+                            pass
             except Exception:
                 log.exception("ensure_account failed for user_id=%s", uid)
+                try:
+                    db.db.rollback()
+                except Exception:
+                    pass
 
             runners_orm = db.get_runners_by_user(user_id=uid, activation="active")
             runners: List[RunnerView] = [self._snapshot_runner(r) for r in runners_orm]
+
+            # Universe hygiene (P1): evaluate once per run against active runners
+            try:
+                self._uni.ensure_loaded([r.stock for r in runners], self.mkt)
+            except Exception:
+                log.exception("Universe evaluation failed; proceeding without filter")
 
             self._prefetch_candles_for_runners(runners, as_of)
 
@@ -306,6 +372,23 @@ class RunnerService:
                             "status": "skipped-invalid-runner",
                             "reason": "no_primary_key",
                             "details": json.dumps({"error": "runner row missing primary key"}, ensure_ascii=False),
+                            "execution_time": as_of,
+                            "cycle_seq": seq,
+                        })
+                        stats["no_action"] += 1
+                        stats["processed"] += 1
+                        continue
+
+                    # Universe filter (P1)
+                    if not self._uni.is_allowed(r.stock, self.mkt):
+                        exec_buffer.append({
+                            "runner_id": r.id,
+                            "user_id": uid,
+                            "symbol": r.stock,
+                            "strategy": str(getattr(r, "strategy", "")),
+                            "status": "completed",
+                            "reason": "skipped-excluded-universe",
+                            "details": (None if self._thin_no_action_details else json.dumps({"reason": self._uni.reason_for(r.stock)}, ensure_ascii=False)),
                             "execution_time": as_of,
                             "cycle_seq": seq,
                         })
@@ -331,9 +414,11 @@ class RunnerService:
                         continue
 
                     tf = int(getattr(r, "time_frame", 5) or 5)
-                    candles = self._get_candles_cached(r.stock, tf, as_of, lookback=300)
+                    # Use mapped symbol for data access (e.g., META→FB), but keep original in records
+                    data_sym = self._uni.map_symbol(r.stock, as_of=as_of)
+                    candles = self._get_candles_cached(data_sym, tf, as_of, lookback=300)
                     if not candles:
-                        # Warn once per (symbol, tf, ET date), but demote to INFO when symbol has no coverage at all (e.g., post-IPO for this sim date)
+                        # Warn once per (symbol, tf, ET date), enriched with coverage window
                         try:
                             from zoneinfo import ZoneInfo  # type: ignore
                             ny = ZoneInfo("America/New_York")
@@ -343,13 +428,22 @@ class RunnerService:
                         key = (r.stock, tf, et_day)
 
                         has_cov = self.mkt.has_daily_bars(r.stock) if tf == 1440 else self.mkt.has_minute_bars(r.stock, tf)
-                        msg = f"No historical candles for {r.stock} tf={tf}m at {as_of.isoformat()} (regular_hours_only={self._regular_hours_only}, coverage={has_cov})"
+                        earliest = self.mkt.earliest_minute_ts(data_sym, tf) if tf < 1440 else None
+                        latest   = self.mkt.latest_minute_ts(data_sym, tf) if tf < 1440 else None
+                        rng = f"range=[{earliest.isoformat() if earliest else 'None'}, {latest.isoformat() if latest else 'None'}]"
+                        msg = (
+                            f"No historical candles for {r.stock} (data_sym={data_sym}) "
+                            f"tf={tf}m at {as_of.isoformat()} (regular_hours_only={self._regular_hours_only}, "
+                            f"coverage={has_cov}) {rng}"
+                        )
                         if key not in self._warn_no_data_once:
                             self._warn_no_data_once.add(key)
                             if has_cov:
                                 log.warning(msg)
                             else:
                                 log.info(msg + " — likely pre-IPO or outside data coverage; skipping.")
+
+                        no_candles_by_tf.setdefault(tf, set()).add(r.stock)
 
                         exec_buffer.append({
                             "runner_id": r.id,
@@ -389,10 +483,20 @@ class RunnerService:
                         })
                         if self._log_no_action:
                             log.debug("NO_ACTION %s tf=%dm — stale candle (last_ts=%s, as_of=%s)",
-                                      r.stock, tf, (last_ts.isoformat() if last_ts else "None"), as_of.isoformat())
+                                    r.stock, tf, (last_ts.isoformat() if last_ts else "None"), as_of.isoformat())
                         stats["no_action"] += 1
                         stats["processed"] += 1
                         continue
+
+                    # Position before broker tick (to detect broker-driven exits)
+                    try:
+                        pos_before: Optional[OpenPosition] = (
+                            db.db.query(OpenPosition)
+                            .filter(OpenPosition.runner_id == r.id)
+                            .first()
+                        )
+                    except Exception:
+                        pos_before = None
 
                     # Fresh price → broker first (so stops can close if truly hit)
                     price = float(candles[-1]["close"])
@@ -415,12 +519,39 @@ class RunnerService:
                         log.exception("Failed to refresh position for runner %s", r.id)
                         pos = None
 
-                    # NEW: bar-advance guard (prevents same-bar flip-flops)
+                    # Detect broker-driven exit (stop/market exit) and apply cooldown (P2)
+                    if pos_before is not None and pos is None:
+                        exec_buffer.append({
+                            "runner_id": r.id,
+                            "user_id": uid,
+                            "symbol": r.stock,
+                            "strategy": r.strategy,
+                            "status": "completed",
+                            "reason": "sell",
+                            "details": json.dumps({"message": "broker_stop_triggered", "price": round(price, 6)}, ensure_ascii=False),
+                            "execution_time": as_of,
+                            "cycle_seq": seq,
+                        })
+                        stats["sells"] += 1
+                        stats["processed"] += 1
+                        if self._cooldown_after_stop_bars > 0:
+                            self._cooldown[(r.id, tf)] = self._cooldown_after_stop_bars
+
+                    # NEW: bar-advance guard and cooldown decrement
                     bar_key = (r.id, tf)
                     prev_bar_ts = self._last_bar_ts.get(bar_key)
                     bar_advanced = (prev_bar_ts is None) or (last_ts is not None and last_ts > prev_bar_ts)
+                    if bar_advanced and (bar_key in self._cooldown) and self._cooldown[bar_key] > 0:
+                        self._cooldown[bar_key] = max(0, self._cooldown[bar_key] - 1)
 
                     if not bar_advanced and self._require_bar_advance:
+                        if self._summarize_same_bar and (tf == 1440 and not self._suppress_daily_same_bar):
+                            pass  # allow daily same-bar if explicitly enabled
+                        elif self._summarize_same_bar:
+                            same_bar_summary[bar_key] = same_bar_summary.get(bar_key, 0) + 1
+                            stats["no_action"] += 1
+                            stats["processed"] += 1
+                            continue
                         exec_buffer.append({
                             "runner_id": r.id,
                             "user_id": uid,
@@ -440,9 +571,9 @@ class RunnerService:
                         })
                         if self._log_no_action:
                             log.debug("NO_ACTION %s tf=%dm — same bar (last=%s, prev=%s).",
-                                      r.stock, tf,
-                                      (last_ts.isoformat() if last_ts else "None"),
-                                      (prev_bar_ts.isoformat() if prev_bar_ts else "None"))
+                                    r.stock, tf,
+                                    (last_ts.isoformat() if last_ts else "None"),
+                                    (prev_bar_ts.isoformat() if prev_bar_ts else "None"))
                         stats["no_action"] += 1
                         stats["processed"] += 1
                         continue
@@ -462,10 +593,36 @@ class RunnerService:
                         "decision": {k: v for k, v in decision.items() if k not in {"action"}},
                         "checks": checks,
                     }
+                    # If we used an alias for data, surface that for traceability
+                    if data_sym != r.stock:
+                        details_payload["mapped_symbol"] = data_sym
+                    # NEW: tag if we used extended-hours fallback to get candles
+                    if (data_sym, tf, seq) in self._x_hours_fallback_used:
+                        details_payload["x_hours_fallback"] = True
+
                     details_json = json.dumps(details_payload, ensure_ascii=False)
 
                     # BUY (only if no position and after bar advance)
                     if action == "BUY" and ctx.position is None:
+                        cd_left = int(self._cooldown.get(bar_key, 0))
+                        if cd_left > 0:
+                            exec_buffer.append({
+                                "runner_id": r.id,
+                                "user_id": uid,
+                                "symbol": r.stock,
+                                "strategy": r.strategy,
+                                "status": "completed",
+                                "reason": "skipped-cooldown",
+                                "details": (None if self._thin_no_action_details else json.dumps({"cooldown_bars_left": cd_left}, ensure_ascii=False)),
+                                "execution_time": as_of,
+                                "cycle_seq": seq,
+                            })
+                            stats["no_action"] += 1
+                            stats["processed"] += 1
+                            if last_ts is not None:
+                                self._last_bar_ts[bar_key] = last_ts
+                            continue
+
                         qty = int(decision.get("quantity") or 0)
                         if qty <= 0:
                             qty = self._qty_from_budget(db, r, ctx.price)
@@ -484,7 +641,7 @@ class RunnerService:
                             })
                             if self._log_no_action:
                                 log.debug("NO_BUY %s tf=%dm — qty=0 | %s",
-                                          r.stock, tf, (explanation or "").replace("\n", " | "))
+                                        r.stock, tf, (explanation or "").replace("\n", " | "))
                             stats["skipped_no_budget"] += 1
                             stats["processed"] += 1
                             if last_ts is not None:
@@ -520,19 +677,32 @@ class RunnerService:
                             })
                             if self._log_no_action:
                                 log.debug("NO_BUY %s tf=%dm — broker rejected BUY (likely cash guard).",
-                                          r.stock, tf)
+                                        r.stock, tf)
                             stats["skipped_no_budget"] += 1
                             stats["processed"] += 1
                             if last_ts is not None:
                                 self._last_bar_ts[bar_key] = last_ts
                             continue
 
-                        # Arm trailing stop once at BUY (broker-managed)
+                        # Arm trailing stop once at BUY (broker-managed), honoring strategy % but enforcing min for intraday
                         try:
+                            strategy_trail = None
+                            try:
+                                tspec = decision.get("trail_stop_order") or {}
+                                if isinstance(tspec, dict):
+                                    strategy_trail = float(tspec.get("trailing_percent") or 0.0)
+                            except Exception:
+                                strategy_trail = None
+
                             params = getattr(r, "parameters", {}) or {}
-                            trail_pct = float(params.get("trailing_stop_percent", 0.0) or 0.0)
+                            param_trail = float(params.get("trailing_stop_percent", 0.0) or 0.0)
+                            trail_pct = float(strategy_trail if (strategy_trail is not None and strategy_trail > 0.0) else param_trail)
                         except Exception:
                             trail_pct = 0.0
+
+                        if tf < 1440 and self._min_intraday_trail_pct > 0.0:
+                            trail_pct = max(trail_pct, self._min_intraday_trail_pct)
+
                         if trail_pct > 0.0:
                             self.broker.arm_trailing_stop_once(
                                 user_id=uid,
@@ -540,6 +710,7 @@ class RunnerService:
                                 entry_price=ctx.price,
                                 trail_pct=trail_pct,
                                 at=as_of,
+                                interval_min=tf,
                             )
 
                         exec_buffer.append({
@@ -554,7 +725,7 @@ class RunnerService:
                             "cycle_seq": seq,
                         })
                         log.debug("BUY %s qty=%d @ %.4f tf=%dm | %s",
-                                  r.stock, qty, ctx.price, tf, (explanation or "").replace("\n", " | "))
+                                r.stock, qty, ctx.price, tf, (explanation or "").replace("\n", " | "))
                         stats["buys"] += 1
                         stats["processed"] += 1
                         if last_ts is not None:
@@ -597,7 +768,7 @@ class RunnerService:
                         })
                         if ok:
                             log.debug("SELL %s @ %.4f tf=%dm | %s",
-                                      r.stock, ctx.price, tf, (explanation or "").replace("\n", " | "))
+                                    r.stock, ctx.price, tf, (explanation or "").replace("\n", " | "))
                             stats["sells"] += 1
                         else:
                             stats["errors"] += 1
@@ -649,7 +820,45 @@ class RunnerService:
                     except Exception:
                         pass
                     stats["errors"] += 1
+                    try:
+                        db.db.rollback()
+                    except Exception:
+                        pass
                     stats["processed"] += 1
+
+            # P2: Emit one log line summarizing same-bar skips (no DB write)
+            if self._summarize_same_bar and same_bar_summary:
+                summary = [
+                    {"runner_id": rid, "tf": tf, "skipped": n}
+                    for (rid, tf), n in sorted(same_bar_summary.items(), key=lambda x: (x[0][1], x[0][0]))
+                ]
+                try:
+                    _exec_log.info(
+                        "cycle=%s time=%s runner=%s user=%s symbol=%s strategy=%s status=%s reason=%s details=%s",
+                        seq,
+                        as_of.isoformat(),
+                        "*",
+                        uid,
+                        "*",
+                        "summary",
+                        "completed",
+                        "skipped-same-bar-summary",
+                        json.dumps(summary, ensure_ascii=False),
+                    )
+                except Exception:
+                    pass
+
+            # NEW: per-tick summary for no-candles symbols by timeframe
+            if no_candles_by_tf:
+                try:
+                    for tf_k, syms in sorted(no_candles_by_tf.items()):
+                        log.info(
+                            "%d symbols had no %dm bars at %s; sample: %s",
+                            len(syms), tf_k, as_of.isoformat(),
+                            ", ".join(sorted(list(syms))[:8])
+                        )
+                except Exception:
+                    pass
 
             # Batch persist executions
             try:
@@ -657,15 +866,25 @@ class RunnerService:
                     db.bulk_record_runner_executions(exec_buffer)
             except Exception:
                 log.exception("Bulk insert of runner executions failed")
+                try:
+                    db.db.rollback()
+                except Exception:
+                    pass
+                stats["post_tick_errors"] += 1
 
             # Account mark-to-market (mock)
             try:
                 self.broker.mark_to_market_all(user_id=uid, at=as_of)
             except Exception:
                 log.exception("Mark-to-market after tick failed")
+                try:
+                    db.db.rollback()
+                except Exception:
+                    pass
+                stats["post_tick_errors"] += 1
 
         log.debug(
-            "tick@%s processed=%d buys=%d sells=%d no_action=%d skipped_no_data=%d skipped_no_budget=%d errors=%d",
+            "tick@%s processed=%d buys=%d sells=%d no_action=%d skipped_no_data=%d skipped_no_budget=%d errors=%d post_tick_errors=%d",
             as_of.isoformat(),
             stats["processed"],
             stats["buys"],
@@ -674,6 +893,6 @@ class RunnerService:
             stats["skipped_no_data"],
             stats["skipped_no_budget"],
             stats["errors"],
+            stats["post_tick_errors"],
         )
         return stats
-
