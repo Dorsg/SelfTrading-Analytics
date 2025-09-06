@@ -183,14 +183,18 @@ class RunnerExecution(Base):
     reason: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
     details: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
-    # NEW: simulation cycle sequence (e.g., epoch seconds of the tick)
+    # Simulation cycle sequence (epoch seconds)
     cycle_seq: Mapped[int] = mapped_column(Integer, index=True)
+
+    # NEW: timeframe minutes (for UPSERT key)
+    timeframe: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, index=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
     execution_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow, index=True)
 
     __table_args__ = (
-        UniqueConstraint("runner_id", "symbol", "strategy", "execution_time", name="uq_runner_exec_key"),
+        # Unique natural key for idempotent upserts
+        UniqueConstraint("cycle_seq", "user_id", "symbol", "strategy", "timeframe", name="ux_runner_exec"),
     )
 
 

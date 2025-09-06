@@ -5,7 +5,9 @@ import os
 from contextlib import AbstractContextManager
 from typing import Optional, Iterable, Dict, Any, List
 from datetime import datetime, timezone
-
+import json
+import sqlalchemy as sa
+from sqlalchemy.exc import SQLAlchemyError, IntegrityError, DataError
 from sqlalchemy.orm import Session
 from sqlalchemy import select, func
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -52,6 +54,26 @@ class DBManager(AbstractContextManager["DBManager"]):
     @property
     def db(self) -> Session:
         return self._session
+
+    @property
+    def engine(self):
+        """
+        Back-compat: provide an Engine for legacy callsites that still expect
+        `DBManager.engine`. Preferred access is `self.db.bind` (SQLAlchemy Session→Engine).
+        """
+        try:
+            eng = getattr(self.db, "bind", None)
+            if eng is not None:
+                return eng
+        except Exception:
+            pass
+        # Final fallback to a globally constructed engine if available.
+        try:
+            from database.db_core import engine as core_engine  # type: ignore
+            return core_engine
+        except Exception:
+            raise AttributeError("No SQLAlchemy engine available from DBManager")
+
 
     # Context manager plumbing
     def __enter__(self) -> "DBManager":
@@ -192,9 +214,240 @@ class DBManager(AbstractContextManager["DBManager"]):
 
     # ───────────────────────── Executions & results ─────────────────────────
 
+    def bulk_upsert_runner_executions(self, rows):
+        """
+        Insert-or-update runner execution rows efficiently and idempotently.
+
+        Conflict key (must match DB unique constraint / index):
+            (cycle_seq, user_id, symbol, strategy, timeframe)
+
+        Behavior:
+        • Normalizes each row (uppercases symbol, ensures non-null strategy).
+        • Collapses any duplicate rows within the same batch that target the SAME conflict key
+        to avoid Postgres 'CardinalityViolation' ("row updated twice") during ON CONFLICT DO UPDATE.
+        Winner selection priority: error > sell > buy > completed/no_action > skipped-*; then
+        prefer richer 'details', then latest 'execution_time', finally last-write-wins.
+        • Uses native ON CONFLICT for PostgreSQL / SQLite / MySQL where available.
+        • Falls back to an UPDATE-then-INSERT loop for unknown dialects.
+        • Mirrors a concise success/failure line to the "runner-executions" logger, and warns
+        when dedup collapses rows.
+        """
+        import json
+        import logging
+        from datetime import datetime
+
+        logger_db = logging.getLogger("database.db_manager")
+        logger_exec = logging.getLogger("runner-executions")
+
+        if not rows:
+            logger_db.debug("bulk_upsert_runner_executions: nothing to upsert (0 rows)")
+            return
+
+        # ── Normalize/guard payload ────────────────────────────────────────────────
+        def _norm(r):
+            details = r.get("details")
+            if isinstance(details, (dict, list)):
+                try:
+                    details = json.dumps(details, ensure_ascii=False)
+                except Exception:
+                    details = str(details)
+
+            # Ensure symbol/strategy are non-null for a stable unique key
+            sym = (r.get("symbol") or "UNKNOWN")
+            try:
+                sym = str(sym).upper()
+            except Exception:
+                sym = "UNKNOWN"
+
+            strat = (r.get("strategy") or "unknown")
+            try:
+                strat = str(strat)
+            except Exception:
+                strat = "unknown"
+
+            # execution_time expected to be TZ-aware datetime; if not, pass-through
+            exec_time = r.get("execution_time")
+
+            # timeframe: tolerate None safely (envs/tests)
+            tf = r.get("timeframe", 5)
+            try:
+                tf = int(tf if tf is not None else 5)
+            except Exception:
+                tf = 5
+
+            return {
+                "runner_id": int(r.get("runner_id")),
+                "user_id": int(r.get("user_id")),
+                "symbol": sym,
+                "strategy": strat,
+                "status": (r.get("status") or None),
+                "reason": (r.get("reason") or None),
+                "details": details,
+                "execution_time": exec_time,
+                "cycle_seq": int(r.get("cycle_seq")),
+                "timeframe": tf,
+            }
+
+        values = [_norm(r) for r in rows]
+
+        # ── Collapse duplicates by conflict key *within the same batch* ────────────
+        conflict_cols = ["cycle_seq", "user_id", "symbol", "strategy", "timeframe"]
+        updatable_cols = ["runner_id", "status", "reason", "details", "execution_time"]
+
+        def _severity(row: dict) -> int:
+            st = (row.get("status") or "").lower()
+            rs = (row.get("reason") or "").lower()
+            # Higher number = more important
+            if st == "error":
+                return 50
+            # Completed with meaningful actions outrank plain "completed/no_action"
+            if rs == "sell":
+                return 40
+            if rs == "buy":
+                return 30
+            if st == "completed":
+                # completed + no_action or other completes
+                return 20
+            if st.startswith("skipped"):
+                return 10
+            return 0
+
+        def _better(a: dict, b: dict) -> dict:
+            """Choose a winner between two rows targeting the same unique key."""
+            sa, sb = _severity(a), _severity(b)
+            if sb > sa:
+                return b
+            if sa > sb:
+                return a
+            # Tie-break 1: prefer the one with 'details'
+            da, db = a.get("details") or "", b.get("details") or ""
+            if db and not da:
+                return b
+            if da and not db:
+                return a
+            # Tie-break 2: prefer latest execution_time if both present
+            ta, tb = a.get("execution_time"), b.get("execution_time")
+            if isinstance(ta, datetime) and isinstance(tb, datetime):
+                return b if tb >= ta else a
+            # Final: last-write-wins (prefer 'b' as it arrived later)
+            return b
+
+        merged = {}
+        dup_count: dict[tuple, int] = {}
+        for v in values:
+            key = (v["cycle_seq"], v["user_id"], v["symbol"], v["strategy"], v["timeframe"])
+            if key in merged:
+                dup_count[key] = dup_count.get(key, 1) + 1
+                merged[key] = _better(merged[key], v)
+            else:
+                merged[key] = v
+                dup_count[key] = 1
+
+        deduped_values = list(merged.values())
+
+        # Helpful preview + duplicate diagnostics
+        dialect = (self.engine.dialect.name if getattr(self.engine, "dialect", None) else "unknown")
+        try:
+            ex0 = deduped_values[0]
+            logger_db.debug(
+                "bulk_upsert_runner_executions: preparing upsert rows=%d (deduped from %d) dialect=%s conflict=%s example=%s",
+                len(deduped_values), len(values), dialect, ",".join(conflict_cols),
+                {k: ex0.get(k) for k in ("runner_id", "user_id", "symbol", "strategy", "cycle_seq", "timeframe", "status")}
+            )
+        except Exception:
+            pass
+
+        # If we collapsed any duplicates, emit a compact warning with top examples
+        if len(deduped_values) < len(values):
+            try:
+                # Build a small top list
+                items = sorted(dup_count.items(), key=lambda kv: kv[1], reverse=True)
+                tops = [f"key={k} x{n}" for (k, n) in items if n > 1][:5]
+                logger_db.warning(
+                    "bulk_upsert_runner_executions: collapsed duplicate keys (before=%d after=%d). Top duplicates: %s",
+                    len(values), len(deduped_values), "; ".join(tops) if tops else "<none>"
+                )
+            except Exception:
+                pass
+
+        # ── Execute inside a single transaction ────────────────────────────────────
+        table = RunnerExecution.__table__
+        try:
+            with self.engine.begin() as conn:
+                if dialect == "postgresql":
+                    from sqlalchemy.dialects.postgresql import insert as pg_insert
+                    stmt = pg_insert(table).values(deduped_values)
+                    stmt = stmt.on_conflict_do_update(
+                        index_elements=conflict_cols,
+                        set_={c: getattr(stmt.excluded, c) for c in updatable_cols},
+                    )
+                    conn.execute(stmt)
+
+                elif dialect == "sqlite":
+                    from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+                    stmt = sqlite_insert(table).values(deduped_values)
+                    stmt = stmt.on_conflict_do_update(
+                        index_elements=conflict_cols,
+                        set_={c: getattr(stmt.excluded, c) for c in updatable_cols},
+                    )
+                    conn.execute(stmt)
+
+                elif dialect.startswith("mysql"):
+                    from sqlalchemy.dialects.mysql import insert as my_insert
+                    stmt = my_insert(table).values(deduped_values)
+                    stmt = stmt.on_duplicate_key_update(**{c: getattr(stmt.inserted, c) for c in updatable_cols})
+                    conn.execute(stmt)
+
+                else:
+                    # Portable fallback: UPDATE then INSERT if no row was touched.
+                    for row in deduped_values:
+                        upd = (
+                            table.update()
+                            .where(table.c.cycle_seq == row["cycle_seq"])
+                            .where(table.c.user_id == row["user_id"])
+                            .where(table.c.symbol == row["symbol"])
+                            .where(table.c.strategy == row["strategy"])
+                            .where(table.c.timeframe == row["timeframe"])
+                            .values({c: row[c] for c in updatable_cols})
+                        )
+                        res = conn.execute(upd)
+                        if getattr(res, "rowcount", 0) == 0:
+                            ins = table.insert().values(row)
+                            conn.execute(ins)
+
+            # Success logging (to dedicated executions log if configured)
+            sample = {
+                "runner_id": deduped_values[0]["runner_id"],
+                "user_id": deduped_values[0]["user_id"],
+                "symbol": deduped_values[0]["symbol"],
+                "strategy": deduped_values[0]["strategy"],
+                "cycle_seq": deduped_values[0]["cycle_seq"],
+                "timeframe": deduped_values[0]["timeframe"],
+                "status": deduped_values[0]["status"],
+            }
+            logger_exec.info(
+                "UPSERT OK runner_executions: rows=%d dialect=%s conflict=%s example=%s",
+                len(deduped_values), dialect, ",".join(conflict_cols), sample
+            )
+
+        except Exception:
+            try:
+                sample = {
+                    k: deduped_values[0].get(k)
+                    for k in ("runner_id", "user_id", "symbol", "strategy", "cycle_seq", "timeframe", "status")
+                }
+            except Exception:
+                sample = {}
+            logger_db.exception(
+                "Bulk upsert failed (runner_executions). rows=%d dialect=%s conflict=%s example=%s",
+                len(deduped_values), dialect, ",".join(conflict_cols), sample
+            )
+            raise
+
+
+
     def record_runner_execution(
         self,
-        *,
         runner_id: int,
         user_id: int,
         symbol: str,
@@ -204,49 +457,43 @@ class DBManager(AbstractContextManager["DBManager"]):
         details: Optional[str] = None,
         execution_time: Optional[datetime] = None,
         cycle_seq: Optional[int] = None,
+        timeframe: Optional[int] = None,
     ) -> RunnerExecution:
         """
-        Persist a per-tick execution record. Commits immediately to ensure logs
-        are visible even if later work fails within the same tick.
-        Also mirrors a compact line to the 'runner-executions' logger.
+        Persist a per-tick execution record (single-row UPSERT).
         """
         if execution_time is None:
             execution_time = _now_utc()
         if cycle_seq is None:
             cycle_seq = int(execution_time.timestamp())
 
-        rec = RunnerExecution(
-            runner_id=runner_id,
-            user_id=user_id,
-            symbol=symbol.upper(),
-            strategy=strategy,
-            status=status,
-            reason=reason,
-            details=details,
-            cycle_seq=cycle_seq,
-            execution_time=execution_time,
-            created_at=_now_utc(),
-        )
-        self._session.add(rec)
-        self._session.commit()
+        # Prefer the bulk upsert path for performance; this is a single-row variant
+        self.bulk_upsert_runner_executions([{
+            "runner_id": runner_id,
+            "user_id": user_id,
+            "symbol": symbol.upper(),
+            "strategy": strategy,
+            "status": status,
+            "reason": reason,
+            "details": details,
+            "cycle_seq": cycle_seq,
+            "execution_time": execution_time,
+            "timeframe": int(timeframe) if timeframe is not None else None,
+        }])
 
-        # Mirror to dedicated log for easy human review
-        try:
-            _exec_log.info(
-                "cycle=%s time=%s runner=%s user=%s symbol=%s strategy=%s status=%s reason=%s",
-                cycle_seq,
-                execution_time.isoformat(),
-                runner_id,
-                user_id,
-                rec.symbol,
-                strategy,
-                status,
-                (reason or "")
+        # Best-effort fetch of the upserted row (not strictly required)
+        rec = (
+            self._session.query(RunnerExecution)
+            .filter(
+                RunnerExecution.cycle_seq == cycle_seq,
+                RunnerExecution.user_id == user_id,
+                RunnerExecution.symbol == symbol.upper(),
+                RunnerExecution.strategy == strategy,
+                RunnerExecution.timeframe == (int(timeframe) if timeframe is not None else None),
             )
-        except Exception:
-            pass
-
-        return rec
+            .first()
+        )
+        return rec  # type: ignore[return-value]
 
     # ───────────────────────── Misc helpers (used by other parts) ─────────────────────────
 
@@ -266,18 +513,16 @@ class DBManager(AbstractContextManager["DBManager"]):
         Fast path: insert many RunnerExecution rows in one commit.
 
         Expected keys per record:
-        runner_id, user_id, symbol, strategy, status, reason, details,
-        execution_time (datetime), cycle_seq (int)
+          runner_id, user_id, symbol, strategy, status, reason, details,
+          execution_time (datetime), cycle_seq (int)
 
         Notes:
-        • `symbol` is uppercased here.
-        • `created_at` is set to now.
-        • Mirrors compact lines to the 'runner-executions' logger, but
+          • `symbol` is uppercased here.
+          • `created_at` is set to now.
+          • Mirrors compact lines to the 'runner-executions' logger, but
             avoids per-row flush/commit overhead.
-        • Summary rows and runner_id<=0 rows are NOT persisted (only logged).
-        • Upsert de-dupes on (runner_id, symbol, strategy, execution_time).
-        • Self-healing: if the ON CONFLICT target is missing in this DB (older schema),
-            we fall back to a plain INSERT so we don't crash ticks.
+          • Summary rows and runner_id<=0 rows are NOT persisted (only logged).
+          • Upsert de-dupes on (runner_id, symbol, strategy, execution_time).
         """
         if not records:
             return
@@ -327,37 +572,18 @@ class DBManager(AbstractContextManager["DBManager"]):
         if not clean_rows:
             return
 
-        # Module-scoped one-time flag to avoid log spam when falling back
-        global _RUNNER_EXEC_UPSERT_FALLBACK
         try:
-            _RUNNER_EXEC_UPSERT_FALLBACK
-        except NameError:
-            _RUNNER_EXEC_UPSERT_FALLBACK = False  # type: ignore
-
-        table = RunnerExecution.__table__
-
-        # Try ON CONFLICT first (preferred, idempotent)
-        try:
+            # Postgres upsert to keep idempotent on replays
+            table = RunnerExecution.__table__
             stmt = pg_insert(table).values(clean_rows)
             stmt = stmt.on_conflict_do_nothing(
                 index_elements=["runner_id", "symbol", "strategy", "execution_time"]
             )
             self._session.execute(stmt)
             self._session.commit()
-        except Exception as e:
-            # If the DB doesn't have the unique/exclusion constraint, Postgres raises:
-            # psycopg2.errors.InvalidColumnReference (seen wrapped by SQLAlchemy).
+        except Exception:
             self._session.rollback()
-            if not _RUNNER_EXEC_UPSERT_FALLBACK:
-                log.warning(
-                    "Upsert ON CONFLICT failed (likely missing unique key). "
-                    "Falling back to plain INSERT for runner_executions. Error=%s",
-                    getattr(e, "orig", e),
-                )
-                _RUNNER_EXEC_UPSERT_FALLBACK = True  # type: ignore
-            # Plain INSERT (may create duplicates across replays, but keeps the run healthy)
-            self._session.execute(table.insert(), clean_rows)
-            self._session.commit()
+            raise
 
         # Mirror clean rows to the execution log
         try:
@@ -375,4 +601,3 @@ class DBManager(AbstractContextManager["DBManager"]):
                 )
         except Exception:
             pass
-

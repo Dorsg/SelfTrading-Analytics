@@ -23,12 +23,42 @@ add_file() {
     fi
 }
 
-# Frontend files
-add_file "client-ui-naive/src/App.vue" "Main Vue application component"
-add_file "client-ui-naive/src/main.js" "Vue application entry point"
-add_file "client-ui-naive/src/router/index.js" "Vue router configuration"
-add_file "client-ui-naive/src/components/tabs/ProgressTab.vue" "Progress tab component"
-add_file "client-ui-naive/src/components/tabs/ResultsTab.vue" "Results tab component"
+# Helper: add all files in a directory (exclude any 'lib' folders)
+add_dir() {
+    local dir_path="$1"
+    local description="$2"
+    if [ -d "$dir_path" ]; then
+        echo "Adding files from: $dir_path"
+        # find files excluding any path that contains /lib/
+        while IFS= read -r -d '' file; do
+            echo "" >> "$OUT_FILE"
+            echo "=" >> "$OUT_FILE"
+            echo "FILE: $file" >> "$OUT_FILE"
+            echo "DESCRIPTION: $description" >> "$OUT_FILE"
+            echo "=" >> "$OUT_FILE"
+            cat "$file" >> "$OUT_FILE"
+            echo "" >> "$OUT_FILE"
+        done < <(find "$dir_path" -type f ! -path "*/lib/*" -print0)
+    else
+        echo "Warning: directory $dir_path not found"
+    fi
+}
+
+# Frontend: add entire client-ui-naive tree excluding lib folders
+add_dir "client-ui-naive" "All client-ui-naive source files (excluding lib folders)"
+
+# From project root: include .env and Docker files if present
+shopt -s nullglob
+ROOT_DOCKER_FILES=( ".env" "Dockerfile" "docker-compose.yml" "docker-compose.yaml" )
+for rf in "${ROOT_DOCKER_FILES[@]}" Dockerfile.* docker-compose.*; do
+    if [ -f "$rf" ]; then
+        add_file "$rf" "Root project file: $rf"
+    fi
+done
+shopt -u nullglob || true
+
+# Include backend api_gateway files
+add_dir "/root/projects/SelfTrading Analytics/backend/api_gateway" "Backend api_gateway files"
 
 # Include last 50 lines of client logs
 shopt -s nullglob

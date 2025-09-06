@@ -130,7 +130,6 @@ async def main() -> None:
 
     rs = RunnerService()
     mkt = MarketDataManager()
-    uni = UniverseManager()
 
     # Decide the session clock symbol up-front (resilient)
     step_sec = _step_seconds()
@@ -147,10 +146,7 @@ async def main() -> None:
             )
             clock_sym = picked
         else:
-            log.warning(
-                "No obvious clock symbol found for %dm. Will rely on GLOBAL fallback (any symbol).",
-                tf_min
-            )
+            log.warning("No obvious clock symbol found for %dm. Will rely on GLOBAL fallback (any symbol).", tf_min)
 
     log.info(
         "Simulation scheduler loop started. LOG_LEVEL=%s  tick_log_every=%s  boundary_refresh_ticks=%s  clock_symbol=%s",
@@ -165,25 +161,20 @@ async def main() -> None:
     try:
         from sqlalchemy import select, func
         from database.models import HistoricalMinuteBar, HistoricalDailyBar
-        with engine.connect() as conn:
-            min_5m_dt = conn.execute(select(func.min(HistoricalMinuteBar.ts))).scalar()
-            max_5m_dt = conn.execute(select(func.max(HistoricalMinuteBar.ts))).scalar()
-            min_daily_dt = conn.execute(select(func.min(HistoricalDailyBar.date))).scalar()
+        with DBManager() as db:
+            with db.db.bind.connect() as conn:  # type: ignore[attr-defined]
+                min_5m_dt = conn.execute(select(func.min(HistoricalMinuteBar.ts))).scalar()
+                max_5m_dt = conn.execute(select(func.max(HistoricalMinuteBar.ts))).scalar()
+                min_daily_dt = conn.execute(select(func.min(HistoricalDailyBar.date))).scalar()
         log.info("Historical 5m data range: start=%s end=%s", min_5m_dt, max_5m_dt)
     except Exception:
         log.exception("Failed to log historical range at startup")
 
-    # Cached boundaries reused across ticks; optionally refreshed by env
     cached_min_ts = min_5m_dt
     cached_max_ts = max_5m_dt
     cached_min_daily = min_daily_dt
 
-    # ── Internal monotonic clock (source of truth for advancing) ──
     state_epoch: int | None = None  # seconds since epoch, UTC
-
-    # One-time daily resample gate (P1 hygiene)
-    daily_resample_done = False
-
     tick = 0
     while True:
         pace = _read_pace_seconds()
@@ -215,13 +206,12 @@ async def main() -> None:
                     tick += 1
                     continue
 
-                # ── Boundaries: optionally refresh on a cadence ───────────────
                 if (
                     cached_min_ts is None or
                     cached_max_ts is None or
                     (boundary_refresh_ticks > 0 and tick % boundary_refresh_ticks == 0)
                 ):
-                    with engine.connect() as conn:
+                    with db.db.bind.connect() as conn:  # type: ignore[attr-defined]
                         cached_min_ts = conn.execute(select(func.min(HistoricalMinuteBar.ts))).scalar()
                         cached_max_ts = conn.execute(select(func.max(HistoricalMinuteBar.ts))).scalar()
                         cached_min_daily = conn.execute(select(func.min(HistoricalDailyBar.date))).scalar()
@@ -240,10 +230,8 @@ async def main() -> None:
                 min_epoch = int(cached_min_ts.replace(tzinfo=timezone.utc).timestamp())
                 max_epoch = int(cached_max_ts.replace(tzinfo=timezone.utc).timestamp())
 
-                # Base: earliest 5m + warmup bars (raw)
                 base_start_epoch = min_epoch + warmup_bars * step_sec
 
-                # Daily guard: earliest daily + N days
                 if cached_min_daily:
                     min_daily_epoch = int(cached_min_daily.replace(tzinfo=timezone.utc).timestamp())
                     daily_guard_epoch = min_daily_epoch + daily_warmup_days * 86400
@@ -251,7 +239,6 @@ async def main() -> None:
                 else:
                     desired_start = base_start_epoch
 
-                # Align to the next real market candle (preferred clock or global fallback)
                 aligned_dt = mkt.get_next_session_ts(
                     datetime.fromtimestamp(desired_start, tz=timezone.utc),
                     interval_min=step_sec // 60,
@@ -262,20 +249,11 @@ async def main() -> None:
                         datetime.fromtimestamp(desired_start, tz=timezone.utc),
                         interval_min=step_sec // 60,
                     )
-                # Ensure the returned ts has a clock bar; otherwise advance once
-                if aligned_dt is not None and clock_sym:
-                    if not mkt.has_bar_at(clock_sym, step_sec // 60, aligned_dt):
-                        maybe = mkt.get_next_session_ts(aligned_dt, interval_min=step_sec // 60, reference_symbol=clock_sym)
-                        if maybe is not None:
-                            aligned_dt = maybe
-
                 if aligned_dt is not None:
                     desired_start = min(int(aligned_dt.timestamp()), max_epoch)
 
-                # Normalize DB value (if any)
                 db_epoch = _ts(st.last_ts)
 
-                # Initialize internal clock once
                 if state_epoch is None:
                     base = db_epoch if (db_epoch is not None) else desired_start
                     base_dt = datetime.fromtimestamp(min(max(base, desired_start), max_epoch), tz=timezone.utc)
@@ -286,13 +264,6 @@ async def main() -> None:
                     )
                     if next_dt is None:
                         next_dt = mkt.get_next_session_ts_global(base_dt, interval_min=step_sec // 60)
-                    # Ensure the chosen next_dt has a clock bar; if not, advance again
-                    if next_dt is not None and clock_sym:
-                        if not mkt.has_bar_at(clock_sym, step_sec // 60, next_dt):
-                            maybe = mkt.get_next_session_ts(next_dt, interval_min=step_sec // 60, reference_symbol=clock_sym)
-                            if maybe is not None:
-                                next_dt = maybe
-
                     if next_dt is None:
                         st.is_running = "false"
                         db.db.commit()
@@ -301,27 +272,8 @@ async def main() -> None:
                         tick += 1
                         continue
 
-                    # Universe hygiene + daily resample before we start
-                    if not daily_resample_done:
-                        runner_syms = [r.stock for r in db.get_runners_by_user(user_id=uid, activation="active")]
-                        uni.ensure_loaded(runner_syms, mkt)
-                        allowed = sorted(uni.allowed_symbols())
-                        if allowed:
-                            try:
-                                mkt.ensure_daily_bars_for_symbols(
-                                    allowed,
-                                    end_date=next_dt,
-                                    lookback_days=int(os.getenv("DAILY_RESAMPLE_LOOKBACK_DAYS", "1460")),  # 4 years
-                                    source_interval_min=int(os.getenv("DAILY_RESAMPLE_SOURCE_MIN", "5")),
-                                    rth_only=True,
-                                )
-                            except Exception:
-                                log.exception("Pre-run daily resample failed")
-                        daily_resample_done = True
-
                     state_epoch = int(next_dt.timestamp())
 
-                    # Per-day session warmup anchored to NY open
                     open_epoch = _ny_open_epoch_for_day(next_dt)
                     warmup_epoch = open_epoch + session_warmup_bars * step_sec
                     if state_epoch < warmup_epoch <= max_epoch:
@@ -332,7 +284,6 @@ async def main() -> None:
                         )
                         state_epoch = warmup_epoch
 
-                    # Persist start monotonically
                     target_dt = datetime.fromtimestamp(state_epoch, tz=timezone.utc)
                     db.db.execute(
                         text(
@@ -350,14 +301,12 @@ async def main() -> None:
                         db_epoch, desired_start, st.last_ts.isoformat(), (clock_sym or "<global>")
                     )
                 else:
-                    # Re-read fresh DB value for comparison
                     db_epoch = _ts(
                         db.db.query(SimulationState.last_ts)
                         .filter(SimulationState.user_id == uid)
                         .scalar()
                     )
 
-                    # Guard against DB regression (someone wrote an earlier ts)
                     if db_epoch is not None and (db_epoch + step_sec) < state_epoch:
                         log.warning(
                             "Detected DB last_ts regression (%s < %s). Overwriting with monotonic clock.",
@@ -374,7 +323,6 @@ async def main() -> None:
                         )
                         db.db.commit()
 
-                    # If DB jumped forward (manual fast-forward), adopt it (align to next session)
                     if db_epoch is not None and db_epoch > state_epoch + step_sec:
                         log.info(
                             "Adopting DB fast-forward: state_epoch=%s -> db_epoch=%s",
@@ -388,11 +336,6 @@ async def main() -> None:
                         )
                         if next_dt is None:
                             next_dt = mkt.get_next_session_ts_global(jump_dt, interval_min=step_sec // 60)
-                        if next_dt is not None and clock_sym:
-                            if not mkt.has_bar_at(clock_sym, step_sec // 60, next_dt):
-                                maybe = mkt.get_next_session_ts(next_dt, interval_min=step_sec // 60, reference_symbol=clock_sym)
-                                if maybe is not None:
-                                    next_dt = maybe
                         if next_dt is None:
                             st.is_running = "false"
                             db.db.commit()
@@ -402,7 +345,6 @@ async def main() -> None:
                             continue
                         state_epoch = int(next_dt.timestamp())
 
-                # End-of-data check
                 if state_epoch >= max_epoch:
                     st.is_running = "false"
                     db.db.commit()
@@ -411,13 +353,9 @@ async def main() -> None:
                     tick += 1
                     continue
 
-                # ── Session-aware selection of the current tick ────────────────
                 cur_dt = datetime.fromtimestamp(state_epoch, tz=timezone.utc)
-
-                # Advance one tick (the one at state_epoch)
                 cur_ts, stats = await _advance_one_tick(rs, state_epoch)
 
-                # Compute the next market-session tick strictly after cur_dt
                 next_dt = mkt.get_next_session_ts(
                     cur_dt,
                     interval_min=_step_seconds() // 60,
@@ -425,12 +363,6 @@ async def main() -> None:
                 )
                 if next_dt is None:
                     next_dt = mkt.get_next_session_ts_global(cur_dt, interval_min=_step_seconds() // 60)
-                if next_dt is not None and clock_sym:
-                    if not mkt.has_bar_at(clock_sym, _step_seconds() // 60, next_dt):
-                        maybe = mkt.get_next_session_ts(next_dt, interval_min=_step_seconds() // 60, reference_symbol=clock_sym)
-                        if maybe is not None:
-                            next_dt = maybe
-
                 if next_dt is None:
                     st.is_running = "false"
                     db.db.commit()
@@ -441,7 +373,6 @@ async def main() -> None:
 
                 state_epoch = int(next_dt.timestamp())
 
-                # Persist next_ts monotonically
                 target_dt = datetime.fromtimestamp(state_epoch, tz=timezone.utc)
                 db.db.execute(
                     text(
@@ -454,7 +385,6 @@ async def main() -> None:
                 db.db.commit()
                 st.last_ts = target_dt
 
-                # Progress indicator
                 start_epoch = int(desired_start)
                 total_span = max(1, max_epoch - start_epoch)
                 done_span = max(0, cur_ts - start_epoch)
@@ -466,7 +396,7 @@ async def main() -> None:
                     pace_label = "full-speed" if pace <= 0 else f"{pace:.2f}s delay"
                     log.debug(
                         "TICK #%d as_of=%s → next=%s | runners: processed=%d buys=%d sells=%d "
-                        "no_action=%d skipped_no_data=%d skipped_no_budget=%d errors=%d post_tick_errors=%d | "
+                        "no_action=%d skipped_no_data=%d skipped_no_budget=%d errors=%d | "
                         "progress=%.4f%% (session-aware; clock=%s; pace=%s)",
                         tick,
                         as_of_s,
@@ -478,7 +408,6 @@ async def main() -> None:
                         int(stats.get("skipped_no_data", 0)),
                         int(stats.get("skipped_no_budget", 0)),
                         int(stats.get("errors", 0)),
-                        int(stats.get("post_tick_errors", 0)),
                         pct,
                         (clock_sym or "<global>"),
                         pace_label,
