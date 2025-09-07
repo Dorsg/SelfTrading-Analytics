@@ -51,6 +51,9 @@ class RunnerService:
       • Strategy signals only on bar advance to avoid same-bar flip-flops.
       • Partial disable per timeframe: excluded pairs are skipped; others run.
       • Bulk UPSERT for runner_executions (cycle_seq, user_id, symbol, strategy, timeframe).
+      • NEW: optional global same-bar guard with configurable scope:
+            SAME_BAR_SCOPE = ["symbol_tf" | "symbol_tf_strategy"]
+         When enabled, at most one successful BUY per (key, bar_ts) is allowed.
     """
 
     def __init__(self) -> None:
@@ -82,6 +85,14 @@ class RunnerService:
 
         # simulation bootstrap start (for coverage checks)
         self._sim_boot_start: Optional[datetime] = None
+
+        # ── NEW: global same-bar BUY guard (per tick) ────────────────────────────
+        # Scope:
+        #   "symbol_tf"          → one BUY per (symbol,timeframe,bar_ts) across ALL strategies
+        #   "symbol_tf_strategy" → one BUY per (symbol,timeframe,bar_ts,strategy)
+        self._same_bar_scope: str = (os.getenv("SAME_BAR_SCOPE", "symbol_tf") or "symbol_tf").strip().lower()
+        self._same_bar_seen_seq: Optional[int] = None  # resets each tick (cycle_seq)
+        self._same_bar_seen: Set[str] = set()
 
     # ───────────────────────── internals ─────────────────────────
     def _get_candles_cached(
@@ -231,10 +242,30 @@ class RunnerService:
                 activation=str(getattr(r, "activation", "active") or "active"),
             )
 
+    # ── NEW: same-bar key helper ────────────────────────────────────────────────
+    def _same_bar_key(self, symbol: str, timeframe: int, bar_ts: Optional[datetime], strategy: str) -> Optional[str]:
+        """
+        Build the same-bar guard key according to scope. Returns None if bar_ts is None.
+        """
+        if bar_ts is None:
+            return None
+        ts_i = int(bar_ts.timestamp())
+        sym = (symbol or "UNKNOWN").upper()
+        strat = (strategy or "")
+        if self._same_bar_scope == "symbol_tf_strategy":
+            return f"{sym}:{int(timeframe)}:{ts_i}:{strat}"
+        # default (legacy / broader): symbol + timeframe only
+        return f"{sym}:{int(timeframe)}:{ts_i}"
+
     # ───────────────────────── public ─────────────────────────
     async def run_tick(self, as_of: datetime) -> dict:
         as_of = as_of.astimezone(timezone.utc)
         seq = int(as_of.timestamp())
+
+        # reset per-tick same-bar BUY guard
+        if self._same_bar_seen_seq != seq:
+            self._same_bar_seen_seq = seq
+            self._same_bar_seen.clear()
 
         stats = {
             "processed": 0,
@@ -426,7 +457,7 @@ class RunnerService:
                         log.exception("Failed to refresh position for runner %s", r.id)
                         pos = None
 
-                    # same-bar guard
+                    # per-runner same-bar (bar-advance) guard
                     bar_key = (r.id, tf)
                     prev_bar_ts = self._last_bar_ts.get(bar_key)
                     bar_advanced = (prev_bar_ts is None) or (last_ts is not None and last_ts > prev_bar_ts)
@@ -474,6 +505,33 @@ class RunnerService:
 
                     # BUY (no position; bar advanced)
                     if action == "BUY" and ctx.position is None:
+                        # ── NEW: global same-bar BUY guard ─────────────────────────
+                        sb_key = self._same_bar_key(sym, tf, last_ts, r.strategy)
+                        if sb_key and sb_key in self._same_bar_seen:
+                            exec_buffer.append({
+                                "runner_id": r.id,
+                                "user_id": uid,
+                                "symbol": sym,
+                                "strategy": r.strategy,
+                                "status": "completed",
+                                "reason": "skipped-same-bar-guard",
+                                "details": None if self._thin_no_action_details else json.dumps({
+                                    "message": "same-bar BUY already executed for key",
+                                    "key": sb_key,
+                                    "scope": self._same_bar_scope,
+                                }, ensure_ascii=False),
+                                "execution_time": as_of,
+                                "cycle_seq": seq,
+                                "timeframe": tf,
+                            })
+                            stats["same_bar_skips"] += 1
+                            stats["no_action"] += 1
+                            stats["processed"] += 1
+                            if last_ts is not None:
+                                self._last_bar_ts[bar_key] = last_ts
+                            continue
+                        # ───────────────────────────────────────────────────────────
+
                         qty = int(decision.get("quantity") or 0)
                         if qty <= 0:
                             qty = self._qty_from_budget(db, r, ctx.price)
@@ -521,7 +579,7 @@ class RunnerService:
                                 "strategy": r.strategy,
                                 "status": "skipped-no-budget",
                                 "reason": "broker_rejected_buy",
-                                "details": None if self._thin_no_action_details else details_json,
+                                "details": details_json,
                                 "execution_time": as_of,
                                 "cycle_seq": seq,
                                 "timeframe": tf,
@@ -563,6 +621,9 @@ class RunnerService:
                         stats["processed"] += 1
                         if last_ts is not None:
                             self._last_bar_ts[bar_key] = last_ts
+                        # Mark this key as having executed a BUY on this bar
+                        if sb_key:
+                            self._same_bar_seen.add(sb_key)
                         self.health.mark_clean_pass(sym=sym, tf=tf)
                         continue
 

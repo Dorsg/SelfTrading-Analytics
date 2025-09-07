@@ -1,0 +1,69 @@
+<template>
+    <n-space vertical size="large">
+      <n-grid :cols="12" x-gap="16" y-gap="16">
+        <n-gi :span="12">
+          <ImportStatus
+            :state="sim.importStatus.state"
+            :progress="sim.importStatus.progress_percent"
+            :processed="sim.importStatus.processed"
+            :total="sim.importStatus.total"
+          />
+        </n-gi>
+  
+        <n-gi :span="12">
+          <SimulationControls
+            :status="sim.status"
+            :is-running="sim.isRunning"
+            :is-starting="sim.isStarting"
+            :is-stopping="sim.isStopping"
+            :is-resetting="sim.isResetting"
+            @start="handleStart"
+            @stop="handleStop"
+            @reset="handleReset"
+          />
+        </n-gi>
+  
+        <n-gi :span="12">
+          <LogsPanel :warnings="sim.logs.warnings" :errors="sim.logs.errors" />
+        </n-gi>
+      </n-grid>
+    </n-space>
+  </template>
+  
+  <script setup>
+  import { onMounted, onUnmounted } from 'vue'
+  import { NGrid, NGi, NSpace, useMessage } from 'naive-ui'
+  import ImportStatus from '@/components/ImportStatus.vue'
+  import SimulationControls from '@/components/SimulationControls.vue'
+  import LogsPanel from '@/components/LogsPanel.vue'
+  import { useSimulationStore } from '@/stores/simulation'
+  
+  const sim = useSimulationStore()
+  const message = useMessage()
+  
+  onMounted(async () => {
+    await sim.warmUp()
+  })
+  
+  onUnmounted(() => {
+    sim.destroy()
+  })
+  
+  async function handleStart () {
+    const res = await sim.start()
+    // toast shown in child as well; double-safety:
+    message.success(res?.message ?? 'Simulation started')
+    return res
+  }
+  async function handleStop () {
+    const res = await sim.stop()
+    message.success(res?.message ?? 'Simulation stopped')
+    return res
+  }
+  async function handleReset () {
+    const res = await sim.reset()
+    message.success(res?.message ?? 'Simulation reset')
+    return res
+  }
+  </script>
+  

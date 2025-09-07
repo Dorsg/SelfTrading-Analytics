@@ -76,6 +76,7 @@ add_file() {
 # (omit printing a project tree and exclude scripts, Dockerfiles, and other top-level files)
 
 # Collect source files under backend only (excluding vendor/lib/venv)
+# Note: api_gateway is included (not pruned)
 while IFS= read -r -d '' file; do
     add_file "$file" "Source file"
 done < <(find backend \
@@ -86,7 +87,6 @@ done < <(find backend \
     -path "*/venv" -prune -o -path "*/venv/*" -prune -o \
     -path "*/__pycache__" -prune -o -path "*/__pycache__/*" -prune -o \
     -path "*/strategies" -prune -o -path "*/strategies/*" -prune -o \
-    -path "*/api_gateway" -prune -o -path "*/api_gateway/*" -prune -o \
     -type f -print0 2>/dev/null)
 
 # Also include only top-level .env if present

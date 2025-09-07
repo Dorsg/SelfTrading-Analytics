@@ -1,107 +1,67 @@
 <template>
-  <n-config-provider :theme="darkTheme">
-    <n-dialog-provider>
-      <n-message-provider>
-        <n-layout-header class="header">
-          <div class="title clickable" @click="goHome" style="display: flex; align-items: center; gap: 10px;">
-            <img src="/kraken-svgrepo-com.svg" alt="SelfTrading Icon" style="width: 28px; height: 28px;" />
-            <div class="title">SelfTrading | simulations</div>
-          </div>
-          <div class="user-box">
-            <!-- Analytics Mode Indicator -->
-            <n-tag
-              round
-              size="small"
-              :bordered="false"
-              type="info"
-              class="status-label"
-            >
-              <template #icon>
-                <n-icon :component="AnalyticsOutline" />
-              </template>
-              Analytics Mode
-            </n-tag>
+  <n-config-provider :theme-overrides="theme">
+    <n-message-provider>
+      <div class="app-shell">
+        <header class="app-header">
+          <n-space align="center" justify="space-between" class="w-full">
+            <n-space align="center">
+              <n-avatar size="large" round>SIM</n-avatar>
+              <n-h2 style="margin:0">Simulator Console</n-h2>
+            </n-space>
+            <n-space align="center">
+              <n-tag type="success" size="small" round>Naive-UI</n-tag>
+            </n-space>
+          </n-space>
+        </header>
 
-            <span class="uname">Analytics User</span>
-          </div>
-        </n-layout-header>
-
-        <!-- ─────────── Routed view ─────────── -->
-        <RouterView />
-      </n-message-provider>
-    </n-dialog-provider>
+        <main class="app-main">
+          <n-card size="large" embedded>
+            <n-tabs type="line" :value="active" @update:value="active = $event">
+              <n-tab-pane name="simulation" tab="Simulation">
+                <SimulationView />
+              </n-tab-pane>
+              <n-tab-pane name="results" tab="Results">
+                <ResultsView />
+              </n-tab-pane>
+            </n-tabs>
+          </n-card>
+        </main>
+      </div>
+    </n-message-provider>
   </n-config-provider>
 </template>
 
 <script setup>
-import {
-  ref,
-  computed,
-  onMounted,
-  onBeforeUnmount,
-} from "vue";
-import { useRouter } from "vue-router";
-import { darkTheme } from "naive-ui";
-import {
-  AnalyticsOutline
-} from "@vicons/ionicons5";
+import { ref } from 'vue'
+import { NConfigProvider, NMessageProvider, NCard, NTabs, NTabPane, NSpace, NAvatar, NH2, NTag } from 'naive-ui'
+import SimulationView from '@/views/SimulationView.vue'
+import ResultsView from '@/views/ResultsView.vue'
 
-// Analytics mode - no authentication required
-const router = useRouter();
-const user = ref({ username: "analytics" });
-const isAuth = ref(true); // Always authenticated in analytics mode
+const active = ref('simulation')
 
-/* ───────── helpers ───────── */
-function goHome() {
-  try {
-    localStorage.setItem("activeTab", "account");
-  } catch {}
-  window.dispatchEvent(new Event("nav-go-account"));
-  router.push({ name: "Home" });
+const theme = {
+  common: {
+    fontWeightStrong: '600'
+  },
+  Card: {
+    borderRadius: '16px'
+  },
+  Button: { borderRadius: '12px' },
+  Tag: { borderRadius: '999px' }
 }
-
-// Analytics mode - no inactivity logout needed
-function resetInactivityTimer() {
-  // No-op in analytics mode
-}
-
-onMounted(() => {
-  // Analytics mode - no authentication events needed
-});
-
-onBeforeUnmount(() => {
-  // Analytics mode - no cleanup needed
-});
 </script>
 
-<style>
-html, body, #app { height:100%; margin:0; background:#101014; }
-
-/* header */
-.header {
-  display:flex;
-  align-items:center;
-  justify-content:space-between;
-  padding:16px;
-  border-bottom:1px solid #444;
-  background:#18181C;
-  color:#fff;
+<style scoped>
+.app-shell {
+  min-height: 100vh;
+  background: linear-gradient(135deg, #0f172a 0%, #111827 100%);
+  color: #f8fafc;
 }
-.title {
-  font-size:20px;
-  font-weight:600;
+.app-header {
+  padding: 16px 24px;
 }
-.clickable { cursor: pointer; }
-.user-box {
-  display:flex;
-  align-items:center;
-  gap:14px;
+.app-main {
+  padding: 0 24px 24px;
 }
-.uname {
-  font-size:16px;  /* bigger font */
-  font-weight:600;
-}
-.status-label {
-  font-weight: 600;
-}
+.w-full { width: 100%; }
 </style>

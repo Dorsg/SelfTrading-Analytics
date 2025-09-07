@@ -49,7 +49,7 @@ add_dir "client-ui-naive" "All client-ui-naive source files (excluding lib folde
 
 # From project root: include .env and Docker files if present
 shopt -s nullglob
-ROOT_DOCKER_FILES=( ".env" "Dockerfile" "docker-compose.yml" "docker-compose.yaml" )
+ROOT_DOCKER_FILES=( ".env" "Dockerfile" "docker-compose.yml" "docker-compose.yaml" "docker-compose.prod.yml" )
 for rf in "${ROOT_DOCKER_FILES[@]}" Dockerfile.* docker-compose.*; do
     if [ -f "$rf" ]; then
         add_file "$rf" "Root project file: $rf"
