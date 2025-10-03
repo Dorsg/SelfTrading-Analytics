@@ -2,9 +2,14 @@
     <n-space vertical size="large">
       <n-space justify="space-between" align="center">
         <n-h3 style="margin:0">Results</n-h3>
-        <n-button type="primary" :loading="store.loading" @click="refresh">
-          Refresh
-        </n-button>
+        <n-space>
+          <n-button quaternary type="warning" :loading="sim.isResetting" @click="resetAll">
+            Reset
+          </n-button>
+          <n-button type="primary" :loading="store.loading" @click="refresh">
+            Generate Results
+          </n-button>
+        </n-space>
       </n-space>
   
       <n-grid :cols="3" x-gap="16" y-gap="16">
@@ -38,8 +43,10 @@
   import ResultsBreakdown from '@/components/ResultsBreakdown.vue'
   import BestStocksTable from '@/components/BestStocksTable.vue'
   import { useResultsStore } from '@/stores/results'
+  import { useSimulationStore } from '@/stores/simulation'
   
   const store = useResultsStore()
+  const sim = useSimulationStore()
   const message = useMessage()
   
   onMounted(async () => {
@@ -49,6 +56,13 @@
   async function refresh () {
     const res = await store.fetchAll()
     if (res?.ok) message.success('Results updated')
+  }
+
+  async function resetAll () {
+    await sim.reset()
+    store.summary = { pnl_by_year: [], pnl_by_timeframe: [], pnl_by_strategy: [] }
+    store.topStocks = []
+    message.success('Reset completed')
   }
   </script>
   

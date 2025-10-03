@@ -184,7 +184,7 @@ class MockBroker:
                 pnl_amount=pnl_amt,
                 pnl_percent=pnl_pct,
                 strategy=str(getattr(runner, "strategy", "unknown")),
-                timeframe=str(int(getattr(runner, "time_frame", 5) or 5)),
+                timeframe='1d' if str(int(getattr(runner, "time_frame", 5) or 5)) == '1440' else '5m',
             )
             db.db.add(trade)
 

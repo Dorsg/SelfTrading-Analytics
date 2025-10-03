@@ -139,19 +139,17 @@ async def _bootstrap_everything() -> None:
     except Exception:
         log.exception("Bootstrap user/account/runners/state failed")
 
-    # Respect auto-start without touching time
+    # Respect auto-start ONLY by setting state; do NOT trigger a runtime start here.
+    # Triggering the scheduler directly during API bootstrap caused confusing "auto-start"
+    # behavior where the sim began without an explicit user request. Keep this opt-in
+    # by only writing the desired state and requiring an explicit API call to actually
+    # advance time if needed.
     if os.getenv("SIM_AUTO_START", "0") == "1":
-        try:
-            # Uses forward-only start_simulation defined above
-            from api_gateway.routes.analytics_routes import start_simulation
-            start_simulation()
-            log.info("Simulation auto-started (SIM_AUTO_START=1).")
-        except Exception:
-            log.exception("Auto-start failed")
+        log.info("SIM_AUTO_START=1 detected: simulation state may be set to running, but auto-start call is suppressed. Use /api/analytics/simulation/start to start processing.")
 
 
 @app.on_event("startup")
-async def _init_db() -> None:
+async def _init_db(force: bool = False) -> None:
     _configure_logging()
     logger = logging.getLogger("api-gateway")
 
@@ -196,3 +194,18 @@ app.add_middleware(
 
 app.include_router(auth_routes.router,      prefix="/api")
 app.include_router(analytics_routes.router, prefix="/api")
+
+@app.post('/api/analytics/simulation/reset')
+async def _bridge_reset():
+    # Prefer the router reset if present
+    try:
+        from api_gateway.routes.analytics_routes import api_reset_simulation as rr
+        return rr()
+    except Exception:
+        pass
+    # Fallback to app.reset_sim if available
+    try:
+        from backend.api_gateway.app import reset_sim, ResetRequest
+        return reset_sim(ResetRequest())
+    except Exception:
+        return {"ok": False, "error": "reset unavailable"}

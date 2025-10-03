@@ -1,49 +1,56 @@
 <template>
-    <n-card title="Top Stocks by % Performance" size="large">
-      <n-data-table
-        :columns="columns"
-        :data="items"
-        :bordered="false"
-        :pagination="pagination"
-        :single-line="false"
-      />
-    </n-card>
-  </template>
-  
-  <script setup>
-  import { ref } from 'vue'
-  import { NCard, NDataTable, NTag } from 'naive-ui'
-  
-  const props = defineProps({
-    items: {
-      type: Array,
-      default: () => [] // [{ stock, time, timeframe, strategy, pct }]
-    }
-  })
-  
-  const pagination = ref({ pageSize: 10 })
-  
-  const columns = [
-    { title: 'Stock', key: 'stock', minWidth: 120,
-      render: (row) => row.stock
+  <n-card title="Top Stocks by % Performance">
+    <n-data-table
+      :columns="columns"
+      :data="items"
+      :pagination="{ pageSize: 10 }"
+      :bordered="false"
+      :single-line="false"
+    />
+  </n-card>
+</template>
+
+<script setup>
+import { h } from 'vue'
+import { NCard, NDataTable } from 'naive-ui'
+
+defineProps({
+  items: { type: Array, default: () => [] }
+})
+
+const columns = [
+  { title: 'Stock', key: 'stock' },
+  { title: 'Timeframe', key: 'timeframe' },
+  { title: 'Strategy', key: 'strategy' },
+  {
+    title: 'Weighted P&L (%)',
+    key: 'weighted_pct',
+    render (row) {
+      return h('span', (row.weighted_pct || 0).toFixed(2) + '%')
     },
-    { title: 'Time', key: 'time', minWidth: 140,
-      render: (row) => row.time
+    sorter: (a, b) => a.weighted_pct - b.weighted_pct
+  },
+  {
+    title: 'Avg. P&L (%) per Trade',
+    key: 'avg_pct',
+    render (row) {
+      const val = (row.avg_pct || 0).toFixed(2) + '%'
+      const cls = row.avg_pct > 0 ? 'pos' : (row.avg_pct < 0 ? 'neg' : '')
+      return h('span', { class: cls }, val)
     },
-    { title: 'Timeframe', key: 'timeframe', minWidth: 100,
-      render: (row) => row.timeframe
-    },
-    { title: 'Strategy', key: 'strategy', minWidth: 160,
-      render: (row) => row.strategy
-    },
-    { title: 'P&L (%)', key: 'pct', minWidth: 120,
-      sorter: (a, b) => Number(a.pct) - Number(b.pct),
-      render: (row) => {
-        const val = Number(row.pct ?? 0).toFixed(2)
-        const type = Number(row.pct ?? 0) >= 0 ? 'success' : 'error'
-        return h(NTag, { type, round: true }, { default: () => `${val}%` })
-      }
-    }
-  ]
-  </script>
+    sorter: (a, b) => a.avg_pct - b.avg_pct
+  },
+  {
+    title: 'Trades',
+    key: 'trades',
+    sorter: (a, b) => (a.trades || 0) - (b.trades || 0)
+  }
+]
+</script>
+
+<style scoped>
+/* Light green/red for Avg P&L column */
+.pos { background-color: rgba(6, 170, 85, 0.08); padding: 2px 4px; border-radius: 4px; }
+.neg { background-color: rgba(220, 38, 38, 0.08); padding: 2px 4px; border-radius: 4px; }
+</style>
   

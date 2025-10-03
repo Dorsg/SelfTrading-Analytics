@@ -74,6 +74,32 @@
         </n-space>
       </n-card>
 
+      <!-- Snapshot stale banner -->
+      <div v-if="isSnapshotStale" style="padding:8px">
+        <n-card size="small" :bordered="false">
+          <n-space align="center" justify="space-between">
+            <n-space>
+              <n-tag type="warning">Snapshot stale</n-tag>
+              <n-text>Last snapshot is {{ snapshotAge }}s old. Data may be out-of-date.</n-text>
+            </n-space>
+            <n-space>
+              <n-button size="small" @click="load">Refresh now</n-button>
+            </n-space>
+          </n-space>
+        </n-card>
+      </div>
+
+      <!-- Debug: show latest /progress snapshot and quick cache controls -->
+      <n-card title="Debug Snapshot" size="small" :bordered="false">
+        <n-space vertical>
+          <n-space>
+            <n-button size="small" @click="clearDbCache">Clear DB cache</n-button>
+            <n-button size="small" secondary @click="load">Force refresh</n-button>
+          </n-space>
+          <pre style="max-height:200px;overflow:auto;background:#f6f8fa;padding:8px;border-radius:4px;">{{ rawSnapshotText }}</pre>
+        </n-space>
+      </n-card>
+
       <n-card title="Simulation Controls" size="small" :bordered="false">
         <n-space align="center">
           <n-tag type="success" v-if="state.running">Running</n-tag>
@@ -222,8 +248,12 @@ import { useMessage } from 'naive-ui';
 import axios from 'axios';
 
 const message = useMessage();
+import { useSimulationStore } from '@/stores/simulation'
+import { computed } from 'vue'
 
-const state = ref({ running: false, last_ts: null });
+const sim = useSimulationStore()
+// Bind UI state to the central simulation store so all components observe the same state
+const state = computed(() => ({ running: sim.isRunning, last_ts: sim.status.last_ts }))
 
 const progress = ref({
   '5m': { percent: 0, ticks_done: 0, ticks_total: 0 },
@@ -232,6 +262,9 @@ const progress = ref({
 
 const logs = ref([]);
 const dbStatus = ref({ ready: false, status: 'checking...', data: {}, setup: {} });
+const rawSnapshotText = ref('')
+const snapshotAge = ref(null)
+const isSnapshotStale = computed(() => snapshotAge.value !== null && snapshotAge.value > 5)
 
 // Log controls (warnings + errors only)
 const logHours = ref(24);
@@ -310,11 +343,21 @@ async function loadLogs() {
   }
 }
 
+function clearDbCache() {
+  try {
+    sessionStorage.removeItem('analytics_db_status_cache')
+  } catch (e) {}
+}
+
 async function load() {
   try {
+    // Add cache-busting and no-cache headers so intermediate proxies/browsers
+    // don't return stale state. Some users reported UI not reflecting server
+    // state due to cached responses.
+    const opts = { params: { _t: Date.now() }, headers: { 'Cache-Control': 'no-cache' } };
     const [p, s] = await Promise.all([
-      axios.get('/api/analytics/progress'),
-      axios.get('/api/analytics/simulation/state')
+      axios.get('/api/analytics/progress', opts),
+      axios.get('/api/analytics/simulation/state', opts)
     ]);
 
     // normalize timeframes
@@ -336,29 +379,61 @@ async function load() {
       progress.value.estimated_finish = p.data.estimated_finish;
     }
 
-    state.value = {
-      running: !!s.data?.running,
-      last_ts: s.data?.last_ts || null
-    };
+    // Update the central simulation store instead of trying to overwrite the
+    // local computed `state` (which is read-only). This keeps UI components
+    // in sync with the Pinia store and avoids silent failures when assigning
+    // to a computed ref.
+    try {
+      const runningFlag = !!s.data?.running
+      sim.status.state = s.data?.state ?? s.data?.status ?? (runningFlag ? 'running' : 'idle')
+      sim.status.progress_percent = Math.round(s.data?.progress_percent ?? s.data?.progress ?? sim.status.progress_percent)
+      sim.status.eta_seconds = s.data?.eta_seconds ?? s.data?.eta ?? sim.status.eta_seconds
+      if (s.data?.last_ts) sim.status.last_ts = s.data.last_ts
+      // snapshot age if present
+      if (s.data?.snapshot_age_seconds !== undefined && s.data?.snapshot_age_seconds !== null) {
+        snapshotAge.value = s.data.snapshot_age_seconds
+      } else if (p.data?.sim_time_epoch) {
+        try { snapshotAge.value = Math.max(0, Math.floor((Date.now()/1000) - Number(p.data.sim_time_epoch))); } catch(e) { snapshotAge.value = null }
+      } else {
+        snapshotAge.value = null
+      }
+      // Update debug snapshot text
+      try {
+        rawSnapshotText.value = JSON.stringify(p.data || s.data || {}, null, 2)
+      } catch (e) {
+        rawSnapshotText.value = String(p.data || s.data || '')
+      }
+    } catch (e) {
+      console.error('Failed to update sim.status from /simulation/state', e)
+    }
   } catch (err) {
     message.error('Failed to load progress');
   }
 }
 
 async function toggleRun() {
+  // Prevent duplicate rapid clicks
+  if (toggleRun.inFlight) return;
+  toggleRun.inFlight = true;
   try {
     if (state.value.running) {
-      await axios.post('/api/analytics/simulation/stop');
-      state.value.running = false;
-      stopAutoAdvance();
+      const r = await sim.stop()
+      message.success(r?.message ?? 'Stop requested')
+      stopAutoAdvance()
     } else {
-      await axios.post('/api/analytics/simulation/start');
-      state.value.running = true;
-      startAutoAdvance();
+      const r = await sim.start()
+      if (r?.message === 'already running') {
+        message.info(r.message)
+      } else {
+        message.success(r?.message ?? 'Simulation started')
+      }
+      if (sim.isRunning) startAutoAdvance()
     }
-    await load();
+    await load()
   } catch (err) {
     message.error('Failed to toggle simulation');
+  } finally {
+    toggleRun.inFlight = false;
   }
 }
 

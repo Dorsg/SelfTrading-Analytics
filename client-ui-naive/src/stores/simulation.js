@@ -7,20 +7,73 @@ export const useSimulationStore = defineStore('simulation', () => {
   const isStopping = ref(false)
   const isResetting = ref(false)
 
-  const status = ref({
+  // For client-side ETA calculation
+  let lastProgressData = null
+  let lastPollTime = null
+  const etaRateSmoother = 0.1 // EMA alpha for smoothing rate calculations
+  
+  // ───────── Simulation status cache (prevents blank/0% flash on refresh) ─────────
+  const SIM_STATUS_CACHE_KEY = 'analytics_sim_status_cache'
+  const ETA_CACHE_KEY = 'analytics_eta_cache_v1'
+  const ETA_TTL_MS = 60 * 1000 // 1 minute TTL for cached ETA
+  function readSimCache () {
+    try {
+      const raw = sessionStorage.getItem(SIM_STATUS_CACHE_KEY)
+      if (!raw) return null
+      return JSON.parse(raw)
+    } catch { return null }
+  }
+  function writeSimCache (val) {
+    try { sessionStorage.setItem(SIM_STATUS_CACHE_KEY, JSON.stringify(val)) } catch {}
+  }
+  function readEtaCache () {
+    try {
+      const raw = sessionStorage.getItem(ETA_CACHE_KEY)
+      if (!raw) return null
+      const obj = JSON.parse(raw)
+      if (!obj || !obj.when || (Date.now() - obj.when) > ETA_TTL_MS) return null
+      return obj
+    } catch { return null }
+  }
+  function writeEtaCache (etaSeconds, finishIso, rate) {
+    try { sessionStorage.setItem(ETA_CACHE_KEY, JSON.stringify({ when: Date.now(), etaSeconds, finishIso, rate })) } catch {}
+  }
+
+  const status = ref(readSimCache() || {
     state: 'idle',            // 'idle' | 'running' | 'stopped' | 'completed'
     progress_percent: 0,      // 0..100
     eta_seconds: null,
+    eta_label: null,
+    estimated_finish_iso: null,
     total_buys: 0,
-    total_sells: 0
+    total_sells: 0,
+    last_ts: null,
+    current: null
   })
+  // snapshot_age_seconds: how old the server snapshot is (if provided)
+  status.value.snapshot_age_seconds = null
 
-  const importStatus = ref({
-    state: 'idle',            // 'idle' | 'importing' | 'ready' | 'error'
+  // ───────── Import status cache (prevents 0% flash on refresh) ─────────
+  const IMPORT_STATUS_CACHE_KEY = 'analytics_import_status_cache'
+  function readImportCache () {
+    try {
+      const raw = sessionStorage.getItem(IMPORT_STATUS_CACHE_KEY)
+      if (!raw) return null
+      return JSON.parse(raw)
+    } catch { return null }
+  }
+  function writeImportCache (val) {
+    try { sessionStorage.setItem(IMPORT_STATUS_CACHE_KEY, JSON.stringify(val)) } catch {}
+  }
+
+  const importDefault = {
+    state: 'idle',            // 'idle' | 'importing' | 'ready' | 'error' | 'pending'
     progress_percent: 0,      // 0..100
     processed: 0,
-    total: 0
-  })
+    total: 0,
+    details: { daily_bars: 0, minute_bars: 0, users: 0, runners: 0, date_range: { start: null, end: null }, checks_done: 0, checks_total: 0 }
+  }
+  const importStatus = ref(readImportCache() || importDefault)
 
   const logs = ref({
     warnings: [],
@@ -35,18 +88,90 @@ export const useSimulationStore = defineStore('simulation', () => {
 
   function _startPolling () {
     _stopPolling()
+    const intervalMs = 1200
     pollTimer = setInterval(async () => {
       try {
-        const s = await SimulationAPI.status()
-        status.value = {
-          state: s.state ?? s.status ?? 'idle',
-          progress_percent: Math.round(s.progress_percent ?? s.progress ?? 0),
-          eta_seconds: s.eta_seconds ?? s.eta ?? null,
-          total_buys: s.total_buys ?? 0,
-          total_sells: s.total_sells ?? 0
+        // Prefer the detailed /progress snapshot for percentages and ETA
+        // but fall back to /simulation/state when needed.
+        let progressData = null
+        let stateData = null
+        try {
+          progressData = await SimulationAPI.progress()
+        } catch (e) {
+          // ignore
         }
-      } catch { /* silent */ }
-    }, 1500)
+        try {
+          stateData = await SimulationAPI.status()
+        } catch (e) {
+          // ignore
+        }
+
+        // ---- Client-side ETA Calculation ----
+        if (progressData && progressData.sim_time_epoch && progressData.max_epoch && progressData.state === 'running') {
+          const now = Date.now()
+          if (lastProgressData && lastPollTime) {
+            const simSecondsPerTick = progressData.sim_time_epoch - lastProgressData.sim_time_epoch
+            const wallSecondsPerTick = (now - lastPollTime) / 1000
+
+            if (simSecondsPerTick > 0 && wallSecondsPerTick > 0) {
+              const currentRate = simSecondsPerTick / wallSecondsPerTick // sim seconds per wall second
+              // Use an exponential moving average to smooth the rate
+              const smoothedRate = status.value.rate ? (etaRateSmoother * currentRate) + (1 - etaRateSmoother) * status.value.rate : currentRate
+              status.value.rate = smoothedRate
+
+              const remainingSimSeconds = progressData.max_epoch - progressData.sim_time_epoch
+              if (remainingSimSeconds > 0 && smoothedRate > 0) {
+                const newEtaSeconds = Math.round(remainingSimSeconds / smoothedRate)
+                status.value.eta_seconds = newEtaSeconds
+                status.value.estimated_finish_iso = new Date(now + newEtaSeconds * 1000).toISOString()
+                writeEtaCache(status.value.eta_seconds, status.value.estimated_finish_iso, status.value.rate)
+              } else {
+                status.value.eta_seconds = 0
+                status.value.estimated_finish_iso = new Date().toISOString()
+              }
+            }
+          }
+          lastProgressData = progressData
+          lastPollTime = now
+        } else {
+          // Reset if not running
+          lastProgressData = null
+          lastPollTime = null
+          // keep last cached ETA while idle to avoid flicker
+          const cached = readEtaCache()
+          if (cached) {
+            status.value.eta_seconds = cached.etaSeconds
+            status.value.estimated_finish_iso = cached.finishIso
+            status.value.rate = cached.rate
+          } else {
+            status.value.eta_seconds = null
+            status.value.estimated_finish_iso = null
+          }
+        }
+        
+        const runningFlag = stateData && (typeof stateData.running !== 'undefined' ? stateData.running : stateData.is_running)
+
+        // derive values, preferring progress snapshot
+        const percent = progressData?.progress_percent ?? progressData?.progress ?? stateData?.progress_percent ?? stateData?.progress ?? 0
+        const totalBuys = progressData?.total_buys ?? stateData?.total_buys ?? status.value.total_buys ?? 0
+        const totalSells = progressData?.total_sells ?? stateData?.total_sells ?? status.value.total_sells ?? 0
+        const lastTs = progressData?.sim_time_iso ?? stateData?.last_ts ?? status.value.last_ts ?? null
+        const currentRunnerInfo = progressData?.current_runner_info ?? null
+
+        status.value.state = (stateData?.state ?? stateData?.status) ?? (runningFlag ? 'running' : 'idle')
+        status.value.progress_percent = Math.round(percent ?? 0)
+        status.value.total_buys = totalBuys ?? 0
+        status.value.total_sells = totalSells ?? 0
+        status.value.last_ts = lastTs
+        status.value.current = currentRunnerInfo
+        status.value.snapshot_age_seconds = stateData?.snapshot_age_seconds ?? null
+        
+        writeSimCache(status.value)
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.error('Simulation status poll error:', err)
+      }
+    }, intervalMs)
   }
 
   function _stopPolling () {
@@ -60,12 +185,51 @@ export const useSimulationStore = defineStore('simulation', () => {
     _stopImportPolling()
     importTimer = setInterval(async () => {
       try {
-        const s = await SimulationAPI.importStatus()
+        const [s, db] = await Promise.all([
+          SimulationAPI.importStatus(),
+          SimulationAPI.dbStatus().catch(() => null)
+        ])
+
+        // Map server states to UI states
+        const mappedState = (function mapState () {
+          const st = s?.state
+          if (st === 'completed') return 'ready'
+          if (st === 'pending' && db && db.ready) return 'ready'
+          return st ?? 'idle'
+        })()
+
+        // Derive percent: prefer server, else DB readiness gates
+        let percent = Math.round(s?.progress_percent ?? s?.progress ?? 0)
+        if ((!percent || percent <= 0) && db) {
+          const gates = [ (db?.data?.daily_bars || 0) > 0, (db?.data?.minute_bars || 0) > 0, (db?.setup?.users || 0) > 0 && (db?.setup?.runners || 0) > 0 ]
+          const done = gates.filter(Boolean).length
+          percent = Math.round((done / 3) * 100)
+          if (db.ready) percent = 100
+        }
+
+        const details = s?.details || {
+          daily_bars: db?.data?.daily_bars || 0,
+          minute_bars: db?.data?.minute_bars || 0,
+          users: db?.setup?.users || 0,
+          runners: db?.setup?.runners || 0,
+          date_range: db?.data?.date_range || { start: null, end: null },
+          checks_done: undefined,
+          checks_total: undefined
+        }
+
         importStatus.value = {
-          state: s.state ?? 'idle',
-          progress_percent: Math.round(s.progress_percent ?? s.progress ?? 0),
-          processed: s.processed ?? s.done ?? 0,
-          total: s.total ?? s.count ?? 0
+          state: mappedState,
+          progress_percent: percent,
+          processed: s?.processed ?? s?.done ?? (db?.ready ? 3 : 0),
+          total: s?.total ?? s?.count ?? 3,
+          details
+        }
+        // Persist to cache to avoid 0% flash on next refresh
+        writeImportCache(importStatus.value)
+
+        // Stop polling once import is fully ready to reduce noise
+        if (importStatus.value.progress_percent >= 100 || importStatus.value.state === 'ready') {
+          _stopImportPolling()
         }
       } catch { /* silent */ }
     }, 2000)
@@ -105,28 +269,115 @@ export const useSimulationStore = defineStore('simulation', () => {
   async function warmUp () {
     // Initial pulls to show current state without waiting for the first interval
     try {
-      const [s, i] = await Promise.all([
+      // Reset ETA calculation on warmup
+      lastProgressData = null
+      lastPollTime = null
+      // Use cached ETA immediately if fresh
+      const cachedEta = readEtaCache()
+      if (cachedEta) {
+        status.value.eta_seconds = cachedEta.etaSeconds
+        status.value.estimated_finish_iso = cachedEta.finishIso
+        status.value.rate = cachedEta.rate
+      } else {
+        status.value.eta_seconds = null
+        status.value.estimated_finish_iso = null
+      }
+
+      const [s, i, p, db] = await Promise.all([
         SimulationAPI.status(),
-        SimulationAPI.importStatus()
+        SimulationAPI.importStatus(),
+        SimulationAPI.progress().catch(() => null),
+        SimulationAPI.dbStatus().catch(() => null)
       ])
+      // Normalize running indicator here too
+      const runningFlag = typeof s.running !== 'undefined' ? s.running : s.is_running
       status.value = {
-        state: s.state ?? s.status ?? 'idle',
+        state: s.state ?? s.status ?? (runningFlag ? 'running' : 'idle'),
         progress_percent: Math.round(s.progress_percent ?? s.progress ?? 0),
         eta_seconds: s.eta_seconds ?? s.eta ?? null,
+        eta_label: p?.estimated_finish ?? null,
+        estimated_finish_iso: p?.estimated_finish_iso ?? null,
         total_buys: s.total_buys ?? 0,
-        total_sells: s.total_sells ?? 0
+        total_sells: s.total_sells ?? 0,
+        last_ts: p?.sim_time_iso ?? s.last_ts ?? null,
+        current: p?.current_runner_info ?? null,
+        snapshot_age_seconds: typeof s.snapshot_age_seconds !== 'undefined' ? s.snapshot_age_seconds : null
       }
-      importStatus.value = {
-        state: i.state ?? 'idle',
-        progress_percent: Math.round(i.progress_percent ?? i.progress ?? 0),
-        processed: i.processed ?? i.done ?? 0,
-        total: i.total ?? i.count ?? 0
+      writeSimCache(status.value)
+      if (status.value.eta_seconds != null || status.value.estimated_finish_iso) {
+        writeEtaCache(status.value.eta_seconds, status.value.estimated_finish_iso, status.value.rate)
       }
+      // Normalize import status using DB readiness when available
+      try {
+        const mappedState = (function mapState () {
+          const st = i?.state
+          if (st === 'completed') return 'ready'
+          if (st === 'pending' && db && db.ready) return 'ready'
+          return st ?? 'idle'
+        })()
+        let percent = Math.round(i?.progress_percent ?? i?.progress ?? 0)
+        if ((!percent || percent <= 0) && db) {
+          const gates = [ (db?.data?.daily_bars || 0) > 0, (db?.data?.minute_bars || 0) > 0, (db?.setup?.users || 0) > 0 && (db?.setup?.runners || 0) > 0 ]
+          const done = gates.filter(Boolean).length
+          percent = Math.round((done / 3) * 100)
+          if (db?.ready) percent = 100
+        }
+        importStatus.value = {
+          state: mappedState,
+          progress_percent: percent,
+          processed: i?.processed ?? i?.done ?? (db?.ready ? 3 : 0),
+          total: i?.total ?? i?.count ?? 3,
+          details: i?.details || {
+            daily_bars: db?.data?.daily_bars || 0,
+            minute_bars: db?.data?.minute_bars || 0,
+            users: db?.setup?.users || 0,
+            runners: db?.setup?.runners || 0,
+            date_range: db?.data?.date_range || { start: null, end: null },
+            checks_done: undefined,
+            checks_total: undefined
+          }
+        }
+        writeImportCache(importStatus.value)
+      } catch (e) { /* ignore */ }
     } finally {
       _startPolling()
-      _startImportPolling()
+      // Only continue import polling if not fully ready
+      if (!(importStatus.value.progress_percent >= 100 || importStatus.value.state === 'ready')) {
+        _startImportPolling()
+      }
       _startLogsPolling()
     }
+  }
+
+  // Manual one-shot refresh for the Simulation card
+  async function refreshOnce () {
+    try {
+      // Reset ETA calculation on manual refresh
+      lastProgressData = null
+      lastPollTime = null
+
+      const [p, s] = await Promise.all([
+        SimulationAPI.progress().catch(() => null),
+        SimulationAPI.status().catch(() => null)
+      ])
+      if (p || s) {
+        const runningFlag = s && (typeof s.running !== 'undefined' ? s.running : s?.is_running)
+        const percent = p?.progress_percent ?? p?.progress ?? s?.progress_percent ?? s?.progress ?? status.value.progress_percent
+        const eta = p?.estimated_finish_seconds ?? p?.eta_seconds ?? s?.eta_seconds ?? s?.eta ?? status.value.eta_seconds
+        
+        status.value.state = (s?.state ?? s?.status) ?? (runningFlag ? 'running' : status.value.state)
+        status.value.progress_percent = Math.round(percent ?? 0)
+        status.value.eta_seconds = eta ?? null
+        status.value.eta_label = p?.estimated_finish ?? status.value.eta_label ?? null
+        status.value.estimated_finish_iso = p?.estimated_finish_iso ?? status.value.estimated_finish_iso ?? null
+        status.value.total_buys = p?.total_buys ?? s?.total_buys ?? status.value.total_buys
+        status.value.total_sells = p?.total_sells ?? s?.total_sells ?? status.value.total_sells
+        status.value.last_ts = p?.sim_time_iso ?? s?.last_ts ?? status.value.last_ts
+        status.value.current = p?.current_runner_info ?? status.value.current
+        status.value.snapshot_age_seconds = s?.snapshot_age_seconds ?? status.value.snapshot_age_seconds ?? null
+        writeSimCache(status.value)
+      }
+    } catch { /* ignore */ }
   }
 
   async function start () {
@@ -134,7 +385,21 @@ export const useSimulationStore = defineStore('simulation', () => {
     isStarting.value = true
     try {
       const res = await SimulationAPI.start()
-      // on success the backend updates status; polling will reflect it
+      // Update store immediately so UI reflects start without waiting for next poll
+      try {
+        status.value.state = res.state ?? (res.running ? 'running' : status.value.state)
+        status.value.progress_percent = Math.round(res.progress_percent ?? res.progress ?? status.value.progress_percent)
+        status.value.eta_seconds = res.eta_seconds ?? res.eta ?? status.value.eta_seconds
+        // Mirror counters if present
+        if (typeof res.total_buys !== 'undefined') status.value.total_buys = res.total_buys
+        if (typeof res.total_sells !== 'undefined') status.value.total_sells = res.total_sells
+        // last_ts may be present
+        if (res.last_ts) {
+          status.value.last_ts = res.last_ts
+        }
+      } catch (e) {
+        /* ignore */
+      }
       return res
     } finally {
       isStarting.value = false
@@ -146,6 +411,10 @@ export const useSimulationStore = defineStore('simulation', () => {
     isStopping.value = true
     try {
       const res = await SimulationAPI.stop()
+      try {
+        status.value.state = res.state ?? (res.running ? 'running' : 'stopped')
+        if (res.last_ts) status.value.last_ts = res.last_ts
+      } catch (e) { /* ignore */ }
       return res
     } finally {
       isStopping.value = false
@@ -157,6 +426,31 @@ export const useSimulationStore = defineStore('simulation', () => {
     isResetting.value = true
     try {
       const res = await SimulationAPI.reset()
+      // Clear execution-related caches and store values so UI returns to 0%
+      try {
+        sessionStorage.removeItem(SIM_STATUS_CACHE_KEY)
+        sessionStorage.removeItem(ETA_CACHE_KEY)
+        sessionStorage.removeItem(IMPORT_STATUS_CACHE_KEY)
+      } catch {}
+
+      lastProgressData = null
+      lastPollTime = null
+
+      status.value = {
+        state: 'idle',
+        progress_percent: 0,
+        eta_seconds: null,
+        eta_label: null,
+        estimated_finish_iso: null,
+        total_buys: 0,
+        total_sells: 0,
+        last_ts: null,
+        current: null,
+        snapshot_age_seconds: null
+      }
+      importStatus.value = { ...importDefault, state: 'ready', progress_percent: 100, processed: 3, total: 3 }
+      logs.value = { warnings: [], errors: [] }
+      writeSimCache(status.value)
       return res
     } finally {
       isResetting.value = false
@@ -172,6 +466,6 @@ export const useSimulationStore = defineStore('simulation', () => {
   return {
     status, importStatus, logs,
     isStarting, isStopping, isResetting, isRunning,
-    warmUp, start, stop, reset, destroy
+    warmUp, start, stop, reset, destroy, refreshOnce
   }
 })

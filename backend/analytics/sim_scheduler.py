@@ -4,7 +4,12 @@ import asyncio
 import json
 import logging
 import os
-from datetime import datetime, timezone, timedelta, date, time
+import sys
+import time
+from datetime import datetime, timezone, timedelta, date
+
+# Ensure the project root is in the Python path
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 
 from logger_config import setup_logging  # ensure file handlers & levels
 from database.db_manager import DBManager
@@ -20,6 +25,8 @@ log = logging.getLogger("AnalyticsScheduler")
 
 PACE_FILE = "/tmp/sim_auto_advance.json"
 HEARTBEAT_FILE = "/tmp/sim_scheduler.heartbeat"
+SNAPSHOT_FILE = os.getenv("SIM_PROGRESS_SNAPSHOT", "/app/data/sim_last_progress.json")
+WATCHDOG_IDLE_SECONDS = int(os.getenv("SIM_WATCHDOG_IDLE_SEC", "600"))  # restart if no progress
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Tunables (sane defaults; all overridable via env)
@@ -97,12 +104,102 @@ def _ny_open_epoch_for_day(dt_utc: datetime) -> int:
         return int(approx.timestamp())
 
 
+def _compute_eta(cur_ts: int, pace: float, total_span: int, done_span: int, step_sec: int, tick_times: list) -> dict:
+    """Computes estimated finish time and returns a dictionary with ETA fields."""
+    try:
+        pace_seconds = pace if pace > 0 else None
+        est_secs = None
+        remaining = max(0, total_span - done_span)
+        remaining_ticks = remaining / step_sec if step_sec > 0 else None
+        pct = max(0.0, min(100.0, (done_span / total_span) * 100.0)) if total_span > 0 else 0
+
+        if remaining_ticks is None:
+            return {}
+
+        # 1) If explicit pacing is configured, use it
+        if pace_seconds and pct < 100.0:
+            est_secs = int(remaining_ticks * pace_seconds)
+
+        # 2) Else infer from observed tick wall-times
+        if est_secs is None:
+            try:
+                if len(tick_times) >= 2:
+                    intervals = [t2 - t1 for t1, t2 in zip(list(tick_times)[:-1], list(tick_times)[1:])]
+                    if intervals:
+                        avg = sum(intervals) / len(intervals)
+                        est_secs = int(remaining_ticks * avg)
+            except Exception:
+                est_secs = None
+
+        if est_secs is None:
+            return {}
+
+        payload = {
+            "estimated_finish_seconds": est_secs,
+            "estimated_finish_iso": datetime.fromtimestamp(cur_ts + est_secs, tz=timezone.utc).isoformat()
+        }
+        # Human-friendly string for convenience
+        hh = est_secs // 3600
+        mm = (est_secs % 3600) // 60
+        ss = est_secs % 60
+        if hh > 0:
+            payload["estimated_finish"] = f"~{hh}h {mm}m"
+        else:
+            payload["estimated_finish"] = f"~{mm}m {ss}s"
+        return payload
+    except Exception:
+        return {}
+
+
 async def _heartbeat() -> None:
     try:
         with open(HEARTBEAT_FILE, "w") as f:
             f.write(datetime.now(timezone.utc).isoformat())
     except Exception:
         pass
+
+
+def _write_snapshot_atomic(payload: dict, path: str | None = None) -> None:
+    """Write a JSON snapshot atomically to disk. Non-fatal on failure.
+
+    This ensures the API can read a consistent snapshot even when the scheduler
+    is interrupted or the DB is flaky.
+    """
+    try:
+        import json
+        p = path or SNAPSHOT_FILE
+        tmp = f"{p}.tmp"
+        log.debug("Preparing to write snapshot to %s via %s", p, tmp)
+        try:
+            d = os.path.dirname(p)
+            if d and not os.path.exists(d):
+                log.debug("Creating snapshot directory %s", d)
+                os.makedirs(d, exist_ok=True)
+        except Exception:
+            log.exception("Failed to create snapshot directory for %s", p)
+            return
+
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(payload, f)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except Exception:
+                pass  # fsync may not be available
+        log.debug("Successfully wrote content to temporary snapshot %s", tmp)
+
+        try:
+            os.replace(tmp, p)
+            log.info("Successfully published progress snapshot to %s", p)
+        except Exception:
+            # fallback for cross-device or other issues
+            try:
+                os.rename(tmp, p)
+                log.info("Successfully published progress snapshot via rename to %s", p)
+            except Exception:
+                log.exception("Failed to atomically move snapshot from %s to %s", tmp, p)
+    except Exception:
+        log.exception("Failed to write snapshot")
 
 
 async def _advance_one_tick(rs: RunnerService, ts: int) -> tuple[int, dict]:
@@ -136,7 +233,25 @@ async def main() -> None:
     tf_min = step_sec // 60
     requested_clock = os.getenv("SIM_REFERENCE_CLOCK_SYMBOL", "SPY").upper()
     clock_sym = requested_clock
-    if not mkt.has_minute_bars(clock_sym, tf_min):
+    try:
+        has_bars = mkt.has_minute_bars(clock_sym, tf_min)
+    except Exception as e:
+        # DB may be down/unavailable; write a db_unavailable snapshot and retry until available
+        log.exception("Failed to check minute bars (DB may be down). Will retry.")
+        _write_snapshot_atomic({"state": "db_unavailable", "error": str(e)})
+        backoff = 1.0
+        while True:
+            await asyncio.sleep(backoff)
+            try:
+                if mkt.has_minute_bars(clock_sym, tf_min):
+                    break
+            except Exception as e2:
+                log.debug("Retrying minute bars check failed: %s", e2)
+                _write_snapshot_atomic({"state": "db_unavailable", "error": str(e2)})
+                backoff = min(backoff * 2.0, 8.0)
+        has_bars = True
+
+    if not has_bars:
         picked = mkt.pick_reference_symbol(interval_min=tf_min)
         if picked:
             log.info(
@@ -174,8 +289,38 @@ async def main() -> None:
     cached_max_ts = max_5m_dt
     cached_min_daily = min_daily_dt
 
+    # Optional: Only clear lingering running state on boot if explicitly requested.
+    # Default behavior is to preserve prior state so manual starts survive restarts.
+    try:
+        if os.getenv("SIM_CLEAR_RUNNING_ON_BOOT", "0") == "1" and os.getenv("SIM_AUTO_START", "0") != "1":
+            with DBManager() as db:
+                user = db.get_user_by_username("analytics")
+                if user:
+                    st = db.db.query(SimulationState).filter(SimulationState.user_id == int(getattr(user, "id"))).first()
+                    if st and str(st.is_running).lower() in {"true", "1"}:
+                        log.info("Clearing simulation_state.is_running on boot for user=%s (SIM_CLEAR_RUNNING_ON_BOOT=1).", user.id)
+                        st.is_running = "false"
+                        db.db.commit()
+    except Exception:
+        log.exception("Failed to apply SIM_CLEAR_RUNNING_ON_BOOT policy at scheduler startup")
+
     state_epoch: int | None = None  # seconds since epoch, UTC
     tick = 0
+    last_db_running: bool | None = None
+    # cumulative counters for UI-friendly totals (since scheduler start)
+    cumulative_processed = 0
+    cumulative_buys = 0
+    cumulative_sells = 0
+    # track recent tick wall-times to estimate tick rate when running at full speed
+    try:
+        from collections import deque
+    except Exception:
+        deque = None
+    tick_times = deque(maxlen=64) if deque is not None else []
+    # watchdog trackers
+    last_progress_wall = time.time()
+    last_seen_db_epoch: int | None = None
+    enforced_stop_applied = False
     while True:
         pace = _read_pace_seconds()
         try:
@@ -192,6 +337,19 @@ async def main() -> None:
 
                 uid = int(getattr(user, "id"))
                 st = db.db.query(SimulationState).filter(SimulationState.user_id == uid).first()
+                # detect DB-level start/stop transitions for observability
+                try:
+                    cur_db_running = str(st.is_running).lower() in {"true", "1"} if st else False
+                    if last_db_running is None:
+                        last_db_running = cur_db_running
+                    else:
+                        if not last_db_running and cur_db_running:
+                            log.info("Detected SimulationState transition: STOPPED -> RUNNING for user_id=%s", uid)
+                        if last_db_running and not cur_db_running:
+                            log.info("Detected SimulationState transition: RUNNING -> STOPPED for user_id=%s", uid)
+                        last_db_running = cur_db_running
+                except Exception:
+                    pass
                 if not st:
                     st = SimulationState(user_id=uid, is_running="false")
                     db.db.add(st)
@@ -199,9 +357,39 @@ async def main() -> None:
                     await asyncio.sleep(1.0)
                     continue
 
+                # Enforce default stopped state on boot if SIM_AUTO_START!=1
+                if not enforced_stop_applied and os.getenv("SIM_AUTO_START", "0") != "1":
+                    if str(st.is_running).lower() in {"true", "1"}:
+                        log.info("Scheduler boot: SIM_AUTO_START!=1 → forcing simulation_state.is_running=false (user_id=%s)", uid)
+                        st.is_running = "false"
+                        db.db.commit()
+                    enforced_stop_applied = True
+
+                # Auto-resume if requested via env and state is stopped
+                try:
+                    if os.getenv("SIM_AUTO_START", "0") == "1" and str(st.is_running).lower() not in {"true", "1"}:
+                        st.is_running = "true"
+                        db.db.commit()
+                        log.info("SIM_AUTO_START=1: marked simulation as running on scheduler startup for user_id=%s", uid)
+                except Exception:
+                    log.exception("Failed to apply SIM_AUTO_START in scheduler")
+
+                # Debug: surface SimulationState read so we can trace API start/stop visibility
+                try:
+                    log.debug(
+                        "SimulationState read for user_id=%s -> is_running=%s last_ts=%s",
+                        uid,
+                        getattr(st, "is_running", None),
+                        getattr(st, "last_ts", None),
+                    )
+                except Exception:
+                    pass
+
                 if str(st.is_running).lower() not in {"true", "1"}:
                     if tick % 10 == 0:
                         log.debug("Idle: simulation not running")
+                    # If we just transitioned to not running, clear state_epoch so next start re-initializes
+                    state_epoch = None
                     await asyncio.sleep(1.0)
                     tick += 1
                     continue
@@ -217,7 +405,19 @@ async def main() -> None:
                         cached_min_daily = conn.execute(select(func.min(HistoricalDailyBar.date))).scalar()
 
                 if not cached_min_ts or not cached_max_ts:
-                    log.warning("No minute bars present; pausing run.")
+                    # No intraday data available. Auto-stop (do not burn CPU) and surface a snapshot reason.
+                    if str(st.is_running).lower() in {"true", "1"}:
+                        st.is_running = "false"
+                        db.db.commit()
+                        log.warning("No minute bars present; auto-stopping simulation. Import minute bars or switch to 1d mode.")
+                    try:
+                        _write_snapshot_atomic({
+                            "state": "no_data",
+                            "reason": "no_minute_bars",
+                            "message": "No 5m bars found. Import data or run daily timeframe.",
+                        })
+                    except Exception:
+                        pass
                     await asyncio.sleep(1.0)
                     tick += 1
                     continue
@@ -253,6 +453,9 @@ async def main() -> None:
                     desired_start = min(int(aligned_dt.timestamp()), max_epoch)
 
                 db_epoch = _ts(st.last_ts)
+                if db_epoch is not None and db_epoch != last_seen_db_epoch:
+                    last_seen_db_epoch = db_epoch
+                    last_progress_wall = time.time()
 
                 if state_epoch is None:
                     base = db_epoch if (db_epoch is not None) else desired_start
@@ -354,7 +557,30 @@ async def main() -> None:
                     continue
 
                 cur_dt = datetime.fromtimestamp(state_epoch, tz=timezone.utc)
+                before_tick = datetime.now(timezone.utc).timestamp()
                 cur_ts, stats = await _advance_one_tick(rs, state_epoch)
+                after_tick = datetime.now(timezone.utc).timestamp()
+                # update cumulative totals
+                try:
+                    cumulative_processed += int(stats.get("processed", 0))
+                except Exception:
+                    pass
+                try:
+                    cumulative_buys += int(stats.get("buys", 0))
+                except Exception:
+                    pass
+                try:
+                    cumulative_sells += int(stats.get("sells", 0))
+                except Exception:
+                    pass
+                # record tick wall-time
+                try:
+                    if deque is not None:
+                        tick_times.append(after_tick)
+                    else:
+                        tick_times.append(after_tick)
+                except Exception:
+                    pass
 
                 next_dt = mkt.get_next_session_ts(
                     cur_dt,
@@ -413,6 +639,32 @@ async def main() -> None:
                         pace_label,
                     )
 
+                # Persist a small last-progress snapshot for UI resilience when DB is flaky.
+                try:
+                    _write_snapshot_atomic({
+                        "sim_time_epoch": cur_ts,
+                        "sim_time_iso": datetime.fromtimestamp(cur_ts, tz=timezone.utc).isoformat(),
+                        "timeframes": {"5m": {"ticks_done": done_span // step_sec if step_sec > 0 else 0,
+                                              "ticks_total": total_span // step_sec if step_sec > 0 else 0,
+                                              "percent": pct}},
+                        "counters": {"executions_all_time": int(cumulative_processed),
+                                     "trades_all_time": int(cumulative_buys + cumulative_sells)},
+                        "total_buys": int(cumulative_buys),
+                        "total_sells": int(cumulative_sells),
+                        "progress_percent": pct,
+                        "state": "running",
+                        "tick_number": tick,
+                        "logged_progress": pct,
+                        "current_runner_info": {
+                            "timeframe": f"{int(step_sec // 60)}m" if step_sec % 60 == 0 else f"{step_sec}s",
+                            "symbol": (clock_sym or "<global>"),
+                            "as_of_iso": datetime.fromtimestamp(cur_ts, tz=timezone.utc).isoformat(),
+                        },
+                        **_compute_eta(cur_ts, pace, total_span, done_span, step_sec, tick_times)
+                    })
+                except Exception:
+                    log.exception("Failed to write progress snapshot")
+
                 await asyncio.sleep(pace if pace > 0 else 0)
                 tick += 1
 
@@ -421,6 +673,43 @@ async def main() -> None:
             await asyncio.sleep(0.5)
             tick += 1
 
+        # Watchdog: if sim is marked running but no last_ts progress for too long, exit for supervisor restart
+        try:
+            if WATCHDOG_IDLE_SECONDS > 0:
+                with DBManager() as db:
+                    user = db.get_user_by_username("analytics")
+                    st = db.db.query(SimulationState).filter(SimulationState.user_id == int(getattr(user, "id"))).first() if user else None
+                running = bool(st and str(st.is_running).lower() in {"true", "1"})
+                if running and last_seen_db_epoch is not None and (time.time() - last_progress_wall) > WATCHDOG_IDLE_SECONDS:
+                    log.error(
+                        "Watchdog: no SimulationState.last_ts progress for %ss while running (last_epoch=%s). Exiting to let supervisor restart.",
+                        WATCHDOG_IDLE_SECONDS,
+                        last_seen_db_epoch,
+                    )
+                    try:
+                        _write_snapshot_atomic({"state": "watchdog_restart", "last_epoch": last_seen_db_epoch, "at": datetime.now(timezone.utc).isoformat()})
+                    finally:
+                        os._exit(100)
+        except Exception:
+            pass
+
 if __name__ == "__main__":
     import asyncio
-    asyncio.run(main())
+    import sys
+
+    if "reset" in sys.argv:
+        print("Resetting simulation state...")
+        try:
+            with DBManager() as db:
+                user = db.get_user_by_username("analytics")
+                if user:
+                    st = db.db.query(SimulationState).filter(SimulationState.user_id == user.id).first()
+                    if st:
+                        st.last_ts = None
+                        st.is_running = "false"
+                        db.db.commit()
+                        print("Simulation state reset.")
+        except Exception as e:
+            print(f"Failed to reset simulation state: {e}")
+    else:
+        asyncio.run(main())

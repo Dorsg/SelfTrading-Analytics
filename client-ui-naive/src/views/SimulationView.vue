@@ -7,6 +7,7 @@
             :progress="sim.importStatus.progress_percent"
             :processed="sim.importStatus.processed"
             :total="sim.importStatus.total"
+            :details="sim.importStatus.details"
           />
         </n-gi>
   

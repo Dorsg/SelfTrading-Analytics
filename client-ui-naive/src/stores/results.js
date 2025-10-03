@@ -28,16 +28,18 @@ export const useResultsStore = defineStore('results', () => {
 
   function normalizeSummary (s) {
     // Flexible mapping to support different backend keys
-    const map = (arr, labelKey, valueKey) =>
+    const map = (arr, labelKey = 'bucket', valueKey1 = 'weighted_pct', valueKey2 = 'avg_pct', tradesKey = 'trades') =>
       (arr ?? []).map(x => ({
-        bucket: x.bucket ?? x[labelKey] ?? x[labelKey?.toUpperCase?.()] ?? x[labelKey?.toLowerCase?.()],
-        pct: Number(x.pct ?? x[valueKey] ?? x.percent ?? x.percentage ?? 0)
+        bucket: x[labelKey],
+        weighted_pct: safeNumber(x[valueKey1]),
+        avg_pct: safeNumber(x[valueKey2]),
+        trades: safeInt(x[tradesKey])
       }))
 
     return {
-      pnl_by_year: map(s?.pnl_by_year ?? s?.pnl_by_time ?? s?.by_year, 'year', 'pct'),
-      pnl_by_timeframe: map(s?.pnl_by_timeframe ?? s?.by_timeframe, 'timeframe', 'pct'),
-      pnl_by_strategy: map(s?.pnl_by_strategy ?? s?.by_strategy, 'strategy', 'pct')
+      pnl_by_year: map(s?.pnl_by_year),
+      pnl_by_timeframe: map(s?.pnl_by_timeframe),
+      pnl_by_strategy: map(s?.pnl_by_strategy)
     }
   }
 
@@ -47,8 +49,20 @@ export const useResultsStore = defineStore('results', () => {
       time: x.time ?? x.date ?? x.period ?? '-',
       timeframe: x.timeframe ?? x.tf ?? '-',
       strategy: x.strategy ?? '-',
-      pct: Number(x.pct ?? x.pnl_pct ?? x.performance_pct ?? 0)
+      weighted_pct: safeNumber(x.weighted_pct),
+      avg_pct: safeNumber(x.avg_pct),
+      trades: safeInt(x.trades)
     }))
+  }
+
+  function safeNumber (val) {
+    const n = typeof val === 'string' ? parseFloat(val) : Number(val)
+    return Number.isFinite(n) ? n : 0
+  }
+
+  function safeInt (val) {
+    const n = typeof val === 'string' ? parseInt(val, 10) : Number(val)
+    return Number.isFinite(n) ? Math.max(0, Math.floor(n)) : 0
   }
 
   return { loading, summary, topStocks, fetchAll }

@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from contextlib import suppress
 
-from sqlalchemy import text
+from sqlalchemy import text, inspect
 from database.db_core import engine
 from database.db_manager import DBManager
 
@@ -50,79 +50,104 @@ def _apply_light_migrations() -> None:
 
     - Ensure runner_executions unique index (existing behavior in your app).
     - NEW: Deduplicate runners and enforce uniqueness on (user_id, stock, strategy, time_frame).
+    - Fix strategy name for chatgpt_5_strategy to its canonical key.
     """
     try:
-        with DBManager() as db:
+        with engine.connect() as conn:
+            # --- Ensure users.password_hash exists ---
+            try:
+                insp = inspect(conn)
+                cols = [c["name"] for c in insp.get_columns("users")]
+                if "password_hash" not in cols:
+                    log.info("Light migrations: adding users.password_hash column...")
+                    conn.execute(text("ALTER TABLE users ADD COLUMN password_hash VARCHAR(255)"))
+                    conn.commit()
+            except Exception:
+                conn.rollback()
+                log.exception("Light migrations: failed adding password_hash")
+
             # --- Existing migrations you already run elsewhere are safe to repeat ---
             # Ensure runner_executions.timeframe exists and unique index on conflict key
             try:
-                db.db.execute(text(
+                conn.execute(text(
                     "ALTER TABLE IF EXISTS runner_executions "
                     "    ADD COLUMN IF NOT EXISTS timeframe INT"
                 ))
-                db.db.commit()
+                conn.commit()
             except Exception:
-                db.db.rollback()
+                conn.rollback()
 
             try:
-                db.db.execute(text(
+                conn.execute(text(
                     "CREATE UNIQUE INDEX IF NOT EXISTS ux_runner_exec "
                     "ON runner_executions (cycle_seq, user_id, symbol, strategy, timeframe)"
                 ))
-                db.db.commit()
+                conn.commit()
             except Exception:
-                db.db.rollback()
+                conn.rollback()
 
             # --- NEW: sanitize + dedupe runners ---
             # 1) Normalize stock symbols to uppercase so the unique key is robust.
             try:
-                res = db.db.execute(text(
+                res = conn.execute(text(
                     "UPDATE runners SET stock = UPPER(stock) "
                     "WHERE stock <> UPPER(stock)"
                 ))
                 updated = getattr(res, "rowcount", 0) or 0
-                db.db.commit()
+                conn.commit()
                 if updated:
                     log.info("Light migrations: uppercased %d runner symbols.", updated)
             except Exception:
-                db.db.rollback()
+                conn.rollback()
                 log.exception("Light migrations: failed uppercasing runner symbols")
 
-            # 2) Delete duplicates, keep lowest id per (user_id, stock, strategy, time_frame).
+            # 2) Migration: align chatgpt_5_strategy alias to canonical key recognized by factory
             try:
-                res = db.db.execute(text("""
-                    WITH ranked AS (
-                        SELECT
-                            id,
-                            ROW_NUMBER() OVER (
-                                PARTITION BY user_id, stock, strategy, time_frame
-                                ORDER BY id
-                            ) AS rn
+                res = conn.execute(text(
+                    """
+                    UPDATE runners
+                       SET strategy = 'chatgpt5strategy'
+                     WHERE TRIM(LOWER(strategy)) IN ('chatgpt_5_strategy', 'chatgpt 5 strategy', 'chatgpt-5-strategy')
+                    """
+                ))
+                updated_strat = getattr(res, "rowcount", 0) or 0
+                conn.commit()
+                if updated_strat:
+                    log.info("Light migrations: aligned %d runners to 'chatgpt5strategy' canonical key.", updated_strat)
+            except Exception:
+                conn.rollback()
+                log.exception("Light migrations: failed aligning chatgpt strategy name")
+
+
+            # 3) Delete duplicates, keep lowest id per (user_id, stock, strategy, time_frame).
+            try:
+                # SQLite-compatible duplicate removal (no USING clause)
+                res = conn.execute(text("""
+                    DELETE FROM runners
+                    WHERE id NOT IN (
+                        SELECT MIN(id)
                         FROM runners
+                        GROUP BY user_id, stock, strategy, time_frame
                     )
-                    DELETE FROM runners r
-                    USING ranked q
-                    WHERE r.id = q.id
-                      AND q.rn > 1
                 """))
                 removed = getattr(res, "rowcount", 0) or 0
-                db.db.commit()
+                conn.commit()
                 if removed:
                     log.info("Light migrations: removed %d duplicate runners.", removed)
             except Exception:
-                db.db.rollback()
-                log.exception("Light migrations: failed removing duplicate runners")
+                conn.rollback()
+                log.exception("Light migrations: failed removing duplicate runners (compat)")
 
-            # 3) Enforce uniqueness going forward.
+            # 4) Enforce uniqueness going forward.
             try:
-                db.db.execute(text("""
+                conn.execute(text("""
                     CREATE UNIQUE INDEX IF NOT EXISTS ux_runners_unique
                     ON runners (user_id, stock, strategy, time_frame)
                 """))
-                db.db.commit()
+                conn.commit()
                 log.info("Light migrations: ensured unique index ux_runners_unique.")
             except Exception:
-                db.db.rollback()
+                conn.rollback()
                 log.exception("Light migrations: failed creating ux_runners_unique")
 
             log.info("Light migrations completed.")

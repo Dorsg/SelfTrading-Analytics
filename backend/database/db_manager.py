@@ -96,6 +96,13 @@ class DBManager(AbstractContextManager["DBManager"]):
             .first()
         )
 
+    def count_users(self) -> int:
+        """Return total number of users (robust to empty tables)."""
+        try:
+            return int(self._session.execute(select(func.count()).select_from(User)).scalar() or 0)
+        except Exception:
+            return 0
+
     def create_user(self, username: str, email: str, password: str) -> User:
         """
         Low-ceremony user creation with password hashing (bcrypt via passlib when available).
@@ -202,6 +209,17 @@ class DBManager(AbstractContextManager["DBManager"]):
         if activation:
             q = q.filter(Runner.activation == activation)
         return q.order_by(Runner.created_at.asc(), Runner.id.asc()).all()
+
+    def count_runners(self, user_id: Optional[int] = None) -> int:
+        """Return number of runners. Optionally filter by user_id."""
+        try:
+            q = select(func.count()).select_from(Runner)
+            if user_id is not None:
+                from database.models import Runner as _Runner
+                q = select(func.count()).select_from(_Runner).where(_Runner.user_id == int(user_id))
+            return int(self._session.execute(q).scalar() or 0)
+        except Exception:
+            return 0
 
     # ───────────────────────── Positions ─────────────────────────
 

@@ -153,11 +153,25 @@ def on_startup() -> None:
         uid = _analytics_user_id(db)
         st = _ensure_state(db, uid)
         want_auto = (os.getenv("SIM_AUTO_START", "0") == "1")
+        # Ensure simulation does not auto-start unless SIM_AUTO_START=1.
+        # If SIM_AUTO_START is not set, proactively clear any lingering "running"
+        # flag that might have been left by previous runs so the system waits for
+        # an explicit user action via /api/analytics/simulation/start.
         prev = str(st.is_running).lower() in {"true", "1"}
-        if want_auto != prev:
-            st.is_running = "true" if want_auto else "false"
-            db.db.commit()
-        log.info("API startup: analytics user id=%s, auto_start=%s, is_running_now=%s", uid, want_auto, st.is_running)
+        if want_auto:
+            if not prev:
+                st.is_running = "true"
+                db.db.commit()
+                log.info("SIM_AUTO_START=1: marking simulation state as running on startup (will be observed by scheduler).")
+            else:
+                log.info("SIM_AUTO_START=1 and simulation already running in DB; leaving state as-is.")
+        else:
+            if prev:
+                st.is_running = "false"
+                db.db.commit()
+                log.info("API startup: SIM_AUTO_START!=1 → forcing simulation_state.is_running=false (default stopped).")
+            else:
+                log.info("API startup: simulation state is stopped by default.")
 
 # --------------------------------------------------------------------------------------
 # SIM CONTROL
@@ -302,6 +316,11 @@ def reset_sim(req: ResetRequest):
             log.exception("Failed to truncate logs")
 
     return {"ok": True, "deleted": deleted}
+
+# Bridge route so the UI's /api/analytics/simulation/reset works regardless of router wiring
+@app.post("/api/analytics/simulation/reset")
+def reset_sim_bridge():
+    return reset_sim(ResetRequest())
 
 # --------------------------------------------------------------------------------------
 # RESULTS (works for partial runs too — includes UNREALIZED P&L on open positions)

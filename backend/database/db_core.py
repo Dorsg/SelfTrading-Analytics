@@ -4,8 +4,10 @@ import os
 import time
 import socket
 import logging
+from pathlib import Path
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker, scoped_session, DeclarativeBase
+from sqlalchemy.engine import make_url
 
 log = logging.getLogger("database.db_core")
 
@@ -21,7 +23,38 @@ def _first_resolvable_host(candidates: list[str]) -> str:
     return candidates[0]
 
 
+def _sqlite_path_candidates() -> list[str]:
+    # Custom env override first
+    p = os.getenv("SQLITE_DB_PATH")
+    cand = [p] if p else []
+    # Common container path
+    cand.append("/app/data/analytics.db")
+    # Repo-local path
+    cand.append(str(Path.cwd() / "data" / "analytics.db"))
+    # Known workspace absolute path (Cursor/local)
+    cand.append("/root/projects/SelfTrading Analytics/data/analytics.db")
+    # De-dup while preserving order
+    out: list[str] = []
+    for c in cand:
+        if c and c not in out:
+            out.append(c)
+    return out
+
+
 def _build_url() -> str:
+    # Optional: allow automatic SQLite fallback for local/dev usage when no DATABASE_URL provided
+    allow_sqlite = os.getenv("ALLOW_SQLITE_FALLBACK", "1") == "1"
+    if allow_sqlite:
+        for p in _sqlite_path_candidates():
+            try:
+                if p and Path(p).exists():
+                    url = f"sqlite:////{Path(p).resolve()}"
+                    log.info("database.db_core: Using SQLite fallback at %s", p)
+                    return url
+            except Exception:
+                continue
+
+    # Default to Postgres (docker/dev/prod)
     user = os.getenv("DB_USER") or os.getenv("POSTGRES_USER", "postgres")
     pwd = os.getenv("DB_PASSWORD") or os.getenv("POSTGRES_PASSWORD", "postgres")
     # Prefer explicit envs; otherwise probe a few common service names
@@ -51,14 +84,67 @@ RECYCLE = int(os.getenv("DB_POOL_RECYCLE", "1800"))
 TIMEOUT = int(os.getenv("DB_POOL_TIMEOUT", "30"))
 CONNECT_TIMEOUT = int(os.getenv("DB_CONNECT_TIMEOUT", "5"))
 
+# Configure engine per driver
+try:
+    url = make_url(DATABASE_URL)
+    driver = (url.drivername or "").lower()
+except Exception:
+    url = None
+    driver = ""
+
+connect_args: dict = {}
+engine_kwargs: dict = {
+    "pool_size": POOL_SIZE,
+    "max_overflow": MAX_OVER,
+    "pool_recycle": RECYCLE,
+    "pool_pre_ping": True,
+}
+
+if driver.startswith("postgres"):
+    connect_args = {"connect_timeout": CONNECT_TIMEOUT}
+elif driver.startswith("sqlite"):
+    # Safe defaults for local sqlite use; pool params are ignored by sqlite driver
+    connect_args = {"check_same_thread": False}
+    # Reduce kwargs that sqlite doesn't like
+    engine_kwargs = {"pool_pre_ping": True}
+
 engine = create_engine(
     DATABASE_URL,
-    pool_size=POOL_SIZE,
-    max_overflow=MAX_OVER,
-    pool_recycle=RECYCLE,
-    pool_pre_ping=True,
-    connect_args={"connect_timeout": CONNECT_TIMEOUT},
+    connect_args=connect_args,
+    **engine_kwargs,
 )
+
+# Proactively validate connectivity. If Postgres is unreachable and SQLite
+# fallback is allowed with a present DB file, reconfigure the engine to SQLite
+# so local/dev environments work without a running PG service.
+try:
+    with engine.connect() as conn:
+        conn.execute(text("SELECT 1"))
+except Exception as e:
+    try:
+        if os.getenv("ALLOW_SQLITE_FALLBACK", "1") == "1" and driver.startswith("postgres"):
+            for p in _sqlite_path_candidates():
+                try:
+                    if p and Path(p).exists():
+                        sqlite_url = f"sqlite:////{Path(p).resolve()}"
+                        log.warning(
+                            "database.db_core: Postgres unreachable (%s). Falling back to SQLite at %s",
+                            str(e).splitlines()[0], p,
+                        )
+                        DATABASE_URL = sqlite_url  # type: ignore[assignment]
+                        engine = create_engine(
+                            sqlite_url,
+                            connect_args={"check_same_thread": False},
+                            pool_pre_ping=True,
+                        )
+                        # Validate fallback
+                        with engine.connect() as conn:
+                            conn.execute(text("SELECT 1"))
+                        break
+                except Exception:
+                    continue
+    except Exception:
+        pass
 
 SessionLocal = scoped_session(sessionmaker(bind=engine, autocommit=False, autoflush=False, expire_on_commit=False))
 

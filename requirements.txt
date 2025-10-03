@@ -20,10 +20,11 @@ ib-insync==0.9.86
 idna==3.10
 korean-lunar-calendar==0.3.1
 nest-asyncio==1.6.0
-numpy==2.2.4
+numpy==2.2.6
 pandas==2.2.3
 pandas_market_calendars==5.0.0
-pandas_ta==0.3.14b0
+# pandas_ta removed temporarily to avoid dependency resolution issues during build
+# pandas_ta==0.4.67b0
 passlib==1.7.4
 psycopg2-binary==2.9.10
 pyasn1==0.4.8

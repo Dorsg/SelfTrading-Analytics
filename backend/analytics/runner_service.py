@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import json
 import logging
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any, Tuple, Set
@@ -93,6 +95,7 @@ class RunnerService:
         self._same_bar_scope: str = (os.getenv("SAME_BAR_SCOPE", "symbol_tf") or "symbol_tf").strip().lower()
         self._same_bar_seen_seq: Optional[int] = None  # resets each tick (cycle_seq)
         self._same_bar_seen: Set[str] = set()
+        self._same_bar_lock = asyncio.Lock()
 
     # ───────────────────────── internals ─────────────────────────
     def _get_candles_cached(
@@ -257,6 +260,126 @@ class RunnerService:
         # default (legacy / broader): symbol + timeframe only
         return f"{sym}:{int(timeframe)}:{ts_i}"
 
+    async def _process_runner(self, r: RunnerView, as_of: datetime, seq: int, et_day: str) -> Tuple[Dict[str, int], Dict[str, Any]]:
+        stats_delta = defaultdict(int)
+        
+        try:
+            with DBManager() as db:
+                uid = r.user_id
+                rid = r.id
+                tf = r.time_frame
+                sym = r.stock
+
+                # Pair-level exclusion gate
+                excluded, ex_reason = self.health.is_excluded(sym, tf, now=as_of)
+                if excluded:
+                    stats_delta["excluded_pairs"] += 1
+                    stats_delta["processed"] += 1
+                    return stats_delta, {"runner_id": rid, "user_id": uid, "symbol": sym, "strategy": r.strategy, "status": "skipped-excluded-universe", "reason": (ex_reason or "excluded"), "details": None, "execution_time": as_of, "cycle_seq": seq, "timeframe": tf}
+
+                # Fetch candles
+                candles = self._get_candles_cached(sym, tf, as_of, lookback=300)
+                if not candles:
+                    self.health.note_no_data(sym=sym, tf=tf, now=as_of, et_day=et_day)
+                    stats_delta["skipped_no_data"] += 1
+                    stats_delta["processed"] += 1
+                    return stats_delta, {"runner_id": r.id, "user_id": uid, "symbol": sym, "strategy": r.strategy, "status": "skipped-no-data", "reason": "insufficient_candles", "details": None if self._thin_no_action_details else json.dumps({"message": "no candles available at as_of", "tf": tf}, ensure_ascii=False), "execution_time": as_of, "cycle_seq": seq, "timeframe": tf}
+
+                last_ts = self._last_candle_ts(candles)
+                
+                # Broker tick for stop-loss
+                price = float(candles[-1]["close"])
+                retc = self.broker.on_tick(user_id=uid, runner=r, price=price, at=as_of)
+                stats_delta["stop_cross_exits"] += int(retc.get("stop_cross_exits", 0))
+
+                db.db.expire_all()
+                pos: Optional[OpenPosition] = db.db.query(OpenPosition).filter(OpenPosition.runner_id == r.id).first()
+
+                # Bar advance guard
+                bar_key = (r.id, tf)
+                prev_bar_ts = self._last_bar_ts.get(bar_key)
+                bar_advanced = (prev_bar_ts is None) or (last_ts is not None and last_ts > prev_bar_ts)
+
+                if not bar_advanced and self._require_bar_advance:
+                    stats_delta["same_bar_skips"] += 1
+                    stats_delta["no_action"] += 1
+                    stats_delta["processed"] += 1
+                    return stats_delta, {"runner_id": r.id, "user_id": uid, "symbol": sym, "strategy": r.strategy, "status": "completed", "reason": "skipped-same-bar", "details": None, "execution_time": as_of, "cycle_seq": seq, "timeframe": tf}
+
+                # Strategy decision
+                ctx = _RunnerCtx(runner=r, position=pos, price=price, candles=candles)
+                decision = self._decide(ctx)
+                action = (decision.get("action") or "NO_ACTION").upper()
+
+                details_payload = {"price": round(ctx.price, 6), "position_open": bool(ctx.position is not None), "timeframe_min": tf, "last_ts": last_ts.isoformat() if last_ts else None, "decision": {k: v for k, v in decision.items() if k != "action"}}
+                details_json = json.dumps(details_payload, ensure_ascii=False)
+
+                if action == "BUY" and ctx.position is None:
+                    sb_key = self._same_bar_key(sym, tf, last_ts, r.strategy)
+                    should_skip_buy = False
+                    if sb_key:
+                        async with self._same_bar_lock:
+                            if sb_key in self._same_bar_seen:
+                                should_skip_buy = True
+                            else:
+                                self._same_bar_seen.add(sb_key)
+                    
+                    if should_skip_buy:
+                        stats_delta["same_bar_skips"] += 1
+                        stats_delta["no_action"] += 1
+                        stats_delta["processed"] += 1
+                        if last_ts: self._last_bar_ts[bar_key] = last_ts
+                        return stats_delta, {"runner_id": r.id, "user_id": uid, "symbol": sym, "strategy": r.strategy, "status": "completed", "reason": "skipped-same-bar-guard", "details": None, "execution_time": as_of, "cycle_seq": seq, "timeframe": tf}
+
+                    qty = int(decision.get("quantity") or 0) or self._qty_from_budget(db, r, ctx.price)
+                    if qty <= 0:
+                        stats_delta["skipped_no_budget"] += 1
+                        stats_delta["processed"] += 1
+                        if last_ts: self._last_bar_ts[bar_key] = last_ts
+                        return stats_delta, {"runner_id": r.id, "user_id": uid, "symbol": sym, "strategy": r.strategy, "status": "skipped-no-budget", "reason": "qty=0", "details": None, "execution_time": as_of, "cycle_seq": seq, "timeframe": tf}
+
+                    ok = self.broker.buy(user_id=uid, runner=r, symbol=sym, price=ctx.price, quantity=qty, decision=decision, at=as_of)
+                    if not ok:
+                        stats_delta["skipped_no_budget"] += 1
+                        stats_delta["processed"] += 1
+                        if last_ts: self._last_bar_ts[bar_key] = last_ts
+                        return stats_delta, {"runner_id": r.id, "user_id": uid, "symbol": sym, "strategy": r.strategy, "status": "skipped-no-budget", "reason": "broker_rejected_buy", "details": details_json, "execution_time": as_of, "cycle_seq": seq, "timeframe": tf}
+                    
+                    stats_delta["buys"] += 1
+                    stats_delta["processed"] += 1
+                    if last_ts: self._last_bar_ts[bar_key] = last_ts
+                    self.health.mark_clean_pass(sym=sym, tf=tf)
+                    return stats_delta, {"runner_id": r.id, "user_id": uid, "symbol": sym, "strategy": r.strategy, "status": "completed", "reason": "buy", "details": details_json, "execution_time": as_of, "cycle_seq": seq, "timeframe": tf}
+
+                elif action == "SELL" and ctx.position is not None:
+                    reason = str(decision.get("reason") or decision.get("explanation") or "strategy_sell")
+                    ok = self.broker.sell_all(user_id=uid, runner=r, symbol=sym, price=ctx.price, decision=decision, at=as_of, reason_override=reason)
+                    
+                    if ok:
+                        stats_delta["sells"] += 1
+                        self.health.mark_clean_pass(sym=sym, tf=tf)
+                    else:
+                        stats_delta["errors"] += 1
+                        self.health.note_error(sym=sym, tf=tf, now=as_of, et_day=et_day)
+                    
+                    stats_delta["processed"] += 1
+                    if last_ts: self._last_bar_ts[bar_key] = last_ts
+                    return stats_delta, {"runner_id": r.id, "user_id": uid, "symbol": sym, "strategy": r.strategy, "status": "completed" if ok else "error", "reason": "sell" if ok else "broker_sell_failed", "details": details_json, "execution_time": as_of, "cycle_seq": seq, "timeframe": tf}
+
+                else: # NO_ACTION
+                    stats_delta["no_action"] += 1
+                    stats_delta["processed"] += 1
+                    if last_ts: self._last_bar_ts[bar_key] = last_ts
+                    self.health.mark_clean_pass(sym=sym, tf=tf)
+                    return stats_delta, {"runner_id": r.id, "user_id": uid, "symbol": sym, "strategy": r.strategy, "status": "completed", "reason": str(decision.get("reason") or "no_action"), "details": None if self._thin_no_action_details else details_json, "execution_time": as_of, "cycle_seq": seq, "timeframe": tf}
+
+        except Exception:
+            stats_delta["errors"] += 1
+            stats_delta["processed"] += 1
+            log.exception("Runner %s tick failed", r.id)
+            self.health.note_error(sym=r.stock, tf=r.time_frame, now=as_of, et_day=et_day)
+            return stats_delta, {"runner_id": r.id, "user_id": r.user_id, "symbol": r.stock, "strategy": r.strategy, "status": "error", "reason": "exception", "details": "see logs", "execution_time": as_of, "cycle_seq": seq, "timeframe": r.time_frame}
+
     # ───────────────────────── public ─────────────────────────
     async def run_tick(self, as_of: datetime) -> dict:
         as_of = as_of.astimezone(timezone.utc)
@@ -267,498 +390,71 @@ class RunnerService:
             self._same_bar_seen_seq = seq
             self._same_bar_seen.clear()
 
-        stats = {
-            "processed": 0,
-            "buys": 0,
-            "sells": 0,
-            "no_action": 0,
-            "skipped_no_data": 0,
-            "skipped_no_budget": 0,
-            "same_bar_skips": 0,
-            "stop_cross_exits": 0,
-            "errors": 0,
-            "excluded_pairs": 0,
-        }
-
+        stats = defaultdict(int)
         exec_buffer: List[dict] = []
 
         with DBManager() as db:
             user = db.get_user_by_username("analytics")
             if not user:
                 log.warning("No analytics user found yet.")
-                return stats
+                return dict(stats)
 
             uid = int(getattr(user, "id"))
-
-            # Ensure account exists and is funded for simulation
+            
             try:
                 acct = db.ensure_account(user_id=uid, name="mock")
-                current_cash = float(getattr(acct, "cash", 0.0) or 0.0)
-                if current_cash < self._min_cash_floor:
+                if float(getattr(acct, "cash", 0.0) or 0.0) < self._min_cash_floor:
                     setattr(acct, "cash", self._topup_cash_to)
                     db.db.commit()
-                    log.info(
-                        "Top-upped mock account cash to $%.2f for user_id=%s (previous=%.2f, floor=%.2f)",
-                        self._topup_cash_to, uid, current_cash, self._min_cash_floor
-                    )
             except Exception:
                 log.exception("ensure_account failed for user_id=%s", uid)
 
             runners_orm = db.get_runners_by_user(user_id=uid, activation="active")
             runners: List[RunnerView] = [self._snapshot_runner(r) for r in runners_orm]
 
-            # On first tick, bootstrap coverage health
-            if self._sim_boot_start is None:
-                self._sim_boot_start = as_of
-                self.health.bootstrap_coverage_scan(
-                    runners=runners, sim_start=self._sim_boot_start, market=self.mkt, now=as_of
-                )
+        # On first tick, bootstrap coverage health
+        if self._sim_boot_start is None:
+            self._sim_boot_start = as_of
+            self.health.bootstrap_coverage_scan(runners=runners, sim_start=self._sim_boot_start, market=self.mkt, now=as_of)
 
-            self._prefetch_candles_for_runners(runners, as_of)
+        self._prefetch_candles_for_runners(runners, as_of)
 
-            # helper: ET date string for health-gate day windows
+        try:
+            from zoneinfo import ZoneInfo
+            ny = ZoneInfo("America/New_York")
+            et_day = as_of.astimezone(ny).date().isoformat()
+        except Exception:
+            et_day = as_of.date().isoformat()
+
+        tasks = [self._process_runner(r, as_of, seq, et_day) for r in runners]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        for res in results:
+            if isinstance(res, Exception):
+                log.error("Error in parallel runner processing: %s", res)
+                continue
+            stats_delta, exec_log = res
+            if exec_log:
+                exec_buffer.append(exec_log)
+            for k, v in stats_delta.items():
+                stats[k] += v
+
+        # Bulk UPSERT executions
+        if exec_buffer:
             try:
-                from zoneinfo import ZoneInfo  # type: ignore
-                ny = ZoneInfo("America/New_York")
-                et_day = as_of.astimezone(ny).date().isoformat()
-            except Exception:
-                et_day = as_of.date().isoformat()
-
-            for r in runners:
-                try:
-                    rid = int(getattr(r, "id", 0) or 0)
-                    tf = int(getattr(r, "time_frame", 5) or 5)
-                    sym = r.stock
-
-                    # Pair-level exclusion gate (coverage/errors/TTL)
-                    excluded, ex_reason = self.health.is_excluded(sym, tf, now=as_of)
-                    if excluded:
-                        exec_buffer.append({
-                            "runner_id": rid,
-                            "user_id": uid,
-                            "symbol": sym,
-                            "strategy": r.strategy,
-                            "status": "skipped-excluded-universe",
-                            "reason": (ex_reason or "excluded"),
-                            "details": None,
-                            "execution_time": as_of,
-                            "cycle_seq": seq,
-                            "timeframe": tf,
-                        })
-                        stats["excluded_pairs"] += 1
-                        stats["processed"] += 1
-                        continue
-
-                    if rid == 0:
-                        exec_buffer.append({
-                            "runner_id": 0,
-                            "user_id": uid,
-                            "symbol": sym,
-                            "strategy": str(getattr(r, "strategy", "")),
-                            "status": "skipped-invalid-runner",
-                            "reason": "no_primary_key",
-                            "details": json.dumps({"error": "runner row missing primary key"}, ensure_ascii=False),
-                            "execution_time": as_of,
-                            "cycle_seq": seq,
-                            "timeframe": tf,
-                        })
-                        stats["no_action"] += 1
-                        stats["processed"] += 1
-                        continue
-
-                    canon = resolve_strategy_key(getattr(r, "strategy", None))
-                    if not canon:
-                        exec_buffer.append({
-                            "runner_id": r.id,
-                            "user_id": uid,
-                            "symbol": sym,
-                            "strategy": str(getattr(r, "strategy", "")),
-                            "status": "skipped-unknown-strategy",
-                            "reason": "unknown_strategy",
-                            "details": json.dumps({"strategy": getattr(r, "strategy", None)}, ensure_ascii=False),
-                            "execution_time": as_of,
-                            "cycle_seq": seq,
-                            "timeframe": tf,
-                        })
-                        stats["no_action"] += 1
-                        stats["processed"] += 1
-                        continue
-
-                    # fetch candles (once per runner)
-                    candles = self._get_candles_cached(sym, tf, as_of, lookback=300)
-                    if not candles:
-                        # Note: treat as health event (no_data)
-                        self.health.note_no_data(sym=sym, tf=tf, now=as_of, et_day=et_day)
-                        exec_buffer.append({
-                            "runner_id": r.id,
-                            "user_id": uid,
-                            "symbol": sym,
-                            "strategy": r.strategy,
-                            "status": "skipped-no-data",
-                            "reason": "insufficient_candles",
-                            "details": None if self._thin_no_action_details else json.dumps({"message": "no candles available at as_of", "tf": tf}, ensure_ascii=False),
-                            "execution_time": as_of,
-                            "cycle_seq": seq,
-                            "timeframe": tf,
-                        })
-                        stats["skipped_no_data"] += 1
-                        stats["processed"] += 1
-                        continue
-
-                    last_ts = self._last_candle_ts(candles)
-                    is_stale = self._skip_stale_price and self._is_stale_candle(last_ts, tf, as_of)
-
-                    if is_stale:
-                        exec_buffer.append({
-                            "runner_id": r.id,
-                            "user_id": uid,
-                            "symbol": sym,
-                            "strategy": r.strategy,
-                            "status": "completed",
-                            "reason": "skipped-stale-price",
-                            "details": None if self._thin_no_action_details else json.dumps({
-                                "message": "last candle is stale for timeframe",
-                                "tf_min": tf,
-                                "last_ts": (last_ts.isoformat() if last_ts else None),
-                                "as_of": as_of.isoformat(),
-                            }, ensure_ascii=False),
-                            "execution_time": as_of,
-                            "cycle_seq": seq,
-                            "timeframe": tf,
-                        })
-                        stats["no_action"] += 1
-                        stats["processed"] += 1
-                        continue
-
-                    # Fresh price → broker with *real* price now that we have candles
-                    price = float(candles[-1]["close"])
-                    try:
-                        retc = self.broker.on_tick(user_id=uid, runner=r, price=price, at=as_of)
-                    except Exception:
-                        retc = {}
-                    try:
-                        stats["stop_cross_exits"] += int(retc.get("stop_cross_exits", 0))
-                    except Exception:
-                        pass
-
-                    # refresh ORM after possible stop close
-                    try:
-                        db.db.expire_all()
-                    except Exception:
-                        pass
-
-                    try:
-                        pos: Optional[OpenPosition] = (
-                            db.db.query(OpenPosition)
-                            .filter(OpenPosition.runner_id == r.id)
-                            .first()
-                        )
-                    except Exception:
-                        log.exception("Failed to refresh position for runner %s", r.id)
-                        pos = None
-
-                    # per-runner same-bar (bar-advance) guard
-                    bar_key = (r.id, tf)
-                    prev_bar_ts = self._last_bar_ts.get(bar_key)
-                    bar_advanced = (prev_bar_ts is None) or (last_ts is not None and last_ts > prev_bar_ts)
-
-                    if not bar_advanced and self._require_bar_advance:
-                        exec_buffer.append({
-                            "runner_id": r.id,
-                            "user_id": uid,
-                            "symbol": sym,
-                            "strategy": r.strategy,
-                            "status": "completed",
-                            "reason": "skipped-same-bar",
-                            "details": None if self._thin_no_action_details else json.dumps({
-                                "message": "bar has not advanced; ignoring strategy signals this tick",
-                                "tf_min": tf,
-                                "last_bar_ts": (last_ts.isoformat() if last_ts else None),
-                                "prev_bar_ts": (prev_bar_ts.isoformat() if prev_bar_ts else None),
-                                "as_of": as_of.isoformat(),
-                            }, ensure_ascii=False),
-                            "execution_time": as_of,
-                            "cycle_seq": seq,
-                            "timeframe": tf,
-                        })
-                        stats["same_bar_skips"] += 1
-                        stats["no_action"] += 1
-                        stats["processed"] += 1
-                        continue
-
-                    ctx = _RunnerCtx(runner=r, position=pos, price=price, candles=candles)
-                    decision = self._decide(ctx)
-                    action = (decision.get("action") or "NO_ACTION").upper()
-                    explanation = decision.get("explanation")
-                    checks = decision.get("checks")
-
-                    details_payload = {
-                        "price": round(ctx.price, 6),
-                        "position_open": bool(ctx.position is not None),
-                        "timeframe_min": tf,
-                        "stale": False,
-                        "last_ts": last_ts.isoformat() if last_ts else None,
-                        "decision": {k: v for k, v in decision.items() if k not in {"action"}},
-                        "checks": checks,
-                    }
-                    details_json = json.dumps(details_payload, ensure_ascii=False)
-
-                    # BUY (no position; bar advanced)
-                    if action == "BUY" and ctx.position is None:
-                        # ── NEW: global same-bar BUY guard ─────────────────────────
-                        sb_key = self._same_bar_key(sym, tf, last_ts, r.strategy)
-                        if sb_key and sb_key in self._same_bar_seen:
-                            exec_buffer.append({
-                                "runner_id": r.id,
-                                "user_id": uid,
-                                "symbol": sym,
-                                "strategy": r.strategy,
-                                "status": "completed",
-                                "reason": "skipped-same-bar-guard",
-                                "details": None if self._thin_no_action_details else json.dumps({
-                                    "message": "same-bar BUY already executed for key",
-                                    "key": sb_key,
-                                    "scope": self._same_bar_scope,
-                                }, ensure_ascii=False),
-                                "execution_time": as_of,
-                                "cycle_seq": seq,
-                                "timeframe": tf,
-                            })
-                            stats["same_bar_skips"] += 1
-                            stats["no_action"] += 1
-                            stats["processed"] += 1
-                            if last_ts is not None:
-                                self._last_bar_ts[bar_key] = last_ts
-                            continue
-                        # ───────────────────────────────────────────────────────────
-
-                        qty = int(decision.get("quantity") or 0)
-                        if qty <= 0:
-                            qty = self._qty_from_budget(db, r, ctx.price)
-                        if qty <= 0:
-                            msg = {"reason": "qty=0", "explanation": explanation or "insufficient budget"}
-                            exec_buffer.append({
-                                "runner_id": r.id,
-                                "user_id": uid,
-                                "symbol": sym,
-                                "strategy": r.strategy,
-                                "status": "skipped-no-budget",
-                                "reason": "qty=0",
-                                "details": None if self._thin_no_action_details else json.dumps(msg, ensure_ascii=False),
-                                "execution_time": as_of,
-                                "cycle_seq": seq,
-                                "timeframe": tf,
-                            })
-                            stats["skipped_no_budget"] += 1
-                            stats["processed"] += 1
-                            if last_ts is not None:
-                                self._last_bar_ts[bar_key] = last_ts
-                            continue
-
-                        ok: bool = False
-                        try:
-                            ok = bool(self.broker.buy(
-                                user_id=uid,
-                                runner=r,
-                                symbol=sym,
-                                price=ctx.price,
-                                quantity=qty,
-                                decision=decision,
-                                at=as_of,
-                            ))
-                        except Exception:
-                            ok = False
-                            self.health.note_error(sym=sym, tf=tf, now=as_of, et_day=et_day)
-                            log.exception("Broker BUY failed for %s", sym)
-
-                        if not ok:
-                            exec_buffer.append({
-                                "runner_id": r.id,
-                                "user_id": uid,
-                                "symbol": sym,
-                                "strategy": r.strategy,
-                                "status": "skipped-no-budget",
-                                "reason": "broker_rejected_buy",
-                                "details": details_json,
-                                "execution_time": as_of,
-                                "cycle_seq": seq,
-                                "timeframe": tf,
-                            })
-                            stats["skipped_no_budget"] += 1
-                            stats["processed"] += 1
-                            if last_ts is not None:
-                                self._last_bar_ts[bar_key] = last_ts
-                            continue
-
-                        # Arm trailing stop once at BUY (broker-managed)
-                        try:
-                            params = getattr(r, "parameters", {}) or {}
-                            trail_pct = float(params.get("trailing_stop_percent", 0.0) or 0.0)
-                        except Exception:
-                            trail_pct = 0.0
-                        if trail_pct > 0.0:
-                            self.broker.arm_trailing_stop_once(
-                                user_id=uid,
-                                runner=r,
-                                entry_price=ctx.price,
-                                trail_pct=trail_pct,
-                                at=as_of,
-                            )
-
-                        exec_buffer.append({
-                            "runner_id": r.id,
-                            "user_id": uid,
-                            "symbol": sym,
-                            "strategy": r.strategy,
-                            "status": "completed",
-                            "reason": "buy",
-                            "details": details_json,
-                            "execution_time": as_of,
-                            "cycle_seq": seq,
-                            "timeframe": tf,
-                        })
-                        stats["buys"] += 1
-                        stats["processed"] += 1
-                        if last_ts is not None:
-                            self._last_bar_ts[bar_key] = last_ts
-                        # Mark this key as having executed a BUY on this bar
-                        if sb_key:
-                            self._same_bar_seen.add(sb_key)
-                        self.health.mark_clean_pass(sym=sym, tf=tf)
-                        continue
-
-                    # SELL (strategy-driven)
-                    if action == "SELL" and ctx.position is not None:
-                        ok = False
-                        try:
-                            reason = str(decision.get("reason") or decision.get("explanation") or "strategy_sell")
-                            ok = self.broker.sell_all(
-                                user_id=uid,
-                                runner=r,
-                                symbol=sym,
-                                price=ctx.price,
-                                decision=decision,
-                                at=as_of,
-                                reason_override=reason,
-                            )
-                        except Exception:
-                            ok = False
-                            self.health.note_error(sym=sym, tf=tf, now=as_of, et_day=et_day)
-                            log.exception("Broker SELL failed for %s", sym)
-
-                        exec_buffer.append({
-                            "runner_id": r.id,
-                            "user_id": uid,
-                            "symbol": sym,
-                            "strategy": r.strategy,
-                            "status": "completed" if ok else "error",
-                            "reason": "sell" if ok else "broker_sell_failed",
-                            "details": details_json,
-                            "execution_time": as_of,
-                            "cycle_seq": seq,
-                            "timeframe": tf,
-                        })
-                        if ok:
-                            stats["sells"] += 1
-                            self.health.mark_clean_pass(sym=sym, tf=tf)
-                        else:
-                            stats["errors"] += 1
-                        stats["processed"] += 1
-                        if last_ts is not None:
-                            self._last_bar_ts[bar_key] = last_ts
-                        continue
-
-                    # NO_ACTION
-                    exec_buffer.append({
-                        "runner_id": r.id,
-                        "user_id": uid,
-                        "symbol": sym,
-                        "strategy": r.strategy,
-                        "status": "completed",
-                        "reason": str(decision.get("reason") or "no_action"),
-                        "details": None if self._thin_no_action_details else details_json,
-                        "execution_time": as_of,
-                        "cycle_seq": seq,
-                        "timeframe": tf,
-                    })
-                    stats["no_action"] += 1
-                    stats["processed"] += 1
-                    if last_ts is not None:
-                        self._last_bar_ts[bar_key] = last_ts
-                    self.health.mark_clean_pass(sym=sym, tf=tf)
-
-                except Exception:
-                    # any unhandled error → health note + execution error row
-                    try:
-                        label = getattr(r, "name", None) or f"#{getattr(r, 'id', 'unknown')}"
-                    except Exception:
-                        label = "unknown"
-                    log.exception("Runner %s tick failed", label)
-                    try:
-                        self.health.note_error(sym=r.stock, tf=int(getattr(r, "time_frame", 5) or 5), now=as_of, et_day=et_day)
-                        exec_buffer.append({
-                            "runner_id": int(getattr(r, "id", 0) or 0),
-                            "user_id": uid,
-                            "symbol": r.stock,
-                            "strategy": (getattr(r, "strategy", "") or "unknown"),
-                            "status": "error",
-                            "reason": "exception",
-                            "details": "see logs",
-                            "execution_time": as_of,
-                            "cycle_seq": seq,
-                            "timeframe": int(getattr(r, "time_frame", 5) or 5),
-                        })
-                    except Exception:
-                        pass
-                    stats["errors"] += 1
-                    stats["processed"] += 1
-
-            # ── Bulk UPSERT executions (idempotent) ───────────────────────────────
-            try:
-                if exec_buffer:
-                    # Helpful preview so we can see exactly what we're about to upsert
-                    try:
-                        ex0 = exec_buffer[0]
-                        log.debug(
-                            "Preparing bulk upsert: rows=%d example={runner_id=%s user_id=%s sym=%s strat=%s status=%s seq=%s tf=%s}",
-                            len(exec_buffer),
-                            ex0.get("runner_id"), ex0.get("user_id"), ex0.get("symbol"),
-                            ex0.get("strategy"), ex0.get("status"), ex0.get("cycle_seq"),
-                            ex0.get("timeframe"),
-                        )
-                    except Exception:
-                        pass
-
-                    # mirror to KPI logger
-                    try:
-                        kpi.info(
-                            "tick=%s runners=%d buys=%d sells=%d no_action=%d skipped_no_data=%d same_bar_skips=%d stop_cross=%d excluded=%d errors=%d",
-                            seq, len(runners),
-                            stats["buys"], stats["sells"], stats["no_action"],
-                            stats["skipped_no_data"], stats["same_bar_skips"], stats["stop_cross_exits"],
-                            stats["excluded_pairs"], stats["errors"],
-                        )
-                    except Exception:
-                        pass
-
+                with DBManager() as db:
                     db.bulk_upsert_runner_executions(exec_buffer)
             except Exception:
-                try:
-                    bad = exec_buffer[0] if exec_buffer else {}
-                    log.exception(
-                        "Bulk upsert of runner executions failed (rows=%d example={runner_id=%s sym=%s strat=%s status=%s seq=%s tf=%s})",
-                        len(exec_buffer),
-                        bad.get("runner_id"), bad.get("symbol"), bad.get("strategy"),
-                        bad.get("status"), bad.get("cycle_seq"), bad.get("timeframe")
-                    )
-                except Exception:
-                    log.exception("Bulk upsert of runner executions failed")
+                log.exception("Bulk upsert of runner executions failed")
 
-            # Mark-to-market after the tick to keep P&L sane
-            try:
-                self.broker.mark_to_market_all(user_id=uid, at=as_of)
-            except Exception:
-                log.exception("Mark-to-market after tick failed")
+        # Mark-to-market after the tick
+        try:
+            with DBManager() as db:
+                user = db.get_user_by_username("analytics")
+                if user:
+                    self.broker.mark_to_market_all(user_id=int(getattr(user, "id")), at=as_of)
+        except Exception:
+            log.exception("Mark-to-market after tick failed")
 
         log.debug(
             "tick@%s processed=%d buys=%d sells=%d no_action=%d skipped_no_data=%d skipped_no_budget=%d same_bar_skips=%d stop_cross=%d excluded=%d errors=%d",
@@ -767,4 +463,4 @@ class RunnerService:
             stats["skipped_no_data"], stats["skipped_no_budget"],
             stats["same_bar_skips"], stats["stop_cross_exits"], stats["excluded_pairs"], stats["errors"],
         )
-        return stats
+        return dict(stats)

@@ -1,10 +1,8 @@
 // client-ui-naive/src/router/index.js
 import { createRouter, createWebHistory } from "vue-router";
-import LoginPage   from "@/components/LoginPage.vue";
 import Dashboard   from "@/pages/Dashboard.vue";
 
 const routes = [
-  { path: "/login", component: LoginPage, name: "Login" },
   { path: "/", component: Dashboard, name: "Home" }, // No auth required for analytics
 ];
 

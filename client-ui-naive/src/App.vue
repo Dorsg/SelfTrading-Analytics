@@ -6,7 +6,7 @@
           <n-space align="center" justify="space-between" class="w-full">
             <n-space align="center">
               <n-avatar size="large" round>SIM</n-avatar>
-              <n-h2 style="margin:0">Simulator Console</n-h2>
+              <n-h2 style="margin:0;color:#ffffff">SelfTrading | Simulator</n-h2>
             </n-space>
             <n-space align="center">
               <n-tag type="success" size="small" round>Naive-UI</n-tag>
