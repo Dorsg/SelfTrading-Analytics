@@ -44,6 +44,16 @@ const columns = [
     sorter: (a, b) => a.avg_pct - b.avg_pct,
     width: 160,
   },
+    {
+      title: 'Win Rate (%)', key: 'win_rate_pct', width: 120,
+      render (row) { return h('span', (row.win_rate_pct || 0).toFixed(1) + '%') },
+      sorter: (a, b) => (a.win_rate_pct || 0) - (b.win_rate_pct || 0)
+    },
+    {
+      title: 'Avg Trade Time', key: 'avg_trade_days', width: 130,
+      render (row) { return h('span', ((row.avg_trade_days || 0).toFixed(1)) + ' days') },
+      sorter: (a, b) => (a.avg_trade_days || 0) - (b.avg_trade_days || 0)
+    },
   {
     title: 'Trades',
     key: 'trades', width: 90,

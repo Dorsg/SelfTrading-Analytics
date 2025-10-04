@@ -968,13 +968,15 @@ def get_results_summary() -> dict:
         """)
         pnl_by_timeframe = [{"bucket": r.timeframe_bucket, "weighted_pct": r.weighted_pct, "avg_pct": r.avg_pct, "trades": int(r.trades or 0)} for r in conn.execute(by_tf_q).mappings()]
 
-        # P&L by Strategy
+        # P&L by Strategy (extended with win rate and avg trade duration days)
         by_strat_q = text("""
             SELECT
                 strategy,
                 COALESCE(SUM(pnl_amount), 0) / NULLIF(SUM(buy_price * quantity), 0) * 100 AS weighted_pct,
                 AVG(COALESCE(pnl_amount, 0) / NULLIF(buy_price * quantity, 0) * 100) AS avg_pct,
-                CAST(COUNT(*) AS INT) AS trades
+                CAST(COUNT(*) AS INT) AS trades,
+                100.0 * SUM(CASE WHEN COALESCE(pnl_amount,0) > 0 THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0) AS win_rate_pct,
+                AVG(CASE WHEN buy_ts IS NOT NULL AND sell_ts IS NOT NULL THEN EXTRACT(EPOCH FROM (sell_ts - buy_ts)) ELSE NULL END) / 86400.0 AS avg_trade_days
             FROM executed_trades
             WHERE sell_ts IS NOT NULL
               AND buy_price > 0 AND quantity > 0
@@ -983,7 +985,15 @@ def get_results_summary() -> dict:
             GROUP BY strategy
             ORDER BY weighted_pct DESC
         """)
-        pnl_by_strategy_raw = {r.strategy: {"weighted_pct": r.weighted_pct, "avg_pct": r.avg_pct, "trades": int(r.trades or 0)} for r in conn.execute(by_strat_q).mappings()}
+        pnl_by_strategy_raw = {}
+        for r in conn.execute(by_strat_q).mappings():
+            pnl_by_strategy_raw[r.strategy] = {
+                "weighted_pct": float(r.weighted_pct or 0.0),
+                "avg_pct": float(r.avg_pct or 0.0),
+                "trades": int(r.trades or 0),
+                "win_rate_pct": float(r.win_rate_pct or 0.0),
+                "avg_trade_days": float(r.avg_trade_days or 0.0),
+            }
 
         # Seed with all active strategies to ensure they appear even with 0 trades
         with DBManager() as db:
@@ -992,14 +1002,74 @@ def get_results_summary() -> dict:
 
         pnl_by_strategy = []
         for strat in sorted(list(all_strategies)):
-            data = pnl_by_strategy_raw.get(strat, {"weighted_pct": 0, "avg_pct": 0, "trades": 0})
+            data = pnl_by_strategy_raw.get(strat, {"weighted_pct": 0.0, "avg_pct": 0.0, "trades": 0, "win_rate_pct": 0.0, "avg_trade_days": 0.0})
+            # Ensure JSON-safe numbers
+            data = {
+                "weighted_pct": float(data.get("weighted_pct", 0.0)),
+                "avg_pct": float(data.get("avg_pct", 0.0)),
+                "trades": int(data.get("trades", 0)),
+                "win_rate_pct": float(data.get("win_rate_pct", 0.0)),
+                "avg_trade_days": float(data.get("avg_trade_days", 0.0)),
+            }
             pnl_by_strategy.append({"bucket": strat, **data})
+
+        # P&L by Year/Strategy/Timeframe (for detailed view)
+        by_yst_q = text("""
+            WITH base AS (
+                SELECT
+                    EXTRACT(YEAR FROM sell_ts) AS year,
+                    CASE
+                        WHEN timeframe IN ('1440','1440m','1d','day','1D') THEN '1d'
+                        WHEN timeframe IN ('5','5m','5min','5MIN') THEN '5m'
+                        ELSE NULL
+                    END AS tf,
+                    strategy,
+                    pnl_amount, buy_price, quantity,
+                    buy_ts, sell_ts
+                FROM executed_trades
+                WHERE sell_ts IS NOT NULL AND buy_price > 0 AND quantity > 0
+                  AND strategy IS NOT NULL
+            )
+            SELECT
+                year,
+                tf AS timeframe,
+                strategy,
+                COALESCE(SUM(pnl_amount), 0) / NULLIF(SUM(buy_price * quantity), 0) * 100 AS weighted_pct,
+                AVG(COALESCE(pnl_amount, 0) / NULLIF(buy_price * quantity, 0) * 100) AS avg_pct,
+                CAST(COUNT(*) AS INT) AS trades,
+                AVG(CASE WHEN buy_ts IS NOT NULL AND sell_ts IS NOT NULL THEN EXTRACT(EPOCH FROM (sell_ts - buy_ts)) ELSE NULL END) / 86400.0 AS avg_trade_days
+            FROM base
+            WHERE tf IN ('1d','5m')
+            GROUP BY year, strategy, tf
+            ORDER BY year DESC, strategy ASC, tf ASC
+        """)
+        pnl_by_year_strategy_time = []
+        for r in conn.execute(by_yst_q).mappings():
+            tf = (r.timeframe or '').strip()
+            tf_label = '5 minutes' if tf == '5m' else ('1 day' if tf == '1d' else tf)
+            pnl_by_year_strategy_time.append({
+                "year": int(r.year) if r.year is not None else None,
+                "strategy": r.strategy,
+                "timeframe": tf,
+                "timeframe_label": tf_label,
+                "weighted_pct": float(r.weighted_pct or 0.0),
+                "avg_pct": float(r.avg_pct or 0.0),
+                "trades": int(r.trades or 0),
+                "avg_trade_days": float(r.avg_trade_days or 0.0),
+            })
 
 
     return {
-        "pnl_by_year": pnl_by_year,
-        "pnl_by_timeframe": pnl_by_timeframe,
+        "pnl_by_year": [
+            {"bucket": x["bucket"], "weighted_pct": float(x["weighted_pct"] or 0.0), "avg_pct": float(x["avg_pct"] or 0.0), "trades": int(x["trades"] or 0)}
+            for x in pnl_by_year
+        ],
+        "pnl_by_timeframe": [
+            {"bucket": x["bucket"], "weighted_pct": float(x["weighted_pct"] or 0.0), "avg_pct": float(x["avg_pct"] or 0.0), "trades": int(x["trades"] or 0)}
+            for x in pnl_by_timeframe
+        ],
         "pnl_by_strategy": pnl_by_strategy,
+        "pnl_by_year_strategy_time": pnl_by_year_strategy_time,
     }
 
 
@@ -1017,7 +1087,9 @@ def get_top_stocks(limit: int = Query(20, ge=1, le=100)) -> list[dict]:
             strategy,
             COALESCE(SUM(pnl_amount), 0) / NULLIF(SUM(buy_price * quantity), 0) * 100 AS weighted_pct,
             AVG(COALESCE(pnl_amount, 0) / NULLIF(buy_price * quantity, 0) * 100) AS avg_pct,
-            CAST(COUNT(*) AS INT) AS trades
+            CAST(COUNT(*) AS INT) AS trades,
+            100.0 * SUM(CASE WHEN COALESCE(pnl_amount,0) > 0 THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0) AS win_rate_pct,
+            AVG(CASE WHEN buy_ts IS NOT NULL AND sell_ts IS NOT NULL THEN EXTRACT(EPOCH FROM (sell_ts - buy_ts)) ELSE NULL END) / 86400.0 AS avg_trade_days
         FROM executed_trades
         WHERE sell_ts IS NOT NULL
           AND buy_price > 0 AND quantity > 0
@@ -1045,6 +1117,14 @@ def get_top_stocks(limit: int = Query(20, ge=1, le=100)) -> list[dict]:
                 m["trades"] = int(m.get("trades") or 0)
             except Exception:
                 m["trades"] = 0
+            try:
+                m["win_rate_pct"] = float(m.get("win_rate_pct") or 0.0)
+            except Exception:
+                m["win_rate_pct"] = 0.0
+            try:
+                m["avg_trade_days"] = float(m.get("avg_trade_days") or 0.0)
+            except Exception:
+                m["avg_trade_days"] = 0.0
             out.append(m)
         return out
 

@@ -6,6 +6,8 @@
           <th class="col-bucket">Bucket</th>
           <th class="col-num">Wgt P&L (%)</th>
           <th class="col-num">Avg P&L/trade</th>
+          <th v-if="hasWinRate" class="col-num">Win Rate (%)</th>
+          <th v-if="hasAvgTradeTime" class="col-num">Avg Trade Time</th>
           <th class="col-num">Trades</th>
         </tr>
       </thead>
@@ -14,6 +16,8 @@
           <td class="col-bucket" :title="row.bucket">{{ row.bucket }}</td>
           <td>{{ formatPercent(row.weighted_pct) }}</td>
           <td>{{ formatPercent(row.avg_pct) }}</td>
+          <td v-if="hasWinRate">{{ formatPercent(row.win_rate_pct) }}</td>
+          <td v-if="hasAvgTradeTime">{{ formatDays(row.avg_trade_days) }}</td>
           <td>{{ formatInt(row.trades) }}</td>
         </tr>
       </tbody>
@@ -28,13 +32,17 @@
 </template>
 
 <script setup>
+import { computed } from 'vue'
 import { NCard, NTable, NIconWrapper, NIcon, NText } from 'naive-ui'
 import { Ban as BanIcon } from '@vicons/fa'
 
-defineProps({
+const props = defineProps({
   title: { type: String, required: true },
   rows: { type: Array, default: () => [] }
 })
+
+const hasWinRate = computed(() => Array.isArray(props.rows) && props.rows.some(x => typeof x?.win_rate_pct === 'number'))
+const hasAvgTradeTime = computed(() => Array.isArray(props.rows) && props.rows.some(x => typeof x?.avg_trade_days === 'number'))
 
 function formatPercent (val) {
   if (typeof val !== 'number') return '—'
@@ -45,6 +53,12 @@ function formatInt (val) {
   const n = Number(val)
   if (!Number.isFinite(n)) return '0'
   return String(Math.max(0, Math.floor(n)))
+}
+
+function formatDays (val) {
+  const n = Number(val)
+  if (!Number.isFinite(n)) return '—'
+  return `${n.toFixed(1)} days`
 }
 </script>
 

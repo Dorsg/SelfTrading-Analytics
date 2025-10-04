@@ -12,27 +12,13 @@
         </n-space>
       </n-space>
   
-      <n-grid :cols="3" x-gap="12" y-gap="12">
-        <n-gi>
-          <ResultsBreakdown
-            title="% P&L by Year/Time"
-            :rows="store.summary.pnl_by_year"
-          />
-        </n-gi>
-        <n-gi>
-          <ResultsBreakdown
-            title="% P&L by Timeframe"
-            :rows="store.summary.pnl_by_timeframe"
-          />
-        </n-gi>
-        <n-gi>
-          <ResultsBreakdown
-            title="% P&L by Strategy"
-            :rows="store.summary.pnl_by_strategy"
-          />
-        </n-gi>
-      </n-grid>
-  
+      <ResultsBreakdown
+        title="% P&L by Strategy"
+        :rows="store.summary.pnl_by_strategy"
+      />
+
+      <YearStrategyTimeSummary :items="store.summary.pnl_by_year_strategy_time" />
+
       <BestStocksTable :items="store.topStocks" />
     </n-space>
   </template>
@@ -42,6 +28,7 @@
   import { NButton, NSpace, NGrid, NGi, NH3, useMessage } from 'naive-ui'
   import ResultsBreakdown from '@/components/ResultsBreakdown.vue'
   import BestStocksTable from '@/components/BestStocksTable.vue'
+  import YearStrategyTimeSummary from '@/components/YearStrategyTimeSummary.vue'
   import { useResultsStore } from '@/stores/results'
   import { useSimulationStore } from '@/stores/simulation'
   
