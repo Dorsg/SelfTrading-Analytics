@@ -56,8 +56,8 @@ def _mk_handler(filename: str, level: int) -> TruncatingRotatingFileHandler:
 
 
 def setup_logging() -> None:
-    # Reduce default root verbosity to INFO unless explicitly overridden
-    root_level = getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO)
+    # Reduce default root verbosity to WARNING unless explicitly overridden
+    root_level = getattr(logging, os.getenv("LOG_LEVEL", "WARNING").upper(), logging.WARNING)
     logging.basicConfig(level=root_level)
 
     # Allow overriding levels via env, defaults lean verbose for debugging stuckness

@@ -20,8 +20,8 @@ app = FastAPI()
 
 def _configure_logging() -> None:
     setup_analytics_logging()
-    # Honor LOG_LEVEL instead of forcing INFO
-    lvl = getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO)
+    # Honor LOG_LEVEL instead of forcing WARNING
+    lvl = getattr(logging, os.getenv("LOG_LEVEL", "WARNING").upper(), logging.WARNING)
     for name in ["uvicorn", "uvicorn.error", "uvicorn.access", "fastapi"]:
         lg = logging.getLogger(name)
         lg.setLevel(lvl)

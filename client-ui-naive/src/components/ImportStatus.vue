@@ -1,10 +1,12 @@
   <template>
     <n-card title="Import Status" size="large">
-      <n-space v-if="isReady" vertical>
-        <n-tag :type="tagType" round>Ready</n-tag>
-        <n-text v-if="details?.date_range?.start && details?.date_range?.end" depth="3">
-          Range: {{ new Date(details.date_range.start).toLocaleDateString() }} - {{ new Date(details.date_range.end).toLocaleDateString() }}
-        </n-text>
+      <n-space v-if="isReady" align="center" justify="space-between">
+        <n-space align="center">
+          <n-tag :type="tagType" round>Ready</n-tag>
+          <n-text v-if="details?.date_range?.start && details?.date_range?.end" depth="3">
+            Range: {{ new Date(details.date_range.start).toLocaleDateString() }} - {{ new Date(details.date_range.end).toLocaleDateString() }}
+          </n-text>
+        </n-space>
       </n-space>
       <n-space v-else vertical size="large">
         <n-space align="center" justify="space-between">

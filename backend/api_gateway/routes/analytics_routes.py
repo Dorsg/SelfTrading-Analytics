@@ -856,9 +856,17 @@ def get_progress() -> dict:
             cur_ts = int(st.last_ts.timestamp()) if st.last_ts else None
 
             min_ts, max_ts = None, None
+            min_daily, max_daily = None, None
             with engine.connect() as conn:
                 min_ts = conn.execute(select(func.min(HistoricalMinuteBar.ts))).scalar()
                 max_ts = conn.execute(select(func.max(HistoricalMinuteBar.ts))).scalar()
+                # Daily bounds for per-timeframe progress (1d)
+                try:
+                    min_daily = conn.execute(select(func.min(HistoricalDailyBar.date))).scalar()
+                    max_daily = conn.execute(select(func.max(HistoricalDailyBar.date))).scalar()
+                except Exception:
+                    min_daily = None
+                    max_daily = None
 
             if not min_ts or not max_ts:
                 return {"state": "running" if running else "idle", "progress_percent": 0, "sim_time_iso": st.last_ts.isoformat() if st.last_ts else None}
@@ -867,10 +875,68 @@ def get_progress() -> dict:
             end_epoch = int(max_ts.timestamp())
             
             pct = 0
-            if cur_ts:
+            # Compute 5m timeframe progress using continuous 5m ticks across bounds
+            step_sec = int(os.getenv("SIM_STEP_SECONDS", "300"))
+            tf5m = {"ticks_done": 0, "ticks_total": 0, "percent": 0.0}
+            if cur_ts and step_sec > 0:
                 total_span = max(1, end_epoch - start_epoch)
                 done_span = max(0, cur_ts - start_epoch)
-                pct = max(0.0, min(100.0, (done_span / total_span) * 100.0))
+                tf5m_total = max(0, int(total_span // step_sec))
+                tf5m_done = min(tf5m_total, max(0, int(done_span // step_sec)))
+                tf5m_pct = (tf5m_done / tf5m_total * 100.0) if tf5m_total > 0 else 0.0
+                tf5m = {"ticks_done": tf5m_done, "ticks_total": tf5m_total, "percent": tf5m_pct}
+                pct = max(0.0, min(100.0, tf5m_pct))
+
+            # Compute 1d timeframe progress by distinct trading days present in DB
+            tf1d = {"ticks_done": 0, "ticks_total": 0, "percent": 0.0}
+            if min_daily and max_daily and cur_ts:
+                try:
+                    cur_day = datetime.fromtimestamp(cur_ts, tz=timezone.utc).date()
+                    with engine.connect() as conn:
+                        total_days = conn.execute(text("SELECT COUNT(DISTINCT date) FROM historical_daily_bars")).scalar() or 0
+                        done_days = conn.execute(text("SELECT COUNT(DISTINCT date) FROM historical_daily_bars WHERE date <= :d"), {"d": cur_day}).scalar() or 0
+                    done_days = int(done_days)
+                    total_days = int(total_days)
+                    tf1d_pct = (done_days / total_days * 100.0) if total_days > 0 else 0.0
+                    tf1d = {"ticks_done": done_days, "ticks_total": total_days, "percent": tf1d_pct}
+                except Exception:
+                    pass
+
+            # Per-timeframe buys/sells counters
+            try:
+                with engine.connect() as conn:
+                    q = text("""
+                        WITH tf AS (
+                            SELECT
+                                CASE
+                                    WHEN timeframe IN ('1440','1440m','1d','day','1D') THEN '1d'
+                                    WHEN timeframe IN ('5','5m','5min','5MIN') THEN '5m'
+                                    ELSE NULL
+                                END AS tf,
+                                buy_ts, sell_ts
+                            FROM executed_trades
+                        )
+                        SELECT
+                            SUM(CASE WHEN tf='5m' AND buy_ts IS NOT NULL THEN 1 ELSE 0 END) AS buys_5m,
+                            SUM(CASE WHEN tf='5m' AND sell_ts IS NOT NULL THEN 1 ELSE 0 END) AS sells_5m,
+                            SUM(CASE WHEN tf='1d' AND buy_ts IS NOT NULL THEN 1 ELSE 0 END) AS buys_1d,
+                            SUM(CASE WHEN tf='1d' AND sell_ts IS NOT NULL THEN 1 ELSE 0 END) AS sells_1d
+                        FROM tf
+                    """)
+                    r = conn.execute(q).mappings().first()
+                    if r:
+                        try:
+                            tf5m["total_buys"] = int(r.get("buys_5m") or 0)
+                            tf5m["total_sells"] = int(r.get("sells_5m") or 0)
+                        except Exception:
+                            pass
+                        try:
+                            tf1d["total_buys"] = int(r.get("buys_1d") or 0)
+                            tf1d["total_sells"] = int(r.get("sells_1d") or 0)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
 
             resp = {
                 "sim_time_iso": st.last_ts.isoformat() if st.last_ts else None,
@@ -879,8 +945,40 @@ def get_progress() -> dict:
                 "state": "running" if running else "idle",
                 "min_epoch": start_epoch,
                 "max_epoch": end_epoch,
-                "current_runner_info": { "timeframe": f"{int(os.getenv('SIM_STEP_SECONDS', '300')) // 60}m" }
+                "current_runner_info": { "timeframe": f"{int(os.getenv('SIM_STEP_SECONDS', '300')) // 60}m" },
+                "timeframes": {"5m": tf5m, "1d": tf1d}
             }
+
+            # Enrich with ETA from snapshot when available
+            try:
+                snap_path = os.getenv("SIM_PROGRESS_SNAPSHOT", "/app/data/sim_last_progress.json")
+                if os.path.exists(snap_path):
+                    import json
+                    with open(snap_path, "r", encoding="utf-8", errors="ignore") as f:
+                        snap = json.load(f)
+                        if isinstance(snap, dict):
+                            if snap.get("estimated_finish_iso"):
+                                resp["estimated_finish_iso"] = snap.get("estimated_finish_iso")
+                            if snap.get("estimated_finish_seconds") is not None:
+                                resp["estimated_finish_seconds"] = int(snap.get("estimated_finish_seconds"))
+                            if snap.get("estimated_finish"):
+                                resp["estimated_finish"] = snap.get("estimated_finish")
+            except Exception:
+                pass
+
+            # Fallback ETA based on pace if not present
+            try:
+                if resp.get("estimated_finish_iso") is None and running and cur_ts:
+                    step_sec = int(os.getenv("SIM_STEP_SECONDS", "300"))
+                    pace = float(os.getenv("SIM_PACE_SECONDS", "0"))
+                    if pace and step_sec > 0:
+                        remaining = max(0, end_epoch - cur_ts)
+                        remaining_ticks = remaining / step_sec
+                        est_secs = int(remaining_ticks * pace)
+                        resp["estimated_finish_seconds"] = est_secs
+                        resp["estimated_finish_iso"] = datetime.fromtimestamp(cur_ts + est_secs, tz=timezone.utc).isoformat()
+            except Exception:
+                pass
             
             try:
                 with engine.connect() as conn:

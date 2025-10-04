@@ -11,6 +11,11 @@ export const useSimulationStore = defineStore('simulation', () => {
   let lastProgressData = null
   let lastPollTime = null
   const etaRateSmoother = 0.1 // EMA alpha for smoothing rate calculations
+  // Publish gating for ETA to avoid second-by-second flapping
+  let lastEtaPublishAtMs = null
+  let lastEtaPublishedSeconds = null
+  const ETA_PUBLISH_MIN_INTERVAL_MS = 30000 // update visible ETA at most every 30s
+  const ETA_PUBLISH_MIN_DELTA_SECONDS = 60   // or if ETA changes by >= 1 minute
   
   // ───────── Simulation status cache (prevents blank/0% flash on refresh) ─────────
   const SIM_STATUS_CACHE_KEY = 'analytics_sim_status_cache'
@@ -122,9 +127,20 @@ export const useSimulationStore = defineStore('simulation', () => {
               const remainingSimSeconds = progressData.max_epoch - progressData.sim_time_epoch
               if (remainingSimSeconds > 0 && smoothedRate > 0) {
                 const newEtaSeconds = Math.round(remainingSimSeconds / smoothedRate)
-                status.value.eta_seconds = newEtaSeconds
-                status.value.estimated_finish_iso = new Date(now + newEtaSeconds * 1000).toISOString()
-                writeEtaCache(status.value.eta_seconds, status.value.estimated_finish_iso, status.value.rate)
+                const newFinishIso = new Date(now + newEtaSeconds * 1000).toISOString()
+                // Gate visible ETA updates to avoid jitter
+                const shouldPublishByTime = !lastEtaPublishAtMs || (now - lastEtaPublishAtMs) >= ETA_PUBLISH_MIN_INTERVAL_MS
+                const shouldPublishByDelta = (lastEtaPublishedSeconds == null) || (Math.abs(newEtaSeconds - lastEtaPublishedSeconds) >= ETA_PUBLISH_MIN_DELTA_SECONDS)
+                if (shouldPublishByTime || shouldPublishByDelta) {
+                  status.value.eta_seconds = newEtaSeconds
+                  status.value.estimated_finish_iso = newFinishIso
+                  lastEtaPublishAtMs = now
+                  lastEtaPublishedSeconds = newEtaSeconds
+                  writeEtaCache(status.value.eta_seconds, status.value.estimated_finish_iso, status.value.rate)
+                } else {
+                  // Keep internal cache fresh without updating UI-facing fields
+                  writeEtaCache(newEtaSeconds, newFinishIso, status.value.rate)
+                }
               } else {
                 status.value.eta_seconds = 0
                 status.value.estimated_finish_iso = new Date().toISOString()
@@ -137,6 +153,8 @@ export const useSimulationStore = defineStore('simulation', () => {
           // Reset if not running
           lastProgressData = null
           lastPollTime = null
+          lastEtaPublishAtMs = null
+          lastEtaPublishedSeconds = null
           // keep last cached ETA while idle to avoid flicker
           const cached = readEtaCache()
           if (cached) {
@@ -165,6 +183,17 @@ export const useSimulationStore = defineStore('simulation', () => {
         status.value.last_ts = lastTs
         status.value.current = currentRunnerInfo
         status.value.snapshot_age_seconds = stateData?.snapshot_age_seconds ?? null
+        // Prefer server-provided ETA when available to populate Finish immediately
+        if (progressData?.estimated_finish_iso) {
+          status.value.estimated_finish_iso = progressData.estimated_finish_iso
+        }
+        if (typeof progressData?.estimated_finish_seconds !== 'undefined' && progressData.estimated_finish_seconds !== null) {
+          status.value.eta_seconds = progressData.estimated_finish_seconds
+        }
+        // Pass-through per-timeframe progress if provided by snapshot
+        if (progressData?.timeframes && typeof progressData.timeframes === 'object') {
+          status.value.timeframes = progressData.timeframes
+        }
         
         writeSimCache(status.value)
       } catch (err) {
@@ -242,22 +271,7 @@ export const useSimulationStore = defineStore('simulation', () => {
     }
   }
 
-  function _startLogsPolling () {
-    _stopLogsPolling()
-    // Fetch warnings & errors every 3s
-    logsTimer = setInterval(async () => {
-      try {
-        const [w, e] = await Promise.all([
-          SimulationAPI.logs({ level: 'warning', limit: 500 }),
-          SimulationAPI.logs({ level: 'error', limit: 500 })
-        ])
-        logs.value = {
-          warnings: w?.lines ?? [],
-          errors: e?.lines ?? []
-        }
-      } catch { /* silent */ }
-    }, 3000)
-  }
+  function _startLogsPolling () { /* removed logs panel from SimulationView; keep no-op for compatibility */ }
 
   function _stopLogsPolling () {
     if (logsTimer) {
@@ -345,7 +359,7 @@ export const useSimulationStore = defineStore('simulation', () => {
       if (!(importStatus.value.progress_percent >= 100 || importStatus.value.state === 'ready')) {
         _startImportPolling()
       }
-      _startLogsPolling()
+      // Logs panel removed from SimulationView; skip logs polling
     }
   }
 

@@ -288,13 +288,15 @@ class DeepSeekV31Strategy:
             session = getattr(self.mkt, "_last_session", (None, "regular-hours"))[1]
             wiggle = self.limit_wiggle_xrth if session == "extended-hours" else self.limit_wiggle_rth
             limit_price = price * (1 - wiggle)
+            rsi_str = f"{rsi:.1f}" if (rsi is not None and rsi == rsi) else "N/A"
+            stoch_str = f"{stoch_k:.1f}" if (stoch_k is not None and stoch_k == stoch_k) else "N/A"
             return {
                 "action": "SELL",
                 "order_type": "LMT",
                 "price": round(price, 4),
                 "limit_price": round(limit_price, 4),
                 "reason": "discretionary_reversal",
-                "explanation": f"Strong reversal: RSI={rsi:.1f if rsi==rsi else 'N/A'}, Stoch={stoch_k:.1f if stoch_k is not None else 'N/A'}, MACD cross",
+                "explanation": f"Strong reversal: RSI={rsi_str}, Stoch={stoch_str}, MACD cross",
                 "checks": [
                     {"label": "Extreme overbought", "ok": extreme_overbought, "actual": rsi if rsi==rsi else "N/A"},
                     {"label": "Stochastic extreme", "ok": stoch_extreme, "actual": stoch_k if stoch_k is not None else "N/A"},

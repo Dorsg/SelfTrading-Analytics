@@ -24,9 +24,7 @@
           />
         </n-gi>
   
-        <n-gi :span="12">
-          <LogsPanel :warnings="sim.logs.warnings" :errors="sim.logs.errors" />
-        </n-gi>
+        
       </n-grid>
     </n-space>
   </template>
@@ -36,7 +34,7 @@
   import { NGrid, NGi, NSpace, useMessage } from 'naive-ui'
   import ImportStatus from '@/components/ImportStatus.vue'
   import SimulationControls from '@/components/SimulationControls.vue'
-  import LogsPanel from '@/components/LogsPanel.vue'
+  
   import { useSimulationStore } from '@/stores/simulation'
   
   const sim = useSimulationStore()
