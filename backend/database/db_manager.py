@@ -90,8 +90,19 @@ class DBManager(AbstractContextManager["DBManager"]):
     # ───────────────────────── Users & Accounts ─────────────────────────
 
     def get_user_by_username(self, username: str) -> Optional[User]:
+        """
+        Return the user by username while deferring heavy/optional columns.
+
+        Defers `User.password_hash` to avoid selecting a non-existent column on
+        legacy SQLite schemas where migrations haven't run yet. Accessing
+        `user.password_hash` will trigger a lazy-load; most scheduler/runners
+        never touch it.
+        """
+        from sqlalchemy.orm import defer
+
         return (
             self._session.query(User)
+            .options(defer(User.password_hash))
             .filter(User.username == username)
             .first()
         )

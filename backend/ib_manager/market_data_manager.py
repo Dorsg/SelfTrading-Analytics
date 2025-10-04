@@ -497,6 +497,130 @@ class MarketDataManager:
         lows = [float(c["low"]) for c in window]
         return (max(highs), min(lows))
 
+    @staticmethod
+    def calculate_macd(
+        candles: List[Dict[str, Any]], 
+        fast_period: int = 12, 
+        slow_period: int = 26, 
+        signal_period: int = 9
+    ) -> Tuple[Optional[float], Optional[float]]:
+        """Calculate MACD line and signal line."""
+        if len(candles) < slow_period + signal_period:
+            return (None, None)
+        
+        # Calculate fast and slow EMAs
+        fast_k = 2.0 / (fast_period + 1.0)
+        slow_k = 2.0 / (slow_period + 1.0)
+        
+        # Initialize fast EMA
+        fast_ema = float(candles[-slow_period]["close"])
+        for c in candles[-slow_period + 1:]:
+            fast_ema = c["close"] * fast_k + fast_ema * (1.0 - fast_k)
+        
+        # Initialize slow EMA
+        slow_ema = float(candles[-slow_period]["close"])
+        for c in candles[-slow_period + 1:]:
+            slow_ema = c["close"] * slow_k + slow_ema * (1.0 - slow_k)
+        
+        # MACD line = fast EMA - slow EMA
+        macd_line = fast_ema - slow_ema
+        
+        # Calculate signal line (EMA of MACD)
+        # We need at least signal_period of MACD values
+        if len(candles) < slow_period + signal_period:
+            return (macd_line, None)
+        
+        # Calculate MACD values for signal period
+        macd_values = []
+        for i in range(signal_period):
+            idx = -(signal_period - i)
+            if abs(idx) <= len(candles):
+                subset = candles[:idx] if idx < 0 else candles
+                if len(subset) >= slow_period:
+                    f_ema = float(subset[-slow_period]["close"])
+                    s_ema = float(subset[-slow_period]["close"])
+                    for c in subset[-slow_period + 1:]:
+                        f_ema = c["close"] * fast_k + f_ema * (1.0 - fast_k)
+                        s_ema = c["close"] * slow_k + s_ema * (1.0 - slow_k)
+                    macd_values.append(f_ema - s_ema)
+        
+        if len(macd_values) < signal_period:
+            return (macd_line, None)
+        
+        signal_k = 2.0 / (signal_period + 1.0)
+        signal_line = macd_values[0]
+        for mv in macd_values[1:]:
+            signal_line = mv * signal_k + signal_line * (1.0 - signal_k)
+        
+        return (macd_line, signal_line)
+
+    @staticmethod
+    def calculate_stochastic(
+        candles: List[Dict[str, Any]], 
+        k_period: int = 14, 
+        d_period: int = 3
+    ) -> Tuple[Optional[float], Optional[float]]:
+        """Calculate Stochastic Oscillator %K and %D."""
+        if len(candles) < k_period + d_period:
+            return (None, None)
+        
+        # Calculate %K
+        window = candles[-k_period:]
+        highs = [float(c["high"]) for c in window]
+        lows = [float(c["low"]) for c in window]
+        current_close = float(candles[-1]["close"])
+        
+        highest_high = max(highs)
+        lowest_low = min(lows)
+        
+        if highest_high == lowest_low:
+            stoch_k = 50.0
+        else:
+            stoch_k = 100.0 * (current_close - lowest_low) / (highest_high - lowest_low)
+        
+        # Calculate %D (SMA of %K)
+        k_values = []
+        for i in range(d_period):
+            idx = -(d_period - i)
+            subset = candles[:idx] if idx < 0 else candles
+            if len(subset) >= k_period:
+                w = subset[-k_period:]
+                h = [float(c["high"]) for c in w]
+                l = [float(c["low"]) for c in w]
+                cc = float(subset[-1]["close"])
+                hh = max(h)
+                ll = min(l)
+                if hh == ll:
+                    k_values.append(50.0)
+                else:
+                    k_values.append(100.0 * (cc - ll) / (hh - ll))
+        
+        stoch_d = sum(k_values) / len(k_values) if k_values else None
+        
+        return (stoch_k, stoch_d)
+
+    @staticmethod
+    def calculate_bollinger_bands(
+        candles: List[Dict[str, Any]], 
+        period: int = 20, 
+        std_dev: float = 2.0
+    ) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+        """Calculate Bollinger Bands (upper, middle, lower)."""
+        if len(candles) < period:
+            return (None, None, None)
+        
+        closes = [float(c["close"]) for c in candles[-period:]]
+        middle = sum(closes) / len(closes)
+        
+        # Calculate standard deviation
+        variance = sum((x - middle) ** 2 for x in closes) / len(closes)
+        std = variance ** 0.5
+        
+        upper = middle + (std_dev * std)
+        lower = middle - (std_dev * std)
+        
+        return (upper, middle, lower)
+
     # ─────────────────────────── mark-to-market helpers ───────────────────────────
 
     def get_last_close_for_symbols(

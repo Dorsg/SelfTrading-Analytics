@@ -47,20 +47,17 @@ def _ensure_runners_if_needed(users_ct: int, runners_ct: int) -> int:
     logger = logging.getLogger("api-gateway")
     try:
         marker = os.getenv("RUNNERS_MARKER", "/app/data/.runners_seeded")
-        if runners_ct > 0:
-            # Already have runners; refresh marker for observability
-            try:
-                os.makedirs(os.path.dirname(marker), exist_ok=True)
-                with open(marker, "w") as f:
-                    f.write("seeded")
-            except Exception:
-                pass
-            return runners_ct
+        # If runners already exist, do not early-return; we allow backfill of newly added strategies/timeframes.
+        # We still refresh marker for observability and continue to backfill missing combos.
+        try:
+            os.makedirs(os.path.dirname(marker), exist_ok=True)
+            with open(marker, "w") as f:
+                f.write("seeded")
+        except Exception:
+            pass
         if users_ct <= 0:
             return runners_ct
-        # Only attempt once until next process restart
-        if os.path.exists(marker):
-            return runners_ct
+        # Previously this function was one-shot. We now always attempt idempotent backfill when invoked.
         # Proceed to create
         from database.models import HistoricalDailyBar
         from database.db_manager import DBManager
@@ -75,7 +72,20 @@ def _ensure_runners_if_needed(users_ct: int, runners_ct: int) -> int:
             limit = 0
         if limit and len(syms) > limit:
             syms = syms[:limit]
-        strategies = ["chatgpt_5_strategy", "grok_4_strategy"]
+        # Prefer dynamic discovery to keep in sync with available modules
+        try:
+            from backend.strategies.factory import list_available_strategy_keys as _list_strats
+            strategies = _list_strats()
+        except Exception:
+            # Fallback to a static list if discovery fails
+            strategies = [
+                "chatgpt_5_strategy",
+                "chatgpt_5_ultra_strategy",
+                "grok_4_strategy",
+                "gemini_2_5_pro_strategy",
+                "claude_4_5_sonnet_strategy",
+                "deepseek_v3_1_strategy",
+            ]
         timeframes = [5, 1440]
         created = 0
         from database.models import Runner as RunnerModel
@@ -183,6 +193,24 @@ def get_database_status() -> dict:
         "ready": ready
     }
 
+@router.post("/runners/backfill")
+def backfill_runners() -> dict:
+    """Idempotently ensure missing runners for all discovered strategies/timeframes.
+
+    Returns the final runners count and whether a backfill was attempted.
+    """
+    logger = logging.getLogger("api-gateway")
+    try:
+        with DBManager() as db:
+            users_ct = int(db.count_users())
+            runners_ct_before = int(db.count_runners())
+        final_ct = _ensure_runners_if_needed(users_ct, runners_ct_before)
+        return {"ok": True, "runners_before": runners_ct_before, "runners_after": int(final_ct)}
+    except Exception as e:
+        logger.exception("runners/backfill failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 
 @router.post("/simulation/start")
 def start_simulation() -> dict:
@@ -234,6 +262,12 @@ def start_simulation() -> dict:
         raise HTTPException(status_code=500, detail="readiness check failed")
 
     try:
+        # Backfill any missing runners for newly added strategies/timeframes before starting
+        try:
+            _ensure_runners_if_needed(users_ct, runners_ct)
+        except Exception:
+            logger.exception("start_simulation: runner backfill failed; continuing with existing runners")
+
         # Discover 5m boundaries
         with engine.connect() as conn:
             min_ts = conn.execute(select(func.min(HistoricalMinuteBar.ts))).scalar()

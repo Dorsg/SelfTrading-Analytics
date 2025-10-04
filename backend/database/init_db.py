@@ -53,75 +53,99 @@ def _apply_light_migrations() -> None:
     - Fix strategy name for chatgpt_5_strategy to its canonical key.
     """
     try:
-        with engine.connect() as conn:
-            # --- Ensure users.password_hash exists ---
-            try:
+        # Step 1: ensure users.password_hash exists and backfill from legacy hashed_password
+        try:
+            with engine.begin() as conn:
                 insp = inspect(conn)
                 cols = [c["name"] for c in insp.get_columns("users")]
                 if "password_hash" not in cols:
                     log.info("Light migrations: adding users.password_hash column...")
                     conn.execute(text("ALTER TABLE users ADD COLUMN password_hash VARCHAR(255)"))
-                    conn.commit()
-            except Exception:
-                conn.rollback()
-                log.exception("Light migrations: failed adding password_hash")
+                if "hashed_password" in cols:
+                    conn.execute(text(
+                        "UPDATE users SET password_hash = COALESCE(password_hash, hashed_password) "
+                        "WHERE password_hash IS NULL AND hashed_password IS NOT NULL"
+                    ))
+        except Exception:
+            log.exception("Light migrations: failed adding/backfilling password_hash")
 
-            # --- Existing migrations you already run elsewhere are safe to repeat ---
-            # Ensure runner_executions.timeframe exists and unique index on conflict key
-            try:
-                conn.execute(text(
-                    "ALTER TABLE IF EXISTS runner_executions "
-                    "    ADD COLUMN IF NOT EXISTS timeframe INT"
-                ))
-                conn.commit()
-            except Exception:
-                conn.rollback()
+        # Step 2: ensure runner_executions.timeframe column exists (dialect-safe)
+        try:
+            with engine.begin() as conn:
+                insp = inspect(conn)
+                if insp.has_table("runner_executions"):
+                    cols = {c["name"] for c in insp.get_columns("runner_executions")}
+                    if "timeframe" not in cols:
+                        conn.execute(text("ALTER TABLE runner_executions ADD COLUMN timeframe INT"))
+        except Exception:
+            log.exception("Light migrations: failed ensuring runner_executions.timeframe")
 
-            try:
-                conn.execute(text(
-                    "CREATE UNIQUE INDEX IF NOT EXISTS ux_runner_exec "
-                    "ON runner_executions (cycle_seq, user_id, symbol, strategy, timeframe)"
-                ))
-                conn.commit()
-            except Exception:
-                conn.rollback()
+        # Step 3: ensure unique index on runner_executions conflict key
+        try:
+            with engine.begin() as conn:
+                insp = inspect(conn)
+                if insp.has_table("runner_executions"):
+                    cols = {c["name"] for c in insp.get_columns("runner_executions")}
+                    if "timeframe" in cols:
+                        conn.execute(text(
+                            "CREATE UNIQUE INDEX IF NOT EXISTS ux_runner_exec "
+                            "ON runner_executions (cycle_seq, user_id, symbol, strategy, timeframe)"
+                        ))
+        except Exception:
+            log.exception("Light migrations: failed ensuring ux_runner_exec index")
 
-            # --- NEW: sanitize + dedupe runners ---
-            # 1) Normalize stock symbols to uppercase so the unique key is robust.
-            try:
+        # Step 4: sanitize and dedupe runners
+        # 4a) Uppercase symbols
+        try:
+            with engine.begin() as conn:
                 res = conn.execute(text(
-                    "UPDATE runners SET stock = UPPER(stock) "
-                    "WHERE stock <> UPPER(stock)"
+                    "UPDATE runners SET stock = UPPER(stock) WHERE stock <> UPPER(stock)"
                 ))
                 updated = getattr(res, "rowcount", 0) or 0
-                conn.commit()
                 if updated:
                     log.info("Light migrations: uppercased %d runner symbols.", updated)
-            except Exception:
-                conn.rollback()
-                log.exception("Light migrations: failed uppercasing runner symbols")
+        except Exception:
+            log.exception("Light migrations: failed uppercasing runner symbols")
 
-            # 2) Migration: align chatgpt_5_strategy alias to canonical key recognized by factory
-            try:
-                res = conn.execute(text(
+        # 4b) Align chatgpt strategy name safely (avoid unique conflicts)
+        try:
+            with engine.begin() as conn:
+                # First, remove alias rows that would conflict with an existing canonical row
+                res_del = conn.execute(text(
                     """
-                    UPDATE runners
-                       SET strategy = 'chatgpt5strategy'
-                     WHERE TRIM(LOWER(strategy)) IN ('chatgpt_5_strategy', 'chatgpt 5 strategy', 'chatgpt-5-strategy')
+                    DELETE FROM runners r
+                    USING runners t
+                    WHERE TRIM(LOWER(r.strategy)) IN ('chatgpt_5_strategy', 'chatgpt 5 strategy', 'chatgpt-5-strategy')
+                      AND TRIM(LOWER(t.strategy)) = 'chatgpt5strategy'
+                      AND t.user_id = r.user_id AND t.stock = r.stock AND t.time_frame = r.time_frame
                     """
                 ))
-                updated_strat = getattr(res, "rowcount", 0) or 0
-                conn.commit()
+                removed = getattr(res_del, "rowcount", 0) or 0
+                if removed:
+                    log.info("Light migrations: removed %d conflicting chatgpt alias runners.", removed)
+
+                # Then, update remaining alias rows to canonical where it won't create a duplicate
+                res_upd = conn.execute(text(
+                    """
+                    UPDATE runners r
+                       SET strategy = 'chatgpt5strategy'
+                     WHERE TRIM(LOWER(r.strategy)) IN ('chatgpt_5_strategy', 'chatgpt 5 strategy', 'chatgpt-5-strategy')
+                       AND NOT EXISTS (
+                           SELECT 1 FROM runners t
+                            WHERE t.user_id = r.user_id AND t.stock = r.stock AND t.time_frame = r.time_frame
+                              AND TRIM(LOWER(t.strategy)) = 'chatgpt5strategy'
+                       )
+                    """
+                ))
+                updated_strat = getattr(res_upd, "rowcount", 0) or 0
                 if updated_strat:
                     log.info("Light migrations: aligned %d runners to 'chatgpt5strategy' canonical key.", updated_strat)
-            except Exception:
-                conn.rollback()
-                log.exception("Light migrations: failed aligning chatgpt strategy name")
+        except Exception:
+            log.exception("Light migrations: failed aligning chatgpt strategy name")
 
-
-            # 3) Delete duplicates, keep lowest id per (user_id, stock, strategy, time_frame).
-            try:
-                # SQLite-compatible duplicate removal (no USING clause)
+        # 4c) Delete duplicates (keep lowest id per key)
+        try:
+            with engine.begin() as conn:
                 res = conn.execute(text("""
                     DELETE FROM runners
                     WHERE id NOT IN (
@@ -131,26 +155,23 @@ def _apply_light_migrations() -> None:
                     )
                 """))
                 removed = getattr(res, "rowcount", 0) or 0
-                conn.commit()
                 if removed:
                     log.info("Light migrations: removed %d duplicate runners.", removed)
-            except Exception:
-                conn.rollback()
-                log.exception("Light migrations: failed removing duplicate runners (compat)")
+        except Exception:
+            log.exception("Light migrations: failed removing duplicate runners (compat)")
 
-            # 4) Enforce uniqueness going forward.
-            try:
+        # 4d) Enforce uniqueness going forward
+        try:
+            with engine.begin() as conn:
                 conn.execute(text("""
                     CREATE UNIQUE INDEX IF NOT EXISTS ux_runners_unique
                     ON runners (user_id, stock, strategy, time_frame)
                 """))
-                conn.commit()
                 log.info("Light migrations: ensured unique index ux_runners_unique.")
-            except Exception:
-                conn.rollback()
-                log.exception("Light migrations: failed creating ux_runners_unique")
+        except Exception:
+            log.exception("Light migrations: failed creating ux_runners_unique")
 
-            log.info("Light migrations completed.")
+        log.info("Light migrations completed.")
     except Exception:
         log.exception("Light migrations: fatal error")
 
