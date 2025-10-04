@@ -8,6 +8,7 @@
       :single-line="false"
       size="small"
       class="compact-table"
+      :default-sort="{ columnKey: 'avg_pct', order: 'descend' }"
     />
   </n-card>
 </template>
@@ -27,9 +28,7 @@ const columns = [
   {
     title: 'Weighted P&L (%)',
     key: 'weighted_pct',
-    render (row) {
-      return h('span', (row.weighted_pct || 0).toFixed(2) + '%')
-    },
+    render (row) { return h('span', (row.weighted_pct || 0).toFixed(3) + '%') },
     sorter: (a, b) => a.weighted_pct - b.weighted_pct,
     width: 140,
   },
@@ -37,7 +36,7 @@ const columns = [
     title: 'Avg. P&L (%) per Trade',
     key: 'avg_pct',
     render (row) {
-      const val = (row.avg_pct || 0).toFixed(2) + '%'
+      const val = (row.avg_pct || 0).toFixed(3) + '%'
       const cls = row.avg_pct > 0 ? 'pos' : (row.avg_pct < 0 ? 'neg' : '')
       return h('span', { class: cls }, val)
     },
@@ -46,7 +45,7 @@ const columns = [
   },
     {
       title: 'Win Rate (%)', key: 'win_rate_pct', width: 120,
-      render (row) { return h('span', (row.win_rate_pct || 0).toFixed(1) + '%') },
+      render (row) { return h('span', (row.win_rate_pct || 0).toFixed(2) + '%') },
       sorter: (a, b) => (a.win_rate_pct || 0) - (b.win_rate_pct || 0)
     },
     {

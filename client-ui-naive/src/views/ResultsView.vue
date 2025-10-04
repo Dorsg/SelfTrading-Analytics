@@ -15,6 +15,8 @@
       <ResultsBreakdown
         title="% P&L by Strategy"
         :rows="store.summary.pnl_by_strategy"
+        :sortable="true"
+        :default-sort="{ keys: ['win_rate_pct','avg_pct'], order: 'desc' }"
       />
 
       <YearStrategyTimeSummary :items="store.summary.pnl_by_year_strategy_time" />

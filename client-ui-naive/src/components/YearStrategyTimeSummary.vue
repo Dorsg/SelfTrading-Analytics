@@ -7,6 +7,7 @@
       :single-line="false"
       size="small"
       class="compact-table"
+      :default-sort="{ columnKey: 'avg_pct', order: 'descend' }"
     />
   </n-card>
 </template>
@@ -24,9 +25,9 @@ const columns = [
   { title: 'Timeframe', key: 'timeframe_label', width: 110 },
   { title: 'Trades', key: 'trades', width: 90, align: 'right', sorter: (a, b) => (a.trades || 0) - (b.trades || 0) },
   { title: 'Weighted P&L (%)', key: 'weighted_pct', width: 140, sorter: (a, b) => (a.weighted_pct || 0) - (b.weighted_pct || 0),
-    render (row) { return ((row.weighted_pct || 0).toFixed(2) + '%') } },
+    render (row) { return ((row.weighted_pct || 0).toFixed(3) + '%') } },
   { title: 'Avg. P&L (%) per Trade', key: 'avg_pct', width: 170, sorter: (a, b) => (a.avg_pct || 0) - (b.avg_pct || 0),
-    render (row) { return ((row.avg_pct || 0).toFixed(2) + '%') } },
+    render (row) { return ((row.avg_pct || 0).toFixed(3) + '%') } },
   { title: 'Avg Trade Time', key: 'avg_trade_days', width: 130, sorter: (a, b) => (a.avg_trade_days || 0) - (b.avg_trade_days || 0),
     render (row) { return ((row.avg_trade_days || 0).toFixed(1) + ' days') } }
 ]
