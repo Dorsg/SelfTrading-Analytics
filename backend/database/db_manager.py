@@ -221,6 +221,18 @@ class DBManager(AbstractContextManager["DBManager"]):
             q = q.filter(Runner.activation == activation)
         return q.order_by(Runner.created_at.asc(), Runner.id.asc()).all()
 
+    def update_runner_budget(self, runner_id: int, new_budget: float) -> None:
+        """Atomically update the current_budget for a runner."""
+        try:
+            self._session.query(Runner).filter(Runner.id == runner_id).update(
+                {"current_budget": new_budget}, synchronize_session=False
+            )
+            self._session.commit()
+        except Exception:
+            self._session.rollback()
+            log.exception("Failed to update budget for runner_id=%s", runner_id)
+            raise
+
     def count_runners(self, user_id: Optional[int] = None) -> int:
         """Return number of runners. Optionally filter by user_id."""
         try:

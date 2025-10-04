@@ -6,11 +6,20 @@
           <th class="col-bucket" :class="sortable ? 'sortable' : ''" @click="onHeaderClick('bucket')">
             Bucket <span class="sort-indicator">{{ sortArrow('bucket') }}</span>
           </th>
-          <th class="col-num" :class="sortable ? 'sortable' : ''" @click="onHeaderClick('weighted_pct')">
-            Wgt P&L (%) <span class="sort-indicator">{{ sortArrow('weighted_pct') }}</span>
+          <th class="col-num" :class="sortable ? 'sortable' : ''" @click="onHeaderClick('compounded_pnl_pct')">
+            Total P&L (%) <span class="sort-indicator">{{ sortArrow('compounded_pnl_pct') }}</span>
           </th>
           <th class="col-num" :class="sortable ? 'sortable' : ''" @click="onHeaderClick('avg_pct')">
-            Avg P&L/trade <span class="sort-indicator">{{ sortArrow('avg_pct') }}</span>
+            Avg P&L (%)/trade <span class="sort-indicator">{{ sortArrow('avg_pct') }}</span>
+          </th>
+          <th class="col-num" :class="sortable ? 'sortable' : ''" @click="onHeaderClick('profit_factor')">
+            Profit Factor <span class="sort-indicator">{{ sortArrow('profit_factor') }}</span>
+          </th>
+          <th class="col-num" :class="sortable ? 'sortable' : ''" @click="onHeaderClick('max_drawdown_pct')">
+            Max Drawdown (%) <span class="sort-indicator">{{ sortArrow('max_drawdown_pct') }}</span>
+          </th>
+          <th class="col-num" :class="sortable ? 'sortable' : ''" @click="onHeaderClick('sharpe_ratio')">
+            Sharpe Ratio <span class="sort-indicator">{{ sortArrow('sharpe_ratio') }}</span>
           </th>
           <th v-if="hasWinRate" class="col-num" :class="sortable ? 'sortable' : ''" @click="onHeaderClick('win_rate_pct')">
             Win Rate (%) <span class="sort-indicator">{{ sortArrow('win_rate_pct') }}</span>
@@ -26,8 +35,11 @@
       <tbody>
         <tr v-for="row in sortedRows" :key="row.bucket" :class="row.avg_pct > 0 ? 'pos' : (row.avg_pct < 0 ? 'neg' : '')">
           <td class="col-bucket" :title="row.bucket">{{ row.bucket }}</td>
-          <td>{{ formatPercent(row.weighted_pct) }}</td>
+          <td>{{ formatPercent(row.compounded_pnl_pct) }}</td>
           <td>{{ formatPercent(row.avg_pct) }}</td>
+          <td>{{ formatNumber(row.profit_factor, 2) }}</td>
+          <td>{{ formatPercent(row.max_drawdown_pct) }}</td>
+          <td>{{ formatNumber(row.sharpe_ratio, 2) }}</td>
           <td v-if="hasWinRate">{{ formatPercent(row.win_rate_pct) }}</td>
           <td v-if="hasAvgTradeTime">{{ formatDays(row.avg_trade_days) }}</td>
           <td>{{ formatInt(row.trades) }}</td>
@@ -60,8 +72,13 @@ const hasWinRate = computed(() => Array.isArray(props.rows) && props.rows.some(x
 const hasAvgTradeTime = computed(() => Array.isArray(props.rows) && props.rows.some(x => typeof x?.avg_trade_days === 'number'))
 
 function formatPercent (val) {
-  if (typeof val !== 'number') return '—'
+  if (!Number.isFinite(val)) return '0.000%'
   return `${val.toFixed(3)}%`
+}
+
+function formatNumber (val, digits = 2) {
+  if (!Number.isFinite(val)) return (0).toFixed(digits)
+  return val.toFixed(digits)
 }
 
 function formatInt (val) {

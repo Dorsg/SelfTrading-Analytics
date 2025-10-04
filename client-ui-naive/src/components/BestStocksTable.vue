@@ -26,10 +26,10 @@ const columns = [
   { title: 'Timeframe', key: 'timeframe', width: 80 },
   { title: 'Strategy', key: 'strategy', ellipsis: { tooltip: true }, width: 220 },
   {
-    title: 'Weighted P&L (%)',
-    key: 'weighted_pct',
-    render (row) { return h('span', (row.weighted_pct || 0).toFixed(3) + '%') },
-    sorter: (a, b) => a.weighted_pct - b.weighted_pct,
+    title: 'Total P&L (%)',
+    key: 'compounded_pnl_pct',
+    render (row) { return h('span', (row.compounded_pnl_pct || 0).toFixed(3) + '%') },
+    sorter: (a, b) => a.compounded_pnl_pct - b.compounded_pnl_pct,
     width: 140,
   },
   {

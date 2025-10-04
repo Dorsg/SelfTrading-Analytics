@@ -43,7 +43,14 @@ export const useResultsStore = defineStore('results', () => {
       pnl_by_timeframe: map(s?.pnl_by_timeframe),
       pnl_by_strategy: (s?.pnl_by_strategy ?? []).map(x => ({
         bucket: x.bucket ?? x.strategy ?? '-',
+        // Keep original weighted_pct for compatibility
         weighted_pct: safeNumber(x.weighted_pct),
+        // Advanced KPIs (backend provides these keys)
+        compounded_pnl_pct: safeNumber(x.compounded_pnl_pct ?? x.weighted_pct),
+        profit_factor: safeNumber(x.profit_factor),
+        max_drawdown_pct: safeNumber(x.max_drawdown_pct),
+        sharpe_ratio: safeNumber(x.sharpe_ratio),
+        // Existing metrics
         avg_pct: safeNumber(x.avg_pct),
         trades: safeInt(x.trades),
         win_rate_pct: safeNumber(x.win_rate_pct),

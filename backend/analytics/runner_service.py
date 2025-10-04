@@ -226,7 +226,8 @@ class RunnerService:
         try:
             if price is None or price <= 0:
                 return 0
-            qty = int(self._unit_budget_usd // max(price, 0.01))
+            # Use initial budget for consistent trade sizing
+            qty = int(r.budget // max(price, 0.01))
             return max(qty, 0)
         except Exception:
             return 0
@@ -308,8 +309,12 @@ class RunnerService:
                 price = float(candles[-1]["close"])
                 has_position = bool((positions_map or {}).get(r.id))
                 if has_position:
-                    retc = self.broker.on_tick(user_id=uid, runner=r, price=price, at=as_of)
+                    c = candles[-1]
+                    retc = self.broker.on_bar(user_id=uid, runner=r, o=c["open"], h=c["high"], l=c["low"], c=c["close"], at=as_of)
                     stats_delta["stop_cross_exits"] += int(retc.get("stop_cross_exits", 0))
+                    # The on_bar logic might have closed the position, so we need to re-check
+                    if stats_delta["stop_cross_exits"] > 0:
+                        has_position = False # It's closed now
 
                 # Bar advance guard
                 bar_key = (r.id, tf)
@@ -381,11 +386,17 @@ class RunnerService:
 
                 elif action == "SELL" and has_position:
                     reason = str(decision.get("reason") or decision.get("explanation") or "strategy_sell")
-                    ok = self.broker.sell_all(user_id=uid, runner=r, symbol=sym, price=ctx.price, decision=decision, at=as_of, reason_override=reason)
+                    pnl = self.broker.sell_all(user_id=uid, runner=r, symbol=sym, price=ctx.price, decision=decision, at=as_of, reason_override=reason)
                     
+                    ok = pnl is not None
                     if ok:
                         stats_delta["sells"] += 1
                         self.health.mark_clean_pass(sym=sym, tf=tf)
+                        # Update runner's compounding budget
+                        try:
+                            db.update_runner_budget(runner_id=rid, new_budget=r.current_budget + pnl)
+                        except Exception:
+                            log.exception("Failed to update runner budget for runner_id=%s", rid)
                     else:
                         stats_delta["errors"] += 1
                         self.health.note_error(sym=sym, tf=tf, now=as_of, et_day=et_day)

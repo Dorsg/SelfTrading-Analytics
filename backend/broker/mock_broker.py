@@ -1,15 +1,23 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any
+
+from sqlalchemy import inspect
 
 from database.db_manager import DBManager
 from database.models import OpenPosition, Order, ExecutedTrade
 from backend.trades_logger import log_buy, log_sell
 
 log = logging.getLogger("mock-broker")
+
+# Simulation realism parameters from environment variables
+_SIM_COMMISSION_PER_TRADE = float(os.environ.get("SIM_COMMISSION_PER_TRADE", 1.00))  # e.g., $1 per trade
+_SIM_BID_ASK_SPREAD = float(os.environ.get("SIM_BID_ASK_SPREAD", 0.01))  # e.g., 1 cent spread
+_SIM_SLIPPAGE_PERCENT = float(os.environ.get("SIM_SLIPPAGE_PERCENT", 0.0005))  # e.g., 0.05% slippage
 
 
 def _utc(dt: datetime) -> datetime:
@@ -44,8 +52,26 @@ class MockBroker:
 
     def __init__(self, *, tick_size: float = 0.01) -> None:
         self._tick = float(tick_size)
+        self.commission = _SIM_COMMISSION_PER_TRADE
+        self.spread = _SIM_BID_ASK_SPREAD
+        self.slippage = _SIM_SLIPPAGE_PERCENT
+        log.info(f"MockBroker initialized with realism params: commission=${self.commission}, spread=${self.spread}, slippage={self.slippage * 100:.4f}%")
 
     # ─────────────────────────────────────────────────────────────────────────────
+
+    def _apply_realism_costs(self, price: float, side: str) -> float:
+        """Applies spread and slippage to the execution price."""
+        # 1. Apply bid-ask spread
+        if side == "BUY":
+            price += self.spread / 2
+        else:  # SELL
+            price -= self.spread / 2
+
+        # 2. Apply slippage
+        slippage_amount = price * self.slippage * (1 if side == "BUY" else -1)
+        price += slippage_amount
+
+        return _quantize(price, self._tick)
 
     def buy(
         self,
@@ -60,6 +86,13 @@ class MockBroker:
     ) -> bool:
         """Open (or replace) a position for this runner."""
         at = _utc(at)
+        # Check for limit order condition
+        order_type = str((decision or {}).get("order_type", "MKT")).upper()
+        if order_type == "LMT":
+            limit_price = float((decision or {}).get("limit_price") or 0)
+            if limit_price > 0 and price > limit_price:
+                # For a BUY LIMIT, current price is too high, don't fill.
+                return False
         r = _RunnerLite(
             id=int(getattr(runner, "id")),
             user_id=user_id,
@@ -73,12 +106,24 @@ class MockBroker:
         if q <= 0 or price is None or price <= 0:
             return False
 
+        # Apply realism to execution price
+        exec_price = self._apply_realism_costs(price, "BUY")
+
         with DBManager() as db:
             # Replace any existing position for this runner (runner_id is unique in table)
             pos = db.get_open_position(r.id)
             if pos:
-                # For safety, close existing before opening a new one at same tick
-                self._force_close_without_trade(db, pos)
+                # Bug fix: Properly sell the existing position to record the trade, instead of just deleting it.
+                log.warning(f"Runner {r.id} is buying while already in a position. Closing existing position first.")
+                self.sell_all(
+                    user_id=user_id,
+                    runner=r,
+                    symbol=pos.symbol,
+                    price=price, # Use the current market price for the sell
+                    decision={"reason": "strategy_override_buy"},
+                    at=at,
+                    reason_override="strategy_override_buy"
+                )
 
             pos = OpenPosition(
                 user_id=r.user_id,
@@ -86,7 +131,7 @@ class MockBroker:
                 symbol=r.stock,
                 account="mock",
                 quantity=q,
-                avg_price=float(price),
+                avg_price=exec_price,
                 created_at=at,
                 stop_price=None,
                 trail_percent=None,
@@ -110,7 +155,7 @@ class MockBroker:
                 runner_id=r.id,
                 symbol=r.stock,
                 side="BUY",
-                order_type=str((decision or {}).get("order_type", "MKT")).upper(),
+                order_type=order_type,
                 quantity=q,
                 limit_price=float((decision or {}).get("limit_price") or 0) or None,
                 stop_price=pos.stop_price,
@@ -122,7 +167,7 @@ class MockBroker:
             db.db.add(ord_buy)
             db.db.commit()
 
-            log_buy(user_id=r.user_id, runner_id=r.id, symbol=r.stock, qty=q, price=float(price), as_of=at, reason="strategy_buy")
+            log_buy(user_id=r.user_id, runner_id=r.id, symbol=r.stock, qty=q, price=exec_price, as_of=at, reason="strategy_buy")
         return True
 
     # ─────────────────────────────────────────────────────────────────────────────
@@ -137,20 +182,30 @@ class MockBroker:
         decision: Optional[Dict[str, Any]] = None,
         at: datetime,
         reason_override: Optional[str] = None,
-    ) -> bool:
-        """Close the open position (if any) and emit a trade."""
+    ) -> Optional[float]:
+        """Close the open position (if any) and emit a trade. Returns P&L of the trade."""
         at = _utc(at)
+        # Check for limit order condition
+        order_type = str((decision or {}).get("order_type", "MKT")).upper()
+        if order_type == "LMT":
+            limit_price = float((decision or {}).get("limit_price") or 0)
+            if limit_price > 0 and price < limit_price:
+                # For a SELL LIMIT, current price is too low, don't fill.
+                return None
         rid = int(getattr(runner, "id"))
         with DBManager() as db:
             pos = db.get_open_position(rid)
             if not pos:
-                return False
+                return None
 
             q = float(pos.quantity or 0)
             avg = float(pos.avg_price or 0)
             if q <= 0 or avg <= 0:
                 self._force_close_without_trade(db, pos)
-                return False
+                return None
+
+            # Apply realism to execution price
+            exec_price = self._apply_realism_costs(price, "SELL")
 
             # Record SELL order (synthetic)
             ord_sell = Order(
@@ -158,7 +213,7 @@ class MockBroker:
                 runner_id=rid,
                 symbol=pos.symbol,
                 side="SELL",
-                order_type=str((decision or {}).get("order_type", "MKT")).upper(),
+                order_type=order_type,
                 quantity=int(q),
                 limit_price=float((decision or {}).get("limit_price") or 0) or None,
                 stop_price=float((decision or {}).get("stop_price") or 0) or None,
@@ -170,8 +225,8 @@ class MockBroker:
             db.db.add(ord_sell)
 
             # ExecutedTrade roll-up
-            pnl_amt = (float(price) - avg) * q
-            pnl_pct = 0.0 if avg == 0 else (float(price) / avg - 1.0) * 100.0
+            pnl_amt = (exec_price - avg) * q - (self.commission * 2) # Commission on buy and sell
+            pnl_pct = 0.0 if avg == 0 else (exec_price / avg - 1.0) * 100.0
             trade = ExecutedTrade(
                 user_id=user_id,
                 runner_id=rid,
@@ -179,7 +234,7 @@ class MockBroker:
                 buy_ts=pos.created_at,
                 sell_ts=at,
                 buy_price=avg,
-                sell_price=float(price),
+                sell_price=exec_price,
                 quantity=q,
                 pnl_amount=pnl_amt,
                 pnl_percent=pnl_pct,
@@ -198,11 +253,11 @@ class MockBroker:
                 symbol=ord_sell.symbol,
                 qty=q,
                 avg_price=avg,
-                price=float(price),
+                price=exec_price,
                 as_of=at,
                 reason=(reason_override or (decision or {}).get("reason") or ""),
             )
-        return True
+        return pnl_amt
 
     # ─────────────────────────────────────────────────────────────────────────────
 
@@ -239,11 +294,11 @@ class MockBroker:
 
     # ─────────────────────────────────────────────────────────────────────────────
 
-    def on_tick(self, *, user_id: int, runner: Any, price: float, at: datetime) -> Dict[str, int]:
+    def on_bar(self, *, user_id: int, runner: Any, o: float, h: float, l: float, c: float, at: datetime) -> Dict[str, int]:
         """
-        Tick-aware trailing/static stop evaluation.
-        Exit when price <= stop (with epsilon at tick size). Never 'skip'.
-        Returns counters for KPI aggregation: {"stop_cross_exits": N}
+        OHLC-aware trailing/static stop evaluation.
+        Exit when low <= stop. Assumes exit price is the stop price.
+        Returns counters for KPI aggregation.
         """
         at = _utc(at)
         rid = int(getattr(runner, "id"))
@@ -254,55 +309,55 @@ class MockBroker:
             if not pos:
                 return out
 
-            # Update trailing state
-            try:
-                trail_pct = float(pos.trail_percent or 0.0)
-            except Exception:
-                trail_pct = 0.0
+            exit_price = None
+            exit_reason = None
 
-            top = float(pos.highest_price or 0.0)
-            px = float(price)
-
-            if trail_pct > 0.0:
-                if px > top:
-                    pos.highest_price = px
-                    db.db.commit()
-                    top = px
-
-                trail_stop = top * (1.0 - trail_pct / 100.0)
-                # tick-aware compare: allow a tiny epsilon up to one tick
-                if px <= (trail_stop + self._tick * 1e-9):
-                    # Close position now
-                    out["stop_cross_exits"] += 1
-                    self.sell_all(
-                        user_id=user_id,
-                        runner=runner,
-                        symbol=pos.symbol,
-                        price=_quantize(px, self._tick),
-                        decision={"reason": "trailing_stop_hit", "order_type": "MKT"},
-                        at=at,
-                        reason_override="trailing_stop_hit",
-                    )
-                    return out
-
-            # Static stop (if any)
+            # 1. Check static stop
             try:
                 sp = float(pos.stop_price or 0.0)
+                if sp > 0.0 and l <= (sp + self._tick * 1e-9):
+                    exit_price = sp  # Exit at the stop price
+                    exit_reason = "static_stop_hit"
             except Exception:
-                sp = 0.0
+                pass
 
-            if sp > 0.0 and px <= (sp + self._tick * 1e-9):
+            # 2. Check trailing stop (only if static stop not hit)
+            if not exit_price:
+                try:
+                    trail_pct = float(pos.trail_percent or 0.0)
+                    if trail_pct > 0.0:
+                        top = float(pos.highest_price or 0.0)
+                        # First, update highest price based on the bar's high
+                        if h > top:
+                            pos.highest_price = h
+                            top = h
+
+                        trail_stop = top * (1.0 - trail_pct / 100.0)
+                        if l <= (trail_stop + self._tick * 1e-9):
+                            exit_price = trail_stop  # Exit at the stop price
+                            exit_reason = "trailing_stop_hit"
+                except Exception:
+                    pass
+            
+            # If an exit was triggered, sell the position
+            if exit_price and exit_reason:
                 out["stop_cross_exits"] += 1
                 self.sell_all(
                     user_id=user_id,
                     runner=runner,
                     symbol=pos.symbol,
-                    price=_quantize(px, self._tick),
-                    decision={"reason": "static_stop_hit", "order_type": "MKT"},
+                    price=_quantize(exit_price, self._tick),
+                    decision={"reason": exit_reason, "order_type": "MKT"},
                     at=at,
-                    reason_override="static_stop_hit",
+                    reason_override=exit_reason,
                 )
-                return out
+                # Commit highest price change if trail was active
+                db.db.commit()
+
+            # If no exit, but trailing is active, still commit highest price update
+            elif pos in inspect(pos).session.dirty:
+                 db.db.commit()
+
 
         return out
 

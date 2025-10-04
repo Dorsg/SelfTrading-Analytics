@@ -21,6 +21,7 @@ from database.models import (
     ExecutedTrade,
     Runner
 )
+from backend.analytics.performance_metrics import calculate_performance_metrics
 
 router = APIRouter(prefix="/analytics", tags=["analytics"])
 
@@ -1017,8 +1018,8 @@ def list_results(
                 "timeframe": r.timeframe,
                 "start_ts": r.buy_ts,
                 "end_ts": r.sell_ts,
-                "pnl_amount": r.pnl,
-                "pnl_percent": r.pnl_pct,
+                "pnl_amount": r.pnl_amount,
+                "pnl_percent": r.pnl_percent,
             }
             for r in rows
         ]
@@ -1086,13 +1087,42 @@ def get_results_summary() -> dict:
         pnl_by_strategy_raw = {}
         for r in conn.execute(by_strat_q).mappings():
             pnl_by_strategy_raw[r.strategy] = {
-                "weighted_pct": float(r.weighted_pct or 0.0),
                 "avg_pct": float(r.avg_pct or 0.0),
                 "trades": int(r.trades or 0),
                 "win_rate_pct": float(r.win_rate_pct or 0.0),
                 "avg_trade_days": float(r.avg_trade_days or 0.0),
             }
 
+        # Calculate advanced metrics
+        try:
+            # Select explicit columns to ensure predictable dict keys
+            all_trades_q = (
+                select(
+                    ExecutedTrade.runner_id.label("runner_id"),
+                    ExecutedTrade.strategy.label("strategy"),
+                    ExecutedTrade.sell_ts.label("sell_ts"),
+                    ExecutedTrade.pnl_amount.label("pnl_amount"),
+                    ExecutedTrade.pnl_percent.label("pnl_percent"),
+                )
+                .where(ExecutedTrade.sell_ts != None)
+            )
+            all_trades = [dict(row._mapping) for row in conn.execute(all_trades_q).all()]
+
+            # Runners not required for metrics, keep for signature
+            all_runners_q = select(
+                Runner.id.label("id"),
+                Runner.strategy.label("strategy"),
+                Runner.budget.label("budget"),
+                Runner.current_budget.label("current_budget"),
+            )
+            all_runners = [dict(row._mapping) for row in conn.execute(all_runners_q).all()]
+
+            advanced_metrics = calculate_performance_metrics(all_trades, all_runners)
+        except Exception as e:
+            logging.getLogger("api-gateway").exception("Failed to calculate advanced performance metrics")
+            advanced_metrics = {}
+
+        # Merge SQL-aggregated data (like win rate) with Python-calculated advanced metrics
         # Seed with all active strategies to ensure they appear even with 0 trades
         with DBManager() as db:
             active_runners = db.db.query(Runner.strategy).distinct().all()
@@ -1100,16 +1130,25 @@ def get_results_summary() -> dict:
 
         pnl_by_strategy = []
         for strat in sorted(list(all_strategies)):
-            data = pnl_by_strategy_raw.get(strat, {"weighted_pct": 0.0, "avg_pct": 0.0, "trades": 0, "win_rate_pct": 0.0, "avg_trade_days": 0.0})
-            # Ensure JSON-safe numbers
+            # Start with defaults for a strategy that might have 0 trades
+            # Get basic SQL metrics if available
+            sql_data = pnl_by_strategy_raw.get(strat, {})
+            # Get advanced Python metrics if available
+            adv_data = advanced_metrics.get(strat, {})
+
+            # Combine all data, ensuring values are JSON-safe floats/ints
             data = {
-                "weighted_pct": float(data.get("weighted_pct", 0.0)),
-                "avg_pct": float(data.get("avg_pct", 0.0)),
-                "trades": int(data.get("trades", 0)),
-                "win_rate_pct": float(data.get("win_rate_pct", 0.0)),
-                "avg_trade_days": float(data.get("avg_trade_days", 0.0)),
+                "compounded_pnl_pct": float(adv_data.get("compounded_pnl_pct", 0.0)),
+                "profit_factor": float(adv_data.get("profit_factor", 0.0)),
+                "max_drawdown_pct": float(adv_data.get("max_drawdown_pct", 0.0)),
+                "sharpe_ratio": float(adv_data.get("sharpe_ratio", 0.0)),
+                "avg_pct": float(sql_data.get("avg_pct", 0.0)),
+                "trades": int(sql_data.get("trades", 0)),
+                "win_rate_pct": float(sql_data.get("win_rate_pct", 0.0)),
+                "avg_trade_days": float(sql_data.get("avg_trade_days", 0.0)),
             }
             pnl_by_strategy.append({"bucket": strat, **data})
+
 
         # P&L by Year/Strategy/Timeframe (for detailed view)
         by_yst_q = text("""
@@ -1150,25 +1189,25 @@ def get_results_summary() -> dict:
                 "strategy": r.strategy,
                 "timeframe": tf,
                 "timeframe_label": tf_label,
-                "weighted_pct": float(r.weighted_pct or 0.0),
+                "compounded_pnl_pct": float(r.weighted_pct or 0.0), # Note: This is still weighted P&L, not compounded for this view
                 "avg_pct": float(r.avg_pct or 0.0),
                 "trades": int(r.trades or 0),
                 "avg_trade_days": float(r.avg_trade_days or 0.0),
             })
 
 
-    return {
-        "pnl_by_year": [
-            {"bucket": x["bucket"], "weighted_pct": float(x["weighted_pct"] or 0.0), "avg_pct": float(x["avg_pct"] or 0.0), "trades": int(x["trades"] or 0)}
-            for x in pnl_by_year
-        ],
+    # Final assembly
+    out = {
+        "pnl_by_year": pnl_by_year,
         "pnl_by_timeframe": [
-            {"bucket": x["bucket"], "weighted_pct": float(x["weighted_pct"] or 0.0), "avg_pct": float(x["avg_pct"] or 0.0), "trades": int(x["trades"] or 0)}
+            {"bucket": x["bucket"], "compounded_pnl_pct": float(x["weighted_pct"] or 0.0), "avg_pct": float(x["avg_pct"] or 0.0), "trades": int(x["trades"] or 0)}
             for x in pnl_by_timeframe
         ],
         "pnl_by_strategy": pnl_by_strategy,
         "pnl_by_year_strategy_time": pnl_by_year_strategy_time,
     }
+
+    return out
 
 
 @router.get("/results/top-stocks")
@@ -1183,7 +1222,7 @@ def get_top_stocks(limit: int = Query(20, ge=1, le=100)) -> list[dict]:
                 ELSE NULL
             END AS timeframe,
             strategy,
-            COALESCE(SUM(pnl_amount), 0) / NULLIF(SUM(buy_price * quantity), 0) * 100 AS weighted_pct,
+            COALESCE(SUM(pnl_amount), 0) / NULLIF(SUM(buy_price * quantity), 0) * 100 AS compounded_pnl_pct,
             AVG(COALESCE(pnl_amount, 0) / NULLIF(buy_price * quantity, 0) * 100) AS avg_pct,
             CAST(COUNT(*) AS INT) AS trades,
             100.0 * SUM(CASE WHEN COALESCE(pnl_amount,0) > 0 THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0) AS win_rate_pct,
@@ -1194,7 +1233,7 @@ def get_top_stocks(limit: int = Query(20, ge=1, le=100)) -> list[dict]:
           AND (strategy IS NULL OR TRIM(LOWER(strategy)) NOT LIKE '%test%')
         GROUP BY stock, timeframe, strategy
         HAVING timeframe IN ('1d','5m')
-        ORDER BY weighted_pct DESC
+        ORDER BY compounded_pnl_pct DESC
         LIMIT :limit
     """)
     with engine.connect() as conn:
@@ -1204,9 +1243,9 @@ def get_top_stocks(limit: int = Query(20, ge=1, le=100)) -> list[dict]:
         for r in rows:
             m = dict(r)
             try:
-                m["weighted_pct"] = float(m.get("weighted_pct") or 0.0)
+                m["compounded_pnl_pct"] = float(m.get("compounded_pnl_pct") or 0.0)
             except Exception:
-                m["weighted_pct"] = 0.0
+                m["compounded_pnl_pct"] = 0.0
             try:
                 m["avg_pct"] = float(m.get("avg_pct") or 0.0)
             except Exception:

@@ -59,6 +59,36 @@ def _is_regular_market_minute(ts_utc: datetime) -> bool:
     return time(9, 30) <= t <= time(16, 0)
 
 
+def _detect_and_log_gaps(candles: List[Dict[str, Any]], symbol: str, interval_min: int, gap_threshold_pct: float = 2.0):
+    """Helper to find and log significant price gaps between consecutive candles."""
+    if len(candles) < 2:
+        return
+    
+    for i in range(1, len(candles)):
+        prev_candle = candles[i-1]
+        curr_candle = candles[i]
+        
+        prev_close = float(prev_candle["close"])
+        curr_open = float(curr_candle["open"])
+        
+        if prev_close <= 0:
+            continue
+            
+        gap_pct = abs(curr_open / prev_close - 1.0) * 100.0
+        
+        if gap_pct > gap_threshold_pct:
+            log.info(
+                "Price gap detected for %s (%dm): %.2f%% gap from %.2f to %.2f between %s and %s",
+                symbol,
+                interval_min,
+                gap_pct,
+                prev_close,
+                curr_open,
+                prev_candle["ts"].isoformat(),
+                curr_candle["ts"].isoformat(),
+            )
+
+
 class MarketDataManager:
     """
     Historical data access + helpers.
@@ -188,6 +218,7 @@ class MarketDataManager:
                             "volume": m["volume"],
                         }
                     )
+                _detect_and_log_gaps(out, symbol, interval_min)
                 return out
 
             raw_limit = lookback * (3 if regular_hours_only else 1)
@@ -227,6 +258,7 @@ class MarketDataManager:
                     )
             if regular_hours_only and len(out) > lookback:
                 out = out[-lookback:]
+            _detect_and_log_gaps(out, symbol, interval_min)
             return out
 
     # ─────────────────────────── data access (BULK) ───────────────────────────
