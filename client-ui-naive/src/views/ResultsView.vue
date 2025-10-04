@@ -12,7 +12,7 @@
         </n-space>
       </n-space>
   
-      <n-grid :cols="3" x-gap="16" y-gap="16">
+      <n-grid :cols="3" x-gap="12" y-gap="12">
         <n-gi>
           <ResultsBreakdown
             title="% P&L by Year/Time"

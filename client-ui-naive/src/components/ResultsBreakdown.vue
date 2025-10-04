@@ -1,17 +1,17 @@
 <template>
-  <n-card :title="title">
-    <n-table :single-line="false">
+  <n-card :title="title" size="small">
+    <n-table :single-line="false" class="compact-table">
       <thead>
         <tr>
-          <th>Bucket</th>
-          <th>Weighted P&L (%)</th>
-          <th>Avg. P&L (%) per Trade</th>
-          <th>Trades</th>
+          <th class="col-bucket">Bucket</th>
+          <th class="col-num">Wgt P&L (%)</th>
+          <th class="col-num">Avg P&L/trade</th>
+          <th class="col-num">Trades</th>
         </tr>
       </thead>
       <tbody>
         <tr v-for="row in rows" :key="row.bucket" :class="row.avg_pct > 0 ? 'pos' : (row.avg_pct < 0 ? 'neg' : '')">
-          <td>{{ row.bucket }}</td>
+          <td class="col-bucket" :title="row.bucket">{{ row.bucket }}</td>
           <td>{{ formatPercent(row.weighted_pct) }}</td>
           <td>{{ formatPercent(row.avg_pct) }}</td>
           <td>{{ formatInt(row.trades) }}</td>
@@ -61,5 +61,25 @@ function formatInt (val) {
 /* Light green/red backgrounds for positive/negative Avg P&L per Trade */
 tr.pos td { background-color: rgba(6, 170, 85, 0.08); }
 tr.neg td { background-color: rgba(220, 38, 38, 0.08); }
+
+/* Compact table styling for statistics cards */
+.compact-table :deep(th),
+.compact-table :deep(td) {
+  padding: 4px 8px;
+  font-size: 12px;
+  line-height: 1.2;
+  white-space: nowrap;
+}
+.compact-table :deep(th.col-bucket),
+.compact-table :deep(td.col-bucket) {
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.compact-table :deep(th.col-num),
+.compact-table :deep(td.col-num) {
+  width: 120px;
+  text-align: right;
+}
 </style>
   

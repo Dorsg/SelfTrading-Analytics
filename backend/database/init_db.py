@@ -115,8 +115,8 @@ def _apply_light_migrations() -> None:
                     """
                     DELETE FROM runners r
                     USING runners t
-                    WHERE TRIM(LOWER(r.strategy)) IN ('chatgpt_5_strategy', 'chatgpt 5 strategy', 'chatgpt-5-strategy')
-                      AND TRIM(LOWER(t.strategy)) = 'chatgpt5strategy'
+                    WHERE TRIM(LOWER(r.strategy)) IN ('chatgpt5strategy', 'chatgpt 5 strategy', 'chatgpt-5-strategy')
+                      AND TRIM(LOWER(t.strategy)) = 'chatgpt_5_strategy'
                       AND t.user_id = r.user_id AND t.stock = r.stock AND t.time_frame = r.time_frame
                     """
                 ))
@@ -128,18 +128,18 @@ def _apply_light_migrations() -> None:
                 res_upd = conn.execute(text(
                     """
                     UPDATE runners r
-                       SET strategy = 'chatgpt5strategy'
-                     WHERE TRIM(LOWER(r.strategy)) IN ('chatgpt_5_strategy', 'chatgpt 5 strategy', 'chatgpt-5-strategy')
+                       SET strategy = 'chatgpt_5_strategy'
+                     WHERE TRIM(LOWER(r.strategy)) IN ('chatgpt5strategy', 'chatgpt 5 strategy', 'chatgpt-5-strategy')
                        AND NOT EXISTS (
                            SELECT 1 FROM runners t
                             WHERE t.user_id = r.user_id AND t.stock = r.stock AND t.time_frame = r.time_frame
-                              AND TRIM(LOWER(t.strategy)) = 'chatgpt5strategy'
+                              AND TRIM(LOWER(t.strategy)) = 'chatgpt_5_strategy'
                        )
                     """
                 ))
                 updated_strat = getattr(res_upd, "rowcount", 0) or 0
                 if updated_strat:
-                    log.info("Light migrations: aligned %d runners to 'chatgpt5strategy' canonical key.", updated_strat)
+                    log.info("Light migrations: aligned %d runners to 'chatgpt_5_strategy' canonical key.", updated_strat)
         except Exception:
             log.exception("Light migrations: failed aligning chatgpt strategy name")
 
@@ -170,6 +170,22 @@ def _apply_light_migrations() -> None:
                 log.info("Light migrations: ensured unique index ux_runners_unique.")
         except Exception:
             log.exception("Light migrations: failed creating ux_runners_unique")
+
+        # 4e) Normalize executed_trades strategy names to canonical (reporting consistency)
+        try:
+            with engine.begin() as conn:
+                res_et = conn.execute(text(
+                    """
+                    UPDATE executed_trades
+                       SET strategy = 'chatgpt_5_strategy'
+                     WHERE TRIM(LOWER(strategy)) IN ('chatgpt5strategy', 'chatgpt 5 strategy', 'chatgpt-5-strategy')
+                    """
+                ))
+                updated_et = getattr(res_et, "rowcount", 0) or 0
+                if updated_et:
+                    log.info("Light migrations: normalized %d executed_trades to 'chatgpt_5_strategy'.", updated_et)
+        except Exception:
+            log.exception("Light migrations: failed normalizing executed_trades strategy names")
 
         log.info("Light migrations completed.")
     except Exception:
