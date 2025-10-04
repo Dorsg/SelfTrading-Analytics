@@ -11,7 +11,7 @@ from datetime import datetime, timezone, timedelta, date
 # Ensure the project root is in the Python path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 
-from logger_config import setup_logging  # ensure file handlers & levels
+from backend.logger_config import setup_logging  # ensure file handlers & levels
 from database.db_manager import DBManager
 from database.models import SimulationState
 from database.db_core import engine
@@ -222,7 +222,8 @@ async def main() -> None:
     except Exception:
         log.exception("Failed to apply light migrations at scheduler startup")
 
-    tick_log_every = max(1, int(os.getenv("TICK_LOG_EVERY", "1")))
+    # Default to logging every 5 ticks unless explicitly overridden to reduce IO
+    tick_log_every = max(1, int(os.getenv("TICK_LOG_EVERY", "5")))
     boundary_refresh_ticks = int(os.getenv("SIM_BOUNDARY_REFRESH_TICKS", "0"))  # 0 = never refresh
 
     rs = RunnerService()
@@ -639,31 +640,36 @@ async def main() -> None:
                         pace_label,
                     )
 
-                # Persist a small last-progress snapshot for UI resilience when DB is flaky.
+                # Persist a small last-progress snapshot less frequently to reduce disk IO
                 try:
-                    _write_snapshot_atomic({
-                        "sim_time_epoch": cur_ts,
-                        "sim_time_iso": datetime.fromtimestamp(cur_ts, tz=timezone.utc).isoformat(),
-                        "timeframes": {"5m": {"ticks_done": done_span // step_sec if step_sec > 0 else 0,
-                                              "ticks_total": total_span // step_sec if step_sec > 0 else 0,
-                                              "percent": pct}},
-                        "counters": {"executions_all_time": int(cumulative_processed),
-                                     "trades_all_time": int(cumulative_buys + cumulative_sells)},
-                        "total_buys": int(cumulative_buys),
-                        "total_sells": int(cumulative_sells),
-                        "progress_percent": pct,
-                        "state": "running",
-                        "tick_number": tick,
-                        "logged_progress": pct,
-                        "current_runner_info": {
-                            "timeframe": f"{int(step_sec // 60)}m" if step_sec % 60 == 0 else f"{step_sec}s",
-                            "symbol": (clock_sym or "<global>"),
-                            "as_of_iso": datetime.fromtimestamp(cur_ts, tz=timezone.utc).isoformat(),
-                        },
-                        **_compute_eta(cur_ts, pace, total_span, done_span, step_sec, tick_times)
-                    })
+                    snapshot_every = max(1, int(os.getenv("SNAPSHOT_EVERY_TICKS", str(tick_log_every))))
                 except Exception:
-                    log.exception("Failed to write progress snapshot")
+                    snapshot_every = tick_log_every
+                if tick % snapshot_every == 0:
+                    try:
+                        _write_snapshot_atomic({
+                            "sim_time_epoch": cur_ts,
+                            "sim_time_iso": datetime.fromtimestamp(cur_ts, tz=timezone.utc).isoformat(),
+                            "timeframes": {"5m": {"ticks_done": done_span // step_sec if step_sec > 0 else 0,
+                                                  "ticks_total": total_span // step_sec if step_sec > 0 else 0,
+                                                  "percent": pct}},
+                            "counters": {"executions_all_time": int(cumulative_processed),
+                                         "trades_all_time": int(cumulative_buys + cumulative_sells)},
+                            "total_buys": int(cumulative_buys),
+                            "total_sells": int(cumulative_sells),
+                            "progress_percent": pct,
+                            "state": "running",
+                            "tick_number": tick,
+                            "logged_progress": pct,
+                            "current_runner_info": {
+                                "timeframe": f"{int(step_sec // 60)}m" if step_sec % 60 == 0 else f"{step_sec}s",
+                                "symbol": (clock_sym or "<global>"),
+                                "as_of_iso": datetime.fromtimestamp(cur_ts, tz=timezone.utc).isoformat(),
+                            },
+                            **_compute_eta(cur_ts, pace, total_span, done_span, step_sec, tick_times)
+                        })
+                    except Exception:
+                        log.exception("Failed to write progress snapshot")
 
                 await asyncio.sleep(pace if pace > 0 else 0)
                 tick += 1

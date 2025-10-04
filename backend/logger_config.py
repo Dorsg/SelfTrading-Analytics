@@ -56,7 +56,8 @@ def _mk_handler(filename: str, level: int) -> TruncatingRotatingFileHandler:
 
 
 def setup_logging() -> None:
-    root_level = getattr(logging, os.getenv("LOG_LEVEL", "DEBUG").upper(), logging.DEBUG)
+    # Reduce default root verbosity to INFO unless explicitly overridden
+    root_level = getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO)
     logging.basicConfig(level=root_level)
 
     # Allow overriding levels via env, defaults lean verbose for debugging stuckness
@@ -64,19 +65,19 @@ def setup_logging() -> None:
         return getattr(logging, os.getenv(f"LOG_{name}_LEVEL", default).upper(), logging.getLevelName(default))
 
     loggers = {
-        "AnalyticsScheduler": ("sim_scheduler.log", lvl("SCHEDULER", os.getenv("LOG_SCHEDULER_DEFAULT", "DEBUG"))),
-        "runner-service": ("runner-service.log", lvl("RUNNER", "DEBUG")),
-        "mock-broker": ("mock-broker.log", lvl("BROKER", "DEBUG")),
-        "grok-4-strategy": ("grok-4-strategy.log", lvl("GROK", "DEBUG")),
-        "chatgpt-5-strategy": ("chatgpt-5-strategy.log", lvl("CHATGPT5", "DEBUG")),
-        "api-gateway": ("api_gateway.log", lvl("API", "DEBUG")),
-        "app": ("app.log", lvl("APP", "DEBUG")),
+        "AnalyticsScheduler": ("sim_scheduler.log", lvl("SCHEDULER", os.getenv("LOG_SCHEDULER_DEFAULT", "INFO"))),
+        "runner-service": ("runner-service.log", lvl("RUNNER", "INFO")),
+        "mock-broker": ("mock-broker.log", lvl("BROKER", "INFO")),
+        "grok-4-strategy": ("grok-4-strategy.log", lvl("GROK", "INFO")),
+        "chatgpt-5-strategy": ("chatgpt-5-strategy.log", lvl("CHATGPT5", "INFO")),
+        "api-gateway": ("api_gateway.log", lvl("API", "INFO")),
+        "app": ("app.log", lvl("APP", "INFO")),
         "trades": ("trades.log", lvl("TRADES", "INFO")),
-        "market-data-manager": ("market_data_manager.log", lvl("MARKET", "DEBUG")),
-        "runner-executions": ("runner_executions.log", lvl("EXEC", "INFO")),
+        "market-data-manager": ("market_data_manager.log", lvl("MARKET", "INFO")),
+        "runner-executions": ("runner_executions.log", lvl("EXEC", "WARNING")),
         "analytics-kpi": ("analytics_kpi.log", lvl("KPI", "INFO")),
         # Dedicated health-gate sink
-        "runner-health-gate": ("runner_health_gate.log", lvl("HEALTH", "DEBUG")),
+        "runner-health-gate": ("runner_health_gate.log", lvl("HEALTH", "INFO")),
     }
 
     for name, (file, level) in loggers.items():

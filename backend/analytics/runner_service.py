@@ -5,6 +5,8 @@ import os
 import json
 import logging
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any, Tuple, Set
@@ -95,7 +97,21 @@ class RunnerService:
         self._same_bar_scope: str = (os.getenv("SAME_BAR_SCOPE", "symbol_tf") or "symbol_tf").strip().lower()
         self._same_bar_seen_seq: Optional[int] = None  # resets each tick (cycle_seq)
         self._same_bar_seen: Set[str] = set()
-        self._same_bar_lock = asyncio.Lock()
+        # Thread-based lock to coordinate same-bar guard across worker threads
+        self._same_bar_thread_lock = threading.Lock()
+
+        # ── Parallelism: thread pool for blocking runner work ───────────────────
+        try:
+            conc_default = max(1, int(os.getenv("SIM_RUNNER_CONCURRENCY", "0")))
+        except Exception:
+            conc_default = 0
+        if conc_default <= 0:
+            try:
+                cpu = os.cpu_count() or 4
+            except Exception:
+                cpu = 4
+            conc_default = max(2, min(32, cpu * 2))
+        self._executor = ThreadPoolExecutor(max_workers=conc_default, thread_name_prefix="runner-worker")
 
     # ───────────────────────── internals ─────────────────────────
     def _get_candles_cached(
@@ -175,7 +191,7 @@ class RunnerService:
         age_sec = (as_of - last_ts).total_seconds()
         return age_sec > (tf_min * 60 + 1)
 
-    def _decide(self, ctx: _RunnerCtx, strategy_obj=None) -> dict:
+    def _decide(self, ctx: _RunnerCtx, strategy_obj=None, is_exit: Optional[bool] = None) -> dict:
         info = RunnerDecisionInfo(
             runner=ctx.runner,
             position=ctx.position,
@@ -184,7 +200,8 @@ class RunnerService:
             distance_from_time_limit=None,
         )
         strat = strategy_obj or select_strategy(ctx.runner)
-        raw = strat.decide_buy(info) if ctx.position is None else strat.decide_sell(info)
+        choose_exit = (is_exit if is_exit is not None else (ctx.position is not None))
+        raw = strat.decide_sell(info) if choose_exit else strat.decide_buy(info)
         decision = validate_decision(raw, is_exit=ctx.position is not None) or {"action": "NO_ACTION"}
 
         # Inject a static stop at BUY if strategy didn't provide any stop
@@ -260,9 +277,9 @@ class RunnerService:
         # default (legacy / broader): symbol + timeframe only
         return f"{sym}:{int(timeframe)}:{ts_i}"
 
-    async def _process_runner(self, r: RunnerView, as_of: datetime, seq: int, et_day: str) -> Tuple[Dict[str, int], Dict[str, Any]]:
+    def _process_runner_sync(self, r: RunnerView, as_of: datetime, seq: int, et_day: str, positions_map: Optional[Dict[int, Dict[str, Any]]] = None) -> Tuple[Dict[str, int], Dict[str, Any]]:
         stats_delta = defaultdict(int)
-        
+
         try:
             with DBManager() as db:
                 uid = r.user_id
@@ -287,13 +304,12 @@ class RunnerService:
 
                 last_ts = self._last_candle_ts(candles)
                 
-                # Broker tick for stop-loss
+                # Broker tick for stop-loss (only if a position exists)
                 price = float(candles[-1]["close"])
-                retc = self.broker.on_tick(user_id=uid, runner=r, price=price, at=as_of)
-                stats_delta["stop_cross_exits"] += int(retc.get("stop_cross_exits", 0))
-
-                db.db.expire_all()
-                pos: Optional[OpenPosition] = db.db.query(OpenPosition).filter(OpenPosition.runner_id == r.id).first()
+                has_position = bool((positions_map or {}).get(r.id))
+                if has_position:
+                    retc = self.broker.on_tick(user_id=uid, runner=r, price=price, at=as_of)
+                    stats_delta["stop_cross_exits"] += int(retc.get("stop_cross_exits", 0))
 
                 # Bar advance guard
                 bar_key = (r.id, tf)
@@ -307,18 +323,30 @@ class RunnerService:
                     return stats_delta, {"runner_id": r.id, "user_id": uid, "symbol": sym, "strategy": r.strategy, "status": "completed", "reason": "skipped-same-bar", "details": None, "execution_time": as_of, "cycle_seq": seq, "timeframe": tf}
 
                 # Strategy decision
-                ctx = _RunnerCtx(runner=r, position=pos, price=price, candles=candles)
-                decision = self._decide(ctx)
+                # Avoid per-runner DB fetch of OpenPosition in hot path; use prefetch presence
+                ctx = _RunnerCtx(runner=r, position=None, price=price, candles=candles)
+                decision = self._decide(ctx, is_exit=has_position)
                 action = (decision.get("action") or "NO_ACTION").upper()
 
-                details_payload = {"price": round(ctx.price, 6), "position_open": bool(ctx.position is not None), "timeframe_min": tf, "last_ts": last_ts.isoformat() if last_ts else None, "decision": {k: v for k, v in decision.items() if k != "action"}}
-                details_json = json.dumps(details_payload, ensure_ascii=False)
+                # Build details lazily only for actions that need it to reduce JSON overhead
+                def _build_details_json() -> str:
+                    payload = {
+                        "price": round(ctx.price, 6),
+                        "position_open": bool(has_position),
+                        "timeframe_min": tf,
+                        "last_ts": last_ts.isoformat() if last_ts else None,
+                        "decision": {k: v for k, v in decision.items() if k != "action"},
+                    }
+                    try:
+                        return json.dumps(payload, ensure_ascii=False)
+                    except Exception:
+                        return "{}"
 
-                if action == "BUY" and ctx.position is None:
+                if action == "BUY" and not has_position:
                     sb_key = self._same_bar_key(sym, tf, last_ts, r.strategy)
                     should_skip_buy = False
                     if sb_key:
-                        async with self._same_bar_lock:
+                        with self._same_bar_thread_lock:
                             if sb_key in self._same_bar_seen:
                                 should_skip_buy = True
                             else:
@@ -343,15 +371,15 @@ class RunnerService:
                         stats_delta["skipped_no_budget"] += 1
                         stats_delta["processed"] += 1
                         if last_ts: self._last_bar_ts[bar_key] = last_ts
-                        return stats_delta, {"runner_id": r.id, "user_id": uid, "symbol": sym, "strategy": r.strategy, "status": "skipped-no-budget", "reason": "broker_rejected_buy", "details": details_json, "execution_time": as_of, "cycle_seq": seq, "timeframe": tf}
+                        return stats_delta, {"runner_id": r.id, "user_id": uid, "symbol": sym, "strategy": r.strategy, "status": "skipped-no-budget", "reason": "broker_rejected_buy", "details": _build_details_json(), "execution_time": as_of, "cycle_seq": seq, "timeframe": tf}
                     
                     stats_delta["buys"] += 1
                     stats_delta["processed"] += 1
                     if last_ts: self._last_bar_ts[bar_key] = last_ts
                     self.health.mark_clean_pass(sym=sym, tf=tf)
-                    return stats_delta, {"runner_id": r.id, "user_id": uid, "symbol": sym, "strategy": r.strategy, "status": "completed", "reason": "buy", "details": details_json, "execution_time": as_of, "cycle_seq": seq, "timeframe": tf}
+                    return stats_delta, {"runner_id": r.id, "user_id": uid, "symbol": sym, "strategy": r.strategy, "status": "completed", "reason": "buy", "details": _build_details_json(), "execution_time": as_of, "cycle_seq": seq, "timeframe": tf}
 
-                elif action == "SELL" and ctx.position is not None:
+                elif action == "SELL" and has_position:
                     reason = str(decision.get("reason") or decision.get("explanation") or "strategy_sell")
                     ok = self.broker.sell_all(user_id=uid, runner=r, symbol=sym, price=ctx.price, decision=decision, at=as_of, reason_override=reason)
                     
@@ -364,14 +392,14 @@ class RunnerService:
                     
                     stats_delta["processed"] += 1
                     if last_ts: self._last_bar_ts[bar_key] = last_ts
-                    return stats_delta, {"runner_id": r.id, "user_id": uid, "symbol": sym, "strategy": r.strategy, "status": "completed" if ok else "error", "reason": "sell" if ok else "broker_sell_failed", "details": details_json, "execution_time": as_of, "cycle_seq": seq, "timeframe": tf}
+                    return stats_delta, {"runner_id": r.id, "user_id": uid, "symbol": sym, "strategy": r.strategy, "status": "completed" if ok else "error", "reason": "sell" if ok else "broker_sell_failed", "details": _build_details_json(), "execution_time": as_of, "cycle_seq": seq, "timeframe": tf}
 
                 else: # NO_ACTION
                     stats_delta["no_action"] += 1
                     stats_delta["processed"] += 1
                     if last_ts: self._last_bar_ts[bar_key] = last_ts
                     self.health.mark_clean_pass(sym=sym, tf=tf)
-                    return stats_delta, {"runner_id": r.id, "user_id": uid, "symbol": sym, "strategy": r.strategy, "status": "completed", "reason": str(decision.get("reason") or "no_action"), "details": None if self._thin_no_action_details else details_json, "execution_time": as_of, "cycle_seq": seq, "timeframe": tf}
+                    return stats_delta, {"runner_id": r.id, "user_id": uid, "symbol": sym, "strategy": r.strategy, "status": "completed", "reason": str(decision.get("reason") or "no_action"), "details": None if self._thin_no_action_details else _build_details_json(), "execution_time": as_of, "cycle_seq": seq, "timeframe": tf}
 
         except Exception:
             stats_delta["errors"] += 1
@@ -411,6 +439,7 @@ class RunnerService:
 
             runners_orm = db.get_runners_by_user(user_id=uid, activation="active")
             runners: List[RunnerView] = [self._snapshot_runner(r) for r in runners_orm]
+            positions_map = db.get_open_positions_map([rv.id for rv in runners])
 
         # On first tick, bootstrap coverage health
         if self._sim_boot_start is None:
@@ -426,8 +455,10 @@ class RunnerService:
         except Exception:
             et_day = as_of.date().isoformat()
 
-        tasks = [self._process_runner(r, as_of, seq, et_day) for r in runners]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        loop = asyncio.get_running_loop()
+        # Execute blocking runner work in a thread pool for true CPU/IO parallelism
+        futures = [loop.run_in_executor(self._executor, self._process_runner_sync, r, as_of, seq, et_day, positions_map) for r in runners]
+        results = await asyncio.gather(*futures, return_exceptions=True)
 
         for res in results:
             if isinstance(res, Exception):

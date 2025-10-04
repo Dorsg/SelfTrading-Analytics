@@ -110,14 +110,18 @@ def _apply_light_migrations() -> None:
         # 4b) Align chatgpt strategy name safely (avoid unique conflicts)
         try:
             with engine.begin() as conn:
-                # First, remove alias rows that would conflict with an existing canonical row
+                # Dialect-agnostic delete of aliases that would conflict with an existing canonical row
                 res_del = conn.execute(text(
                     """
-                    DELETE FROM runners r
-                    USING runners t
-                    WHERE TRIM(LOWER(r.strategy)) IN ('chatgpt5strategy', 'chatgpt 5 strategy', 'chatgpt-5-strategy')
-                      AND TRIM(LOWER(t.strategy)) = 'chatgpt_5_strategy'
-                      AND t.user_id = r.user_id AND t.stock = r.stock AND t.time_frame = r.time_frame
+                    DELETE FROM runners
+                     WHERE TRIM(LOWER(strategy)) IN ('chatgpt5strategy', 'chatgpt 5 strategy', 'chatgpt-5-strategy')
+                       AND EXISTS (
+                           SELECT 1 FROM runners t
+                            WHERE t.user_id = runners.user_id
+                              AND t.stock = runners.stock
+                              AND t.time_frame = runners.time_frame
+                              AND TRIM(LOWER(t.strategy)) = 'chatgpt_5_strategy'
+                       )
                     """
                 ))
                 removed = getattr(res_del, "rowcount", 0) or 0
@@ -127,12 +131,12 @@ def _apply_light_migrations() -> None:
                 # Then, update remaining alias rows to canonical where it won't create a duplicate
                 res_upd = conn.execute(text(
                     """
-                    UPDATE runners r
+                    UPDATE runners
                        SET strategy = 'chatgpt_5_strategy'
-                     WHERE TRIM(LOWER(r.strategy)) IN ('chatgpt5strategy', 'chatgpt 5 strategy', 'chatgpt-5-strategy')
+                     WHERE TRIM(LOWER(strategy)) IN ('chatgpt5strategy', 'chatgpt 5 strategy', 'chatgpt-5-strategy')
                        AND NOT EXISTS (
                            SELECT 1 FROM runners t
-                            WHERE t.user_id = r.user_id AND t.stock = r.stock AND t.time_frame = r.time_frame
+                            WHERE t.user_id = runners.user_id AND t.stock = runners.stock AND t.time_frame = runners.time_frame
                               AND TRIM(LOWER(t.strategy)) = 'chatgpt_5_strategy'
                        )
                     """
@@ -174,16 +178,20 @@ def _apply_light_migrations() -> None:
         # 4e) Normalize executed_trades strategy names to canonical (reporting consistency)
         try:
             with engine.begin() as conn:
-                res_et = conn.execute(text(
-                    """
-                    UPDATE executed_trades
-                       SET strategy = 'chatgpt_5_strategy'
-                     WHERE TRIM(LOWER(strategy)) IN ('chatgpt5strategy', 'chatgpt 5 strategy', 'chatgpt-5-strategy')
-                    """
-                ))
-                updated_et = getattr(res_et, "rowcount", 0) or 0
-                if updated_et:
-                    log.info("Light migrations: normalized %d executed_trades to 'chatgpt_5_strategy'.", updated_et)
+                insp = inspect(conn)
+                if insp.has_table("executed_trades"):
+                    cols = {c["name"] for c in insp.get_columns("executed_trades")}
+                    if "strategy" in cols:
+                        res_et = conn.execute(text(
+                            """
+                            UPDATE executed_trades
+                               SET strategy = 'chatgpt_5_strategy'
+                             WHERE TRIM(LOWER(strategy)) IN ('chatgpt5strategy', 'chatgpt 5 strategy', 'chatgpt-5-strategy')
+                            """
+                        ))
+                        updated_et = getattr(res_et, "rowcount", 0) or 0
+                        if updated_et:
+                            log.info("Light migrations: normalized %d executed_trades to 'chatgpt_5_strategy'.", updated_et)
         except Exception:
             log.exception("Light migrations: failed normalizing executed_trades strategy names")
 

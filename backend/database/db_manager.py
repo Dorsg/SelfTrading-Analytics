@@ -241,6 +241,40 @@ class DBManager(AbstractContextManager["DBManager"]):
             .first()
         )
 
+    def get_open_positions_map(self, runner_ids: List[int]) -> Dict[int, Dict[str, Any]]:
+        """
+        Bulk fetch open positions for the provided runner IDs, returning a mapping:
+            runner_id -> minimal position dict (for fast read-only decisions).
+
+        This avoids issuing N queries per tick when thousands of runners are active.
+        """
+        out: Dict[int, Dict[str, Any]] = {}
+        if not runner_ids:
+            return out
+        try:
+            rows = (
+                self._session.query(OpenPosition)
+                .filter(OpenPosition.runner_id.in_(list({int(r) for r in runner_ids})))
+                .all()
+            )
+            for p in rows:
+                try:
+                    out[int(getattr(p, "runner_id"))] = {
+                        "symbol": str(getattr(p, "symbol", "")).upper(),
+                        "quantity": float(getattr(p, "quantity", 0) or 0),
+                        "avg_price": float(getattr(p, "avg_price", 0) or 0),
+                        "created_at": getattr(p, "created_at", None),
+                        "stop_price": (None if getattr(p, "stop_price", None) is None else float(getattr(p, "stop_price"))),
+                        "trail_percent": (None if getattr(p, "trail_percent", None) is None else float(getattr(p, "trail_percent"))),
+                        "highest_price": (None if getattr(p, "highest_price", None) is None else float(getattr(p, "highest_price"))),
+                    }
+                except Exception:
+                    continue
+        except Exception:
+            # Non-fatal: return empty map on error to keep tick running
+            return {}
+        return out
+
     # ───────────────────────── Executions & results ─────────────────────────
 
     def bulk_upsert_runner_executions(self, rows):
@@ -454,7 +488,8 @@ class DBManager(AbstractContextManager["DBManager"]):
                 "timeframe": deduped_values[0]["timeframe"],
                 "status": deduped_values[0]["status"],
             }
-            logger_exec.info(
+            # Reduce log volume on hot path: success to DEBUG; warnings/errors stay higher
+            logger_exec.debug(
                 "UPSERT OK runner_executions: rows=%d dialect=%s conflict=%s example=%s",
                 len(deduped_values), dialect, ",".join(conflict_cols), sample
             )
