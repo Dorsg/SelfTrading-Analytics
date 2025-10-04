@@ -38,7 +38,7 @@ class Grok4Strategy:
     atr_period = 14
     fib_offset_ratio = 0.0    # No offset for easier fib condition
     volume_ma_period = 20
-    trail_min_pct = 1.0       # Slightly looser trail
+    trail_min_pct = 2.0       # Looser trail to survive noise
     trail_max_pct = 8.0
     limit_wiggle_rth = 0.0005
     limit_wiggle_xrth = float(os.getenv("XRTH_LIMIT_WIGGLE", "0.02"))
@@ -84,8 +84,8 @@ class Grok4Strategy:
         lookback_fib = min(50, len(candles))
         high = max(c['high'] for c in candles[-lookback_fib:])
         low = min(c['low'] for c in candles[-lookback_fib:])
-        fib_618 = low + (high - low) * 0.618  # Changed to extension for breakouts
-        entry_level = fib_618 * (1 + self.fib_offset_ratio)
+        fib_50 = low + (high - low) * 0.5  # Changed to 50% for easier triggers
+        entry_level = fib_50 * (1 + self.fib_offset_ratio)
         
         # Multi-TF
         higher_trend_ok = True
@@ -122,7 +122,8 @@ class Grok4Strategy:
         
         checklist = core_checks + enhancer_checks
         
-        if not all(c['ok'] for c in core_checks) or not any(c['ok'] for c in enhancer_checks):
+        core_met = sum(1 for c in core_checks if c['ok']) >= 4  # Relaxed: 4/5 core
+        if not core_met or not any(c['ok'] for c in enhancer_checks):
             return {"action": "NO_ACTION", "reason": "conditions_not_met", "checks": checklist}
         
         trail_pct = min(max((atr / price) * 100 * 1.5, self.trail_min_pct), self.trail_max_pct)  # Wider trail

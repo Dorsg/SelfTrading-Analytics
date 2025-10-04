@@ -1087,6 +1087,7 @@ def get_results_summary() -> dict:
         pnl_by_strategy_raw = {}
         for r in conn.execute(by_strat_q).mappings():
             pnl_by_strategy_raw[r.strategy] = {
+                "weighted_pct": float(r.weighted_pct or 0.0),
                 "avg_pct": float(r.avg_pct or 0.0),
                 "trades": int(r.trades or 0),
                 "win_rate_pct": float(r.win_rate_pct or 0.0),
@@ -1142,6 +1143,7 @@ def get_results_summary() -> dict:
                 "profit_factor": float(adv_data.get("profit_factor", 0.0)),
                 "max_drawdown_pct": float(adv_data.get("max_drawdown_pct", 0.0)),
                 "sharpe_ratio": float(adv_data.get("sharpe_ratio", 0.0)),
+                "weighted_pct": float(sql_data.get("weighted_pct", 0.0)),
                 "avg_pct": float(sql_data.get("avg_pct", 0.0)),
                 "trades": int(sql_data.get("trades", 0)),
                 "win_rate_pct": float(sql_data.get("win_rate_pct", 0.0)),

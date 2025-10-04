@@ -64,7 +64,7 @@ class ChatGPT5UltraStrategy:
     trail_max_pct = 9.0
 
     # Entry buffer (percent) above Donchian for cleaner breakouts
-    buy_buffer_pct = 0.05
+    buy_buffer_pct = 0.25
 
     # Regime and filters
     rs_period = 60  # relative strength lookback (same timeframe); daily used when tf=5
@@ -74,6 +74,11 @@ class ChatGPT5UltraStrategy:
     # Limit order wiggle by session
     limit_wiggle_rth = 0.0005
     limit_wiggle_xrth = float(os.getenv("XRTH_LIMIT_WIGGLE", "0.02"))
+
+    # Basic quality filters
+    min_price = 10.0  # avoid penny and microcaps
+    min_vol_5m = 50000.0  # avg 5m volume threshold
+    min_vol_1d = 1000000.0  # avg daily volume threshold
 
     def __init__(self, market_data: MarketDataManager | None = None) -> None:
         self.mkt = market_data or MarketDataManager()
@@ -132,6 +137,21 @@ class ChatGPT5UltraStrategy:
                 "checks": [{"label": "Indicators valid", "ok": False, "actual": "NaN/None", "wanted": "valid"}],
             }
 
+        # Basic liquidity/price gates
+        tf = int(getattr(info.runner, "time_frame", 5) or 5)
+        min_vol_gate = (self.min_vol_5m if tf == 5 else self.min_vol_1d)
+        if price < self.min_price or (vol_ma is not None and vol_ma < min_vol_gate):
+            return {
+                "action": "NO_ACTION",
+                "reason": "liquidity_price_filter",
+                "price": round(price, 4),
+                "explanation": f"price>={self.min_price} and vol_ma>={min_vol_gate} required",
+                "checks": [
+                    {"label": "Min price", "ok": price >= self.min_price, "actual": price, "wanted": self.min_price, "direction": ">="},
+                    {"label": "Avg volume", "ok": vol_ma >= min_vol_gate if vol_ma is not None else False, "actual": vol_ma, "wanted": min_vol_gate, "direction": ">="},
+                ],
+            }
+
         # Squeeze: current BB width vs recent widths
         squeeze_ok = False
         try:
@@ -186,10 +206,13 @@ class ChatGPT5UltraStrategy:
         rs_ok = (rs_val is None) or (rs_val >= self.min_rs_pct)
         rv_ok = (rv == rv) and (rv <= self.max_realized_vol_pct)
 
-        # Score-based acceptance: breakout+trend with confirmations, or high-quality pullback
+        # Score-based acceptance: tighter gates to reduce false positives
         primary_signals = [trend_ok, breakout_ok, momentum_ok, macd_ok, vol_ok, rs_ok, rv_ok]
         score = sum(bool(x) for x in primary_signals) + (1 if squeeze_ok else 0)
-        accept = ((breakout_ok and trend_ok and rs_ok and rv_ok and (score >= 5)) or (pullback_ready and macd_ok and rs_daily_ok))
+        accept = (
+            (breakout_ok and trend_ok and vol_ok and rs_ok and rv_ok and (score >= 6) and (squeeze_ok or macd_ok))
+            or (pullback_ready and macd_ok and rs_daily_ok and squeeze_ok)
+        )
 
         checklist = [
             {"label": "Trend (EMA50>EMA200 & px>EMA200)", "ok": trend_ok, "actual": price, "wanted": ema_slow},
@@ -216,7 +239,7 @@ class ChatGPT5UltraStrategy:
 
         # Order details
         atr_pct = (atr / price) * 100.0 if price > 0 else self.trail_min_pct
-        widen = 1.35 if (rv == rv and rv > 3.5) else 1.15
+        widen = 1.25 if (rv == rv and rv > 3.5) else 1.10
         trail_pct = min(max(atr_pct * widen, self.trail_min_pct), self.trail_max_pct)
         session = getattr(self.mkt, "_last_session", (None, "regular-hours"))[1]
         wiggle = self.limit_wiggle_xrth if session == "extended-hours" else self.limit_wiggle_rth
@@ -278,13 +301,13 @@ class ChatGPT5UltraStrategy:
             }
 
         # Discretionary exit if strong deterioration or profit fade
-        trend_break = price < ema_slow
-        momentum_break = (rsi == rsi and rsi < 38.0)
+        trend_break = price < ema_fast  # react faster on deterioration
+        momentum_break = (rsi == rsi and rsi < 45.0)
         macd_bearish = (macd_line is not None and macd_sig is not None and macd_line < macd_sig * 0.99)
         up_pct = 0.0
         if info.position and getattr(info.position, "avg_price", 0) > 0:
             up_pct = (price - info.position.avg_price) / info.position.avg_price * 100.0
-        profit_fade = (up_pct > 8.0) and (price < ema_fast)
+        profit_fade = (up_pct > 5.0) and (price < ema_fast)
         discretionary_exit = (trend_break and (momentum_break or macd_bearish)) or profit_fade
 
         session = getattr(self.mkt, "_last_session", (None, "regular-hours"))[1]
@@ -292,7 +315,7 @@ class ChatGPT5UltraStrategy:
         limit_price = price * (1 - wiggle)
 
         atr_pct = (atr / price) * 100.0 if price > 0 else self.trail_min_pct
-        widen = 1.35 if (price < ema_fast) else 1.1
+        widen = 1.0 if (price < ema_fast) else 1.15  # tighter stop when below EMA50
         trail_pct = min(max(atr_pct * widen, self.trail_min_pct), self.trail_max_pct)
 
         if discretionary_exit:

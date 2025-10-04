@@ -31,7 +31,7 @@ class Gemini25ProStrategy:
     # Stochastic Oscillator settings
     stoch_k_period = 14
     stoch_d_period = 3
-    stoch_oversold = 30.0
+    stoch_oversold = 40.0  # Relaxed from 30
     stoch_overbought = 80.0
 
     # Bollinger Bands settings
@@ -61,6 +61,14 @@ class Gemini25ProStrategy:
         symbol = (getattr(info.runner, "stock", None) or "").upper()
         price = float(info.current_price)
         candles = info.candles or []
+
+        # Improvement: Add a price filter to avoid penny stocks
+        if price < 10.0:
+            return {
+                "action": "NO_ACTION",
+                "reason": "price_too_low",
+                "explanation": f"Price {price} is below the minimum threshold of $10",
+            }
 
         min_bars = max(
             self.macd_slow_period + self.macd_signal_period,
@@ -111,7 +119,7 @@ class Gemini25ProStrategy:
             }
         
         # Buy conditions
-        trend_ok = macd_line > signal_line
+        trend_ok = macd_line > signal_line and macd_line > 0 and signal_line > 0 # Added check for > 0
         momentum_ok = stoch_k < self.stoch_oversold
         
         # Volatility: previous close below lower BB, current price above it
@@ -123,7 +131,7 @@ class Gemini25ProStrategy:
         volume_ok = current_volume > volume_ma
 
         checklist = [
-            {"label": "Trend (MACD > Signal)", "ok": trend_ok},
+            {"label": "Trend (MACD > Signal & > 0)", "ok": trend_ok},
             {"label": f"Momentum (Stoch %K < {self.stoch_oversold})", "ok": momentum_ok},
             {"label": "Volatility (BB Bounce)", "ok": volatility_ok},
             {"label": f"RSI (< {self.rsi_oversold})", "ok": rsi_ok},

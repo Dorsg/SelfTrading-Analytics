@@ -226,7 +226,9 @@ class MockBroker:
 
             # ExecutedTrade roll-up
             pnl_amt = (exec_price - avg) * q - (self.commission * 2) # Commission on buy and sell
-            pnl_pct = 0.0 if avg == 0 else (exec_price / avg - 1.0) * 100.0
+            cost_basis = avg * q
+            pnl_pct = (pnl_amt / cost_basis) * 100.0 if cost_basis > 0 else 0.0
+
             trade = ExecutedTrade(
                 user_id=user_id,
                 runner_id=rid,

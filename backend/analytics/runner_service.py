@@ -377,7 +377,26 @@ class RunnerService:
                         stats_delta["processed"] += 1
                         if last_ts: self._last_bar_ts[bar_key] = last_ts
                         return stats_delta, {"runner_id": r.id, "user_id": uid, "symbol": sym, "strategy": r.strategy, "status": "skipped-no-budget", "reason": "broker_rejected_buy", "details": _build_details_json(), "execution_time": as_of, "cycle_seq": seq, "timeframe": tf}
-                    
+
+                    # Arm trailing stop once if strategy specified it (idempotent)
+                    try:
+                        tspec = decision.get("trail_stop_order")
+                        if isinstance(tspec, dict):
+                            tp = tspec.get("trailing_percent")
+                            if tp is None:
+                                tp = tspec.get("trailing_amount")
+                            tp = float(tp or 0.0)
+                            if tp > 0.0:
+                                self.broker.arm_trailing_stop_once(
+                                    user_id=uid,
+                                    runner=r,
+                                    entry_price=ctx.price,
+                                    trail_pct=tp,
+                                    at=as_of,
+                                )
+                    except Exception:
+                        log.exception("Failed to arm trailing stop for runner_id=%s", rid)
+
                     stats_delta["buys"] += 1
                     stats_delta["processed"] += 1
                     if last_ts: self._last_bar_ts[bar_key] = last_ts

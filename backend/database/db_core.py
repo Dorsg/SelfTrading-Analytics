@@ -150,22 +150,23 @@ SessionLocal = scoped_session(sessionmaker(bind=engine, autocommit=False, autofl
 
 
 def wait_for_db_ready(max_wait_seconds: int | None = None) -> None:
-    """
-    Ping the DB until it responds or time elapses.
-    max_wait_seconds: environment DB_CONNECT_MAX_WAIT (default 30) if None.
-    """
-    deadline = time.monotonic() + int(os.getenv("DB_CONNECT_MAX_WAIT", "30") if max_wait_seconds is None else max_wait_seconds)
-    attempt = 0
+    """Blocks until the DB is reachable, with backoff."""
+    max_wait = int(os.getenv("DB_MAX_WAIT_SECONDS", "60"))
+    if max_wait_seconds is not None:
+        max_wait = max_wait_seconds
+    
+    start_time = time.time()
     while True:
-        attempt += 1
         try:
             with engine.connect() as conn:
                 conn.execute(text("SELECT 1"))
-            if attempt > 1:
-                log.info("Database is ready (after %d attempts).", attempt)
+            log.info("database.db_core: Database is ready.")
             return
         except Exception as e:
-            if time.monotonic() >= deadline:
-                log.error("Database not ready after retries: %s", e)
-                raise
-            time.sleep(min(0.5 * attempt, 3.0))
+            elapsed = time.time() - start_time
+            if elapsed > max_wait:
+                log.error("database.db_core: Database did not become ready in %s seconds.", max_wait)
+                raise e
+            
+            log.warning("database.db_core: DB not ready yet, retrying... (%s)", str(e).splitlines()[0])
+            time.sleep(min(max(1.0, elapsed / 3.0), 10.0))

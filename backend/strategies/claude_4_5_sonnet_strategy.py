@@ -61,11 +61,11 @@ class Claude45SonnetStrategy:
     volume_ma_period = 20
     volume_surge_multiplier = 1.2  # 20% above average (more lenient)
     
-    # ATR for risk management - TIGHTER
+    # ATR for risk management - BALANCED for trend following
     atr_period = 14
-    trail_min_pct = 0.5       # Tighter trailing stop
-    trail_max_pct = 4.5       # Reduced max
-    atr_multiplier = 1.8      # Closer stop
+    trail_min_pct = 2.0       # Wider stop to survive noise (was 0.5%)
+    trail_max_pct = 8.0       # Allow more room in volatile markets (was 4.5%)
+    atr_multiplier = 2.5      # Give trends room to breathe (was 1.8)
     
     # Price action
     min_bars_for_trend = 5    # Look at last N bars for trend
@@ -236,21 +236,21 @@ class Claude45SonnetStrategy:
         bb_width_pct = ((bb_upper - bb_lower) / bb_middle) * 100.0 if bb_middle > 0 else 0
         trending_regime = bb_width_pct > 3.0  # Wide bands = trending
         
-        # ========== SCORING SYSTEM ==========
-        # Core requirements (must have)
-        core_passed = perfect_trend and rsi_momentum_ok
+        # ========== SCORING SYSTEM ========== 
+        # Core requirements (RELAXED: trend OR rsi, not both)
+        core_passed = perfect_trend or rsi_momentum_ok
         
-        # Breakout signals (need at least 2 of 3)
+        # Breakout signals (RELAXED: need at least 1 of 3, was 2)
         breakout_signals = sum([breakout_ok, squeeze_ok, momentum_ok])
         
-        # Confirmation signals (need at least 2 of 3)
+        # Confirmation signals (RELAXED: need at least 1 of 3, was 2)
         confirmation_signals = sum([macd_bullish, volume_ok, macd_positive])
         
-        # Overall acceptance logic
+        # Overall acceptance logic (RELAXED: allow more entries)
         accept_trade = (
             core_passed and 
-            breakout_signals >= 2 and 
-            confirmation_signals >= 2
+            breakout_signals >= 1 and 
+            confirmation_signals >= 1
         )
 
         checklist = [
@@ -370,43 +370,43 @@ class Claude45SonnetStrategy:
                 "checks": [{"label": "ATR valid", "ok": False, "actual": "NaN", "wanted": "valid"}],
             }
 
-        # ========== DISCRETIONARY EXIT CONDITIONS ==========
+        # ========== DISCRETIONARY EXIT CONDITIONS (SOFTENED) ==========
         
-        # 1. TREND BREAKDOWN: Price breaks below key EMAs
-        trend_break_fast = price < ema_fast * 0.98  # 2% below fast EMA
-        trend_break_mid = price < ema_mid * 0.97    # 3% below mid EMA
-        trend_break_slow = price < ema_slow         # Below slow EMA
+        # 1. TREND BREAKDOWN: Price breaks below key EMAs (SOFTENED thresholds)
+        trend_break_fast = price < ema_fast * 0.95  # 5% below fast EMA (was 2%)
+        trend_break_mid = price < ema_mid * 0.93    # 7% below mid EMA (was 3%)
+        trend_break_slow = price < ema_slow * 0.95  # 5% below slow EMA (was 0%)
         
-        # 2. MOMENTUM REVERSAL: RSI or MACD turning negative
-        rsi_weak = rsi is not None and rsi < 40.0   # RSI dropping
+        # 2. MOMENTUM REVERSAL: RSI or MACD turning negative (SOFTENED)
+        rsi_weak = rsi is not None and rsi < 30.0   # RSI very weak (was 40)
         macd_bearish = (macd_line is not None and macd_sig is not None and 
-                        macd_line < macd_sig * 0.98)  # MACD crossing down
+                        macd_line < macd_sig * 0.95)  # MACD strongly bearish (was 0.98)
         
-        # 3. EXTREME OVERBOUGHT: Lock in profits
+        # 3. EXTREME OVERBOUGHT: Lock in profits (UNCHANGED - reasonable)
         rsi_extreme = rsi is not None and rsi > 85.0
         
-        # 4. LOSS OF MOMENTUM: Check recent price action
+        # 4. LOSS OF MOMENTUM: Check recent price action (SOFTENED threshold)
         momentum_score = self._detect_price_momentum(candles) if len(candles) >= self.min_bars_for_trend + 1 else 0.5
-        momentum_lost = momentum_score < 0.3  # Dropping momentum
+        momentum_lost = momentum_score < 0.15  # Very low momentum only (was 0.3)
         
-        # 5. VOLATILITY SPIKE: Unusual volatility suggests danger
+        # 5. VOLATILITY SPIKE: Unusual volatility suggests danger (SOFTENED)
         bb_upper, bb_middle, bb_lower = self.mkt.calculate_bollinger_bands(candles, self.bb_period, self.bb_std)
-        price_near_lower = (bb_lower is not None and price <= bb_lower * 1.02)  # Near lower band
+        price_near_lower = (bb_lower is not None and price <= bb_lower * 0.98)  # Well below lower band (was 1.02)
         
-        # ========== EXIT DECISION MATRIX ==========
+        # ========== EXIT DECISION MATRIX (REQUIRE MULTIPLE CONFIRMATIONS) ==========
         
-        # Critical exits (immediate sell)
+        # Critical exits (immediate sell) - REQUIRE 2 STRONG SIGNALS NOW
         critical_exit = (
-            (trend_break_mid and macd_bearish) or  # Breaking mid EMA + MACD bearish
-            (trend_break_fast and rsi_weak) or      # Breaking fast EMA + weak RSI
-            (price_near_lower and momentum_lost)    # Near BB lower + losing momentum
+            (trend_break_mid and trend_break_slow and macd_bearish) or  # Multiple EMA breaks + MACD
+            (trend_break_fast and trend_break_mid and rsi_weak) or      # 2 EMA breaks + very weak RSI
+            (price_near_lower and momentum_lost and macd_bearish)       # BB + momentum + MACD all bearish
         )
         
-        # Profit protection (lock gains)
-        profit_protection = rsi_extreme or (trend_break_fast and rsi_weak)
+        # Profit protection (lock gains) - ONLY on extreme overbought
+        profit_protection = rsi_extreme
         
-        # Moderate weakness (tighten stops)
-        moderate_weakness = trend_break_fast or macd_bearish or rsi_weak
+        # Moderate weakness (tighten stops) - REMOVED, let trailing stops do the work
+        moderate_weakness = False
         
         session = getattr(self.mkt, "_last_session", (None, "regular-hours"))[1]
         wiggle = self.limit_wiggle_xrth if session == "extended-hours" else self.limit_wiggle_rth
@@ -450,14 +450,11 @@ class Claude45SonnetStrategy:
                 ],
             }
         
-        # Calculate adaptive trailing stop - TIGHTER than before
+        # Calculate adaptive trailing stop - BALANCED for trend following
         atr_pct = (atr / price) * 100.0 if price > 0 else self.trail_min_pct
         
-        # If moderate weakness, tighten the trail even more
-        if moderate_weakness:
-            trail_pct = min(max(atr_pct * 1.2, self.trail_min_pct), self.trail_max_pct * 0.7)
-        else:
-            trail_pct = min(max(atr_pct * self.atr_multiplier, self.trail_min_pct), self.trail_max_pct)
+        # Use standard trailing stop (removed tightening logic)
+        trail_pct = min(max(atr_pct * self.atr_multiplier, self.trail_min_pct), self.trail_max_pct)
 
         res = {
             "action": "SELL",
@@ -465,16 +462,15 @@ class Claude45SonnetStrategy:
             "price": round(price, 4),
             "limit_price": round(limit_price, 4),
             "trail_percent": round(trail_pct, 2),
-            "explanation": f"Trailing stop at {trail_pct:.2f}% ({'TIGHTENED' if moderate_weakness else 'normal'})",
+            "explanation": f"Trailing stop at {trail_pct:.2f}% (ATR-based adaptive)",
             "checks": [
                 {"label": "ATR-based adaptive trail", "ok": True, "actual": trail_pct, "wanted": "optimized"},
-                {"label": "Moderate weakness detected", "ok": moderate_weakness, "actual": "Yes" if moderate_weakness else "No"},
             ],
         }
         
         log.debug(
-            "SELL %s @ %s (limit=%s, trail=%s%%, weakness=%s) - Trailing mode",
-            symbol, res["price"], res["limit_price"], res["trail_percent"], moderate_weakness
+            "SELL %s @ %s (limit=%s, trail=%s%%) - Trailing mode with wider stops",
+            symbol, res["price"], res["limit_price"], res["trail_percent"]
         )
         return res
 

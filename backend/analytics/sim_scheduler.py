@@ -14,7 +14,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..',
 from backend.logger_config import setup_logging  # ensure file handlers & levels
 from database.db_manager import DBManager
 from database.models import SimulationState
-from database.db_core import engine
+from database.db_core import engine, wait_for_db_ready
 from backend.analytics.runner_service import RunnerService
 from backend.ib_manager.market_data_manager import MarketDataManager
 from backend.universe import UniverseManager
@@ -217,6 +217,7 @@ def _ts(dt: datetime | None) -> int | None:
 async def main() -> None:
     # Ensure tiny migrations also run when the scheduler/runner is started without the API process.
     try:
+        wait_for_db_ready()
         from backend.database.init_db import _apply_light_migrations
         _apply_light_migrations()
     except Exception:
