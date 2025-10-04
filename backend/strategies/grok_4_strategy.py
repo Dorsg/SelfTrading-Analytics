@@ -29,20 +29,29 @@ class Grok4Strategy:
     
     name = "Grok4Strategy"
     
-    # Internal config - shorter periods for more frequent signals
-    ma_short_period = 20      # Short MA for momentum
-    ma_long_period = 20       # Long MA for trend (easier data requirement)
+    # Internal config - adjusted for better performance
+    ma_short_period = 20      # Short EMA for momentum
+    ma_long_period = 50       # Longer SMA for trend
     rsi_period = 14
-    rsi_low = 40.0            # Lower threshold for more entries
-    rsi_high = 75.0           # Avoid extreme overbought
+    rsi_low = 30.0            # Adjusted lower
+    rsi_high = 80.0           # Higher to allow momentum
     atr_period = 14
-    fib_offset_ratio = 0.10   # Reduced for more triggers
-    volume_ma_period = 20     # Volume confirmation
-    trail_min_pct = 0.5
-    trail_max_pct = 6.0
+    fib_offset_ratio = 0.0    # No offset for easier fib condition
+    volume_ma_period = 20
+    trail_min_pct = 1.0       # Slightly looser trail
+    trail_max_pct = 8.0
     limit_wiggle_rth = 0.0005
     limit_wiggle_xrth = float(os.getenv("XRTH_LIMIT_WIGGLE", "0.02"))
     
+    # New parameters
+    macd_fast = 12
+    macd_slow = 26
+    macd_signal = 9
+    bb_period = 20
+    bb_std = 2.0
+    rsi_overbought = 75.0     # Tighten for sells
+    take_profit_pct = 15.0    # Higher target
+
     def __init__(self, market_data: MarketDataManager | None = None) -> None:
         self.mkt = market_data or MarketDataManager()
     
@@ -56,62 +65,73 @@ class Grok4Strategy:
             self.rsi_period + 1,
             self.atr_period + 1,
             self.volume_ma_period + 1,
+            self.macd_slow + self.macd_signal + 1,
+            self.bb_period + 1,
         )
         if len(candles) < min_bars:
-            res = {
-                "action": "NO_ACTION",
-                "reason": "insufficient_data",
-                "explanation": f"Need at least {min_bars} bars",
-                "checks": [
-                    {"label": "Minimum bars", "ok": False, "actual": len(candles), "wanted": min_bars, "direction": ">="}
-                ],
-            }
-            log.debug("Grok4Strategy.decide_buy insufficient data symbol=%s required=%d have=%d", symbol, min_bars, len(candles))
-            return res
+            return {"action": "NO_ACTION", "reason": "insufficient_data"}
         
-        # Calculate indicators
+        # Indicators
         ma_short = self.mkt.calculate_ema(candles, self.ma_short_period)
         ma_long = self.mkt.calculate_sma(candles, self.ma_long_period)
         rsi = self.mkt.calculate_rsi(candles, self.rsi_period)
         atr = self.mkt.calculate_atr(candles, self.atr_period)
         volume_ma = self.mkt.average_volume(candles, self.volume_ma_period)
+        macd_line, signal_line = self.mkt.calculate_macd(candles, self.macd_fast, self.macd_slow, self.macd_signal)
+        bb_upper, bb_middle, bb_lower = self.mkt.calculate_bollinger_bands(candles, self.bb_period, self.bb_std)
         
-        # Simple fib calculation - adapt from fibonacci strategy
-        high = max(c['high'] for c in candles[-50:])
-        low = min(c['low'] for c in candles[-50:])
-        fib_618 = high - (high - low) * 0.618
+        # Fib
+        lookback_fib = min(50, len(candles))
+        high = max(c['high'] for c in candles[-lookback_fib:])
+        low = min(c['low'] for c in candles[-lookback_fib:])
+        fib_618 = low + (high - low) * 0.618  # Changed to extension for breakouts
         entry_level = fib_618 * (1 + self.fib_offset_ratio)
         
-        # Conditions - looser for more triggers
+        # Multi-TF
+        higher_trend_ok = True
+        if getattr(info.runner, "time_frame", 5) == 5:
+            daily_lookback = 50  # Reduced
+            daily_candles = self.mkt.get_candles_until(symbol, 1440, candles[-1]['ts'], lookback=daily_lookback)
+            if len(daily_candles) >= daily_lookback:
+                daily_ema = self.mkt.calculate_ema(daily_candles, daily_lookback)
+                higher_trend_ok = price > daily_ema
+            # Fallback to True if insufficient data
+        
+        # Conditions - require core, optional enhancers
         trend_ok = price > ma_long and ma_short > ma_long
-        momentum_ok = self.rsi_low < rsi < self.rsi_high
-        volume_ok = candles[-1]['volume'] > volume_ma * 1.2  # 20% above MA
+        momentum_ok = rsi > self.rsi_low  # Only lower bound for momentum
+        macd_ok = macd_line > signal_line if macd_line is not None and signal_line is not None else False
         fib_ok = price > entry_level
         
-        checklist = [
-            {"label": "Trend (price > MA long)", "ok": trend_ok, "actual": price, "wanted": ma_long},
-            {"label": "Momentum (RSI in range)", "ok": momentum_ok, "actual": rsi, "wanted": (self.rsi_low, self.rsi_high), "direction": "range"},
-            {"label": "Volume breakout", "ok": volume_ok, "actual": candles[-1]['volume'], "wanted": volume_ma * 1.2},
-            {"label": "Fib entry", "ok": fib_ok, "actual": price, "wanted": entry_level},
+        # Enhancers (at least one for entry)
+        volume_ok = candles[-1]['volume'] > volume_ma * 1.1
+        bb_breakout_ok = price > bb_upper if bb_upper is not None else False
+        
+        core_checks = [
+            {"label": "Trend", "ok": trend_ok},
+            {"label": "Momentum (RSI > 30)", "ok": momentum_ok},
+            {"label": "MACD bullish", "ok": macd_ok},
+            {"label": "Fib extension", "ok": fib_ok},
+            {"label": "Higher TF", "ok": higher_trend_ok},
         ]
         
-        if not all(item['ok'] for item in checklist):
-            res = {
-                "action": "NO_ACTION",
-                "reason": "conditions_not_met",
-                "explanation": format_checklist(checklist),
-                "checks": checklist,
-            }
-            log.debug("Grok4Strategy.decide_buy conditions not met symbol=%s checklist=%s", symbol, checklist)
-            return res
+        enhancer_checks = [
+            {"label": "Volume surge", "ok": volume_ok},
+            {"label": "BB breakout", "ok": bb_breakout_ok},
+        ]
         
-        # Calculate order details
-        trail_pct = min(max((atr / price) * 100, self.trail_min_pct), self.trail_max_pct)
-        session  = self.mkt._last_session[1] if getattr(self.mkt, "_last_session", None) else None
+        checklist = core_checks + enhancer_checks
+        
+        if not all(c['ok'] for c in core_checks) or not any(c['ok'] for c in enhancer_checks):
+            return {"action": "NO_ACTION", "reason": "conditions_not_met", "checks": checklist}
+        
+        trail_pct = min(max((atr / price) * 100 * 1.5, self.trail_min_pct), self.trail_max_pct)  # Wider trail
+        
+        session = self.mkt._last_session[1] if hasattr(self.mkt, "_last_session") else "regular-hours"
         wiggle = self.limit_wiggle_xrth if session == "extended-hours" else self.limit_wiggle_rth
         limit_price = price * (1 + wiggle)
         
-        res = {
+        return {
             "action": "BUY",
             "order_type": "LMT",
             "price": round(price, 4),
@@ -124,47 +144,46 @@ class Grok4Strategy:
             "explanation": format_checklist(checklist),
             "checks": checklist,
         }
-        log.debug("Grok4Strategy.decide_buy BUY symbol=%s price=%s limit=%s trail_pct=%s", symbol, res["price"], res["limit_price"], res["trail_stop_order"]["trailing_percent"])
-        return res
     
     def decide_sell(self, info: RunnerDecisionInfo) -> Dict[str, Any]:
         symbol = (getattr(info.runner, "stock", None) or "").upper()
         price = float(info.current_price)
         candles = info.candles or []
+        position = info.position
         
-        if len(candles) < self.atr_period + 1:
+        if len(candles) < max(self.rsi_period, self.macd_slow + self.macd_signal) or position is None:
+            return {"action": "NO_ACTION", "reason": "insufficient_data_or_no_position"}
+        
+        rsi = self.mkt.calculate_rsi(candles, self.rsi_period)
+        macd_line, signal_line = self.mkt.calculate_macd(candles, self.macd_fast, self.macd_slow, self.macd_signal)
+        
+        current_gain = ((price - position.avg_price) / position.avg_price * 100) if position.avg_price > 0 else 0
+        
+        overbought = rsi > self.rsi_overbought
+        bearish_macd = macd_line < signal_line if macd_line is not None and signal_line is not None else False
+        take_profit = current_gain > self.take_profit_pct
+        
+        checklist = [
+            {"label": f"Overbought (RSI > {self.rsi_overbought})", "ok": overbought},
+            {"label": "Bearish MACD", "ok": bearish_macd},
+            {"label": f"Take profit (>{self.take_profit_pct}%)", "ok": take_profit},
+        ]
+        
+        if overbought and bearish_macd or take_profit:  # Require confirmation for overbought
+            session = self.mkt._last_session[1] if hasattr(self.mkt, "_last_session") else "regular-hours"
+            wiggle = self.limit_wiggle_xrth if session == "extended-hours" else self.limit_wiggle_rth
+            limit_price = price * (1 - wiggle)
+            
             return {
-                "action": "NO_ACTION",
-                "reason": "insufficient_data",
-                "explanation": f"Need at least {self.atr_period + 1} bars for ATR",
-                "checks": [
-                    {"label": "Minimum bars for ATR", "ok": False, "actual": len(candles), "wanted": self.atr_period + 1, "direction": ">="}
-                ],
+                "action": "SELL",
+                "order_type": "LMT",
+                "price": round(price, 4),
+                "limit_price": round(limit_price, 4),
+                "explanation": format_checklist(checklist),
+                "checks": checklist,
             }
         
-        atr = self.mkt.calculate_atr(candles, self.atr_period)
-        if atr is None:
-            return {
-                "action": "NO_ACTION",
-                "reason": "indicator_unavailable",
-                "explanation": "ATR indicator unavailable",
-                "checks": [{"label": "ATR valid", "ok": False, "actual": "None", "wanted": "valid"}],
-            }
-        
-        trail_pct = min(max((atr / price) * 100, self.trail_min_pct), self.trail_max_pct)
-        session  = self.mkt._last_session[1] if getattr(self.mkt, "_last_session", None) else None
-        wiggle = self.limit_wiggle_xrth if session == "extended-hours" else self.limit_wiggle_rth
-        limit_price = price * (1 - wiggle)
-        
-        return {
-            "action": "SELL",
-            "order_type": "LMT",
-            "price": round(price, 4),
-            "limit_price": round(limit_price, 4),
-            "trail_percent": round(trail_pct, 2),
-            "explanation": f"SELL SIGNAL - Trailing stop at {trail_pct:.2f}% below current price",
-            "checks": [{"label": "ATR-based trail", "ok": True, "actual": trail_pct, "wanted": "within min/max"}],
-        }
+        return {"action": "NO_ACTION", "reason": "no_sell_signal"}
 
     def decide_refresh(self, info: RunnerDecisionInfo) -> Dict[str, Any] | None:
         return {"action": "NO_ACTION", "reason": "no_refresh_logic"}

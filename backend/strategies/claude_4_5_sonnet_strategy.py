@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import logging
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 from backend.ib_manager.market_data_manager import MarketDataManager
 from backend.strategies.explain import format_checklist
@@ -13,56 +13,62 @@ log = logging.getLogger("claude-4-5-sonnet-strategy")
 
 class Claude45SonnetStrategy:
     """
-    Advanced multi-indicator strategy combining:
-      • MACD for trend direction and momentum
-      • Bollinger Bands for mean reversion entries
-      • RSI for overbought/oversold conditions
-      • Stochastic for precise entry timing
-      • Volume confirmation for breakout validation
-      • Adaptive ATR-based trailing stops
-      • Multi-timeframe trend alignment
+    Elite quantitative strategy optimized for maximum profitability.
     
-    Philosophy: Buy quality dips in strong trends with multiple confirmations.
-    The strategy aims for high win-rate by waiting for confluence of signals.
+    Core Strategy:
+      • Trend-following with momentum breakouts (NOT mean reversion)
+      • Multiple timeframe confluence (EMA 20, 50, 200)
+      • Donchian breakout + Bollinger squeeze for entries
+      • RSI momentum filter (trending, not oversold)
+      • MACD confirmation for trend strength
+      • Volume surge validation
+      • Adaptive ATR stops with tighter ranges
+      • Dynamic profit targets based on volatility
+      • Market regime detection (trending vs choppy)
+    
+    Philosophy: Catch strong momentum moves with tight risk management.
+    Enter on confirmed breakouts in strong trends, exit quickly on weakness.
     """
 
     name = "Claude45SonnetStrategy"
 
-    # Trend indicators
-    ema_fast_period = 12
-    ema_slow_period = 26
-    ema_trend_period = 50
+    # Multi-timeframe trend
+    ema_fast_period = 20      # Short-term trend
+    ema_mid_period = 50       # Medium-term trend
+    ema_slow_period = 200     # Long-term trend
     
-    # MACD settings
+    # Breakout detection
+    donchian_period = 40      # Breakout channel
+    breakout_buffer_pct = 0.15  # % above high to confirm breakout
+    
+    # MACD settings (standard)
     macd_fast = 12
     macd_slow = 26
     macd_signal = 9
     
-    # Bollinger Bands
+    # Bollinger Bands for squeeze detection
     bb_period = 20
     bb_std = 2.0
+    squeeze_lookback = 50     # Bars to assess squeeze
+    squeeze_threshold = 0.25  # Low volatility percentile
     
-    # RSI settings
+    # RSI settings - MOMENTUM focused
     rsi_period = 14
-    rsi_oversold = 35.0  # Buy when RSI dips below this in uptrend
-    rsi_overbought = 70.0  # Avoid buying when too hot
-    
-    # Stochastic Oscillator
-    stoch_k_period = 14
-    stoch_d_period = 3
-    stoch_oversold = 25.0
+    rsi_momentum_min = 50.0   # Want RSI trending UP, not oversold
+    rsi_momentum_max = 85.0   # Avoid extreme overbought
     
     # Volume
     volume_ma_period = 20
-    volume_surge_multiplier = 1.3  # Volume should be 30% above average
+    volume_surge_multiplier = 1.2  # 20% above average (more lenient)
     
-    # ATR for risk management
+    # ATR for risk management - TIGHTER
     atr_period = 14
-    trail_min_pct = 0.8
-    trail_max_pct = 7.0
+    trail_min_pct = 0.5       # Tighter trailing stop
+    trail_max_pct = 4.5       # Reduced max
+    atr_multiplier = 1.8      # Closer stop
     
-    # Position sizing multiplier based on signal strength
-    atr_stop_multiplier = 2.5  # Stop loss at 2.5x ATR below entry
+    # Price action
+    min_bars_for_trend = 5    # Look at last N bars for trend
     
     limit_wiggle_rth = 0.0005
     limit_wiggle_xrth = float(os.getenv("XRTH_LIMIT_WIGGLE", "0.02"))
@@ -70,17 +76,65 @@ class Claude45SonnetStrategy:
     def __init__(self, market_data: MarketDataManager | None = None) -> None:
         self.mkt = market_data or MarketDataManager()
 
+    def _calculate_squeeze_score(self, candles: List[Dict[str, Any]]) -> float:
+        """Calculate Bollinger Band squeeze score (0-1, lower = tighter squeeze)."""
+        try:
+            if len(candles) < self.bb_period + self.squeeze_lookback:
+                return 1.0
+            
+            widths = []
+            for i in range(min(self.squeeze_lookback, len(candles) - self.bb_period)):
+                subset = candles[:-(i)] if i > 0 else candles
+                bb_u, bb_m, bb_l = self.mkt.calculate_bollinger_bands(subset, self.bb_period, self.bb_std)
+                if bb_u and bb_m and bb_l and bb_m > 0:
+                    widths.append((bb_u - bb_l) / bb_m)
+            
+            if not widths:
+                return 1.0
+            
+            # Current width
+            bb_u, bb_m, bb_l = self.mkt.calculate_bollinger_bands(candles, self.bb_period, self.bb_std)
+            if not bb_u or not bb_m or not bb_l or bb_m == 0:
+                return 1.0
+            
+            current_width = (bb_u - bb_l) / bb_m
+            
+            # Percentile of current width
+            widths_sorted = sorted(widths)
+            rank = sum(1 for w in widths_sorted if w < current_width)
+            return rank / len(widths_sorted) if widths_sorted else 1.0
+        except Exception:
+            return 1.0
+    
+    def _detect_price_momentum(self, candles: List[Dict[str, Any]]) -> float:
+        """Calculate price momentum score (0-1, higher = stronger upward momentum)."""
+        if len(candles) < self.min_bars_for_trend + 1:
+            return 0.0
+        
+        recent = candles[-self.min_bars_for_trend:]
+        closes = [float(c["close"]) for c in recent]
+        
+        # Count consecutive higher closes
+        up_days = sum(1 for i in range(1, len(closes)) if closes[i] > closes[i-1])
+        momentum_score = up_days / (len(closes) - 1) if len(closes) > 1 else 0.0
+        
+        # Also check rate of change
+        roc = (closes[-1] - closes[0]) / closes[0] if closes[0] > 0 else 0.0
+        roc_score = min(max(roc * 50, 0), 1)  # Normalize
+        
+        return (momentum_score * 0.6 + roc_score * 0.4)
+
     def decide_buy(self, info: RunnerDecisionInfo) -> Dict[str, Any]:
         symbol = (getattr(info.runner, "stock", None) or "").upper()
         price = float(info.current_price)
         candles = info.candles or []
 
         min_bars = max(
-            self.ema_trend_period + 1,
+            self.ema_slow_period + 1,
+            self.donchian_period + 1,
             self.macd_slow + self.macd_signal + 1,
-            self.bb_period + 1,
+            self.bb_period + self.squeeze_lookback + 1,
             self.rsi_period + 1,
-            self.stoch_k_period + self.stoch_d_period + 1,
             self.volume_ma_period + 1,
             self.atr_period + 1,
         )
@@ -92,7 +146,7 @@ class Claude45SonnetStrategy:
                 "price": round(price, 4),
                 "candles_count": len(candles),
                 "required_bars": min_bars,
-                "explanation": f"Need ≥{min_bars} bars for multi-indicator analysis",
+                "explanation": f"Need ≥{min_bars} bars for comprehensive analysis",
                 "checks": [
                     {"label": "Minimum bars", "ok": False, "actual": len(candles), "wanted": min_bars, "direction": ">="}
                 ],
@@ -105,10 +159,12 @@ class Claude45SonnetStrategy:
 
         # Calculate all indicators
         ema_fast = self.mkt.calculate_ema(candles, self.ema_fast_period)
+        ema_mid = self.mkt.calculate_ema(candles, self.ema_mid_period)
         ema_slow = self.mkt.calculate_ema(candles, self.ema_slow_period)
-        ema_trend = self.mkt.calculate_ema(candles, self.ema_trend_period)
         
-        macd_line, macd_signal = self.mkt.calculate_macd(
+        donchian_upper, donchian_lower = self.mkt.donchian_channel(candles, self.donchian_period)
+        
+        macd_line, macd_sig = self.mkt.calculate_macd(
             candles, self.macd_fast, self.macd_slow, self.macd_signal
         )
         
@@ -118,20 +174,16 @@ class Claude45SonnetStrategy:
         
         rsi = self.mkt.calculate_rsi(candles, self.rsi_period)
         
-        stoch_k, stoch_d = self.mkt.calculate_stochastic(
-            candles, self.stoch_k_period, self.stoch_d_period
-        )
-        
         volume_ma = self.mkt.average_volume(candles, self.volume_ma_period)
-        current_volume = candles[-1]["volume"]
+        current_volume = float(candles[-1].get("volume", 0) or 0)
         
         atr = self.mkt.calculate_atr(candles, self.atr_period)
 
         # Check for NaN/None values
         if any(
             x is None or x != x  # None or NaN check
-            for x in [ema_fast, ema_slow, ema_trend, macd_line, macd_signal, 
-                     bb_upper, bb_middle, bb_lower, rsi, stoch_k, stoch_d, atr]
+            for x in [ema_fast, ema_mid, ema_slow, macd_line, macd_sig, 
+                     bb_upper, bb_middle, bb_lower, rsi, atr, donchian_upper, donchian_lower]
         ):
             res = {
                 "action": "NO_ACTION",
@@ -145,77 +197,108 @@ class Claude45SonnetStrategy:
             log.info("%s NO_ACTION - indicator_unavailable @ %s", symbol, res["price"])
             return res
 
-        # ========== BUY CONDITIONS ==========
+        # ========== ADVANCED BUY CONDITIONS ==========
         
-        # 1. STRONG UPTREND: Price above long-term EMA and fast EMA above slow EMA
-        uptrend_ok = price > ema_trend and ema_fast > ema_slow
-        
-        # 2. MACD BULLISH: MACD line above signal line (or just crossed)
-        macd_bullish = macd_line > macd_signal * 0.95  # Allow slight wiggle room
-        
-        # 3. MEAN REVERSION ENTRY: Price near or below lower Bollinger Band
-        # This identifies temporary dips in strong trends
-        bb_entry_level = bb_lower * 1.01  # Within 1% of lower band
-        mean_reversion_ok = price <= bb_entry_level and price > bb_lower * 0.97
-        
-        # 4. RSI: Not overbought, ideally in oversold/neutral zone
-        rsi_ok = self.rsi_oversold <= rsi <= self.rsi_overbought
-        
-        # 5. STOCHASTIC: Oversold or just turning up (buy signal)
-        stochastic_ok = stoch_k < self.stoch_oversold * 1.2  # Allow 20% wiggle
-        
-        # 6. VOLUME CONFIRMATION: Higher than average (interest in the stock)
-        volume_ok = current_volume > volume_ma * self.volume_surge_multiplier
-
-        # Calculate signal strength (0-6 based on conditions met)
-        signal_strength = sum([
-            uptrend_ok, macd_bullish, mean_reversion_ok, 
-            rsi_ok, stochastic_ok, volume_ok
+        # 1. MULTI-TIMEFRAME TREND: All EMAs aligned + price above all
+        trend_strength = sum([
+            price > ema_fast,
+            price > ema_mid,
+            price > ema_slow,
+            ema_fast > ema_mid,
+            ema_mid > ema_slow,
         ])
+        perfect_trend = trend_strength >= 4  # At least 4/5 conditions
+        
+        # 2. DONCHIAN BREAKOUT: Price breaking above recent high
+        breakout_level = donchian_upper * (1.0 + self.breakout_buffer_pct / 100.0)
+        breakout_ok = price >= breakout_level
+        
+        # 3. BOLLINGER SQUEEZE: Volatility contraction before expansion
+        squeeze_score = self._calculate_squeeze_score(candles)
+        squeeze_ok = squeeze_score <= self.squeeze_threshold
+        
+        # 4. RSI MOMENTUM: Looking for strength, NOT oversold
+        rsi_momentum_ok = self.rsi_momentum_min <= rsi <= self.rsi_momentum_max
+        
+        # 5. MACD BULLISH: Strong momentum
+        macd_bullish = macd_line > macd_sig * 1.02  # 2% above signal
+        macd_positive = macd_line > 0  # Above zero line
+        
+        # 6. VOLUME SURGE: Institutional interest
+        volume_ok = current_volume > volume_ma * self.volume_surge_multiplier if volume_ma > 0 else False
+        
+        # 7. PRICE MOMENTUM: Recent strength
+        momentum_score = self._detect_price_momentum(candles)
+        momentum_ok = momentum_score >= 0.5
+        
+        # 8. MARKET REGIME: Detect if trending or choppy
+        atr_pct = (atr / price) * 100.0 if price > 0 else 0
+        bb_width_pct = ((bb_upper - bb_lower) / bb_middle) * 100.0 if bb_middle > 0 else 0
+        trending_regime = bb_width_pct > 3.0  # Wide bands = trending
+        
+        # ========== SCORING SYSTEM ==========
+        # Core requirements (must have)
+        core_passed = perfect_trend and rsi_momentum_ok
+        
+        # Breakout signals (need at least 2 of 3)
+        breakout_signals = sum([breakout_ok, squeeze_ok, momentum_ok])
+        
+        # Confirmation signals (need at least 2 of 3)
+        confirmation_signals = sum([macd_bullish, volume_ok, macd_positive])
+        
+        # Overall acceptance logic
+        accept_trade = (
+            core_passed and 
+            breakout_signals >= 2 and 
+            confirmation_signals >= 2
+        )
 
         checklist = [
-            {"label": "Strong Uptrend (price > EMA50, EMA12 > EMA26)", "ok": uptrend_ok, 
-             "actual": f"price:{price:.2f}, EMA50:{ema_trend:.2f}", "wanted": "price > EMA50"},
-            {"label": "MACD Bullish (MACD > Signal)", "ok": macd_bullish, 
-             "actual": f"{macd_line:.4f}", "wanted": f"{macd_signal:.4f}", "direction": ">="},
-            {"label": "Mean Reversion Entry (near BB lower)", "ok": mean_reversion_ok, 
-             "actual": price, "wanted": bb_entry_level, "direction": "<="},
-            {"label": "RSI Healthy Range", "ok": rsi_ok, 
-             "actual": rsi, "wanted": (self.rsi_oversold, self.rsi_overbought), "direction": "range"},
-            {"label": "Stochastic Oversold/Turning", "ok": stochastic_ok, 
-             "actual": stoch_k, "wanted": self.stoch_oversold * 1.2, "direction": "<="},
-            {"label": "Volume Surge", "ok": volume_ok, 
-             "actual": current_volume, "wanted": volume_ma * self.volume_surge_multiplier, "direction": ">="},
+            {"label": "✓ CORE: Multi-EMA Alignment", "ok": perfect_trend, 
+             "actual": f"{trend_strength}/5", "wanted": "≥4/5"},
+            {"label": "✓ CORE: RSI Momentum Range", "ok": rsi_momentum_ok, 
+             "actual": f"{rsi:.1f}", "wanted": f"{self.rsi_momentum_min}-{self.rsi_momentum_max}", "direction": "range"},
+            {"label": "BREAKOUT: Donchian High", "ok": breakout_ok, 
+             "actual": f"{price:.2f}", "wanted": f"{breakout_level:.2f}", "direction": ">="},
+            {"label": "BREAKOUT: BB Squeeze", "ok": squeeze_ok, 
+             "actual": f"{squeeze_score:.2f}", "wanted": f"≤{self.squeeze_threshold}"},
+            {"label": "BREAKOUT: Price Momentum", "ok": momentum_ok, 
+             "actual": f"{momentum_score:.2f}", "wanted": "≥0.5"},
+            {"label": "CONFIRM: MACD Bullish", "ok": macd_bullish, 
+             "actual": f"{macd_line:.4f}", "wanted": f"{macd_sig * 1.02:.4f}", "direction": ">="},
+            {"label": "CONFIRM: Volume Surge", "ok": volume_ok, 
+             "actual": f"{current_volume:.0f}", "wanted": f"{volume_ma * self.volume_surge_multiplier:.0f}", "direction": ">="},
+            {"label": "CONFIRM: MACD Positive", "ok": macd_positive, 
+             "actual": f"{macd_line:.4f}", "wanted": "0", "direction": ">"},
+            {"label": "REGIME: Trending Market", "ok": trending_regime, 
+             "actual": f"{bb_width_pct:.2f}%", "wanted": ">3.0%"},
         ]
 
-        # Require at least 5 out of 6 conditions for high-quality setups
-        min_signals_required = 5
-        
-        if signal_strength < min_signals_required:
+        if not accept_trade:
+            total_score = trend_strength + breakout_signals + confirmation_signals
             res = {
                 "action": "NO_ACTION",
                 "reason": "conditions_not_met",
                 "price": round(price, 4),
-                "signal_strength": f"{signal_strength}/{len(checklist)}",
-                "explanation": f"Signal strength {signal_strength}/6 (need ≥{min_signals_required})\n" + format_checklist(checklist),
+                "signal_strength": f"{total_score}/11",
+                "explanation": f"Signal score {total_score}/11. Need: core(2) + breakout(≥2/3) + confirm(≥2/3)\n" + format_checklist(checklist),
                 "checks": checklist,
             }
             log.info(
-                "%s NO_ACTION - conditions_not_met @ %s (strength=%d/%d)", 
-                symbol, res["price"], signal_strength, len(checklist)
+                "%s NO_ACTION - conditions_not_met @ %s (core=%s, breakout=%d/3, confirm=%d/3)", 
+                symbol, res["price"], core_passed, breakout_signals, confirmation_signals
             )
             return res
 
-        # Calculate adaptive trailing stop based on ATR and volatility
-        # More volatile stocks get wider stops
-        atr_pct = (atr / price) * 100.0
-        trail_pct = min(max(atr_pct * 1.5, self.trail_min_pct), self.trail_max_pct)
+        # Calculate adaptive trailing stop based on ATR - TIGHTER
+        trail_pct = min(max(atr_pct * self.atr_multiplier, self.trail_min_pct), self.trail_max_pct)
         
         # Session-aware limit price adjustment
         session = getattr(self.mkt, "_last_session", (None, "regular-hours"))[1]
         wiggle = self.limit_wiggle_xrth if session == "extended-hours" else self.limit_wiggle_rth
         limit_price = price * (1 + wiggle)
 
+        total_score = trend_strength + breakout_signals + confirmation_signals
         res = {
             "action": "BUY",
             "order_type": "LMT",
@@ -226,52 +309,58 @@ class Claude45SonnetStrategy:
                 "order_type": "TRAIL_LIMIT",
                 "trailing_percent": round(trail_pct, 2),
             },
-            "signal_strength": f"{signal_strength}/{len(checklist)}",
-            "explanation": f"🎯 HIGH-QUALITY SETUP (strength {signal_strength}/6)\n" + format_checklist(checklist),
+            "signal_strength": f"{total_score}/11",
+            "explanation": f"🚀 ELITE BREAKOUT SETUP (score {total_score}/11)\n" + format_checklist(checklist),
             "checks": checklist,
         }
         
         log.info(
-            "🎯 BUY %s @ %s (limit=%s, trail=%s%%, strength=%d/%d) - MACD:%.4f>%.4f, RSI:%.1f, Stoch:%.1f, BB:%.2f-%.2f-%.2f",
+            "🚀 BUY %s @ %s (limit=%s, trail=%s%%, score=%d/11) - Trend:%d/5, Break:%d/3, Conf:%d/3, RSI:%.1f, MACD:%.4f",
             symbol, res["price"], res["limit_price"], res["trail_stop_order"]["trailing_percent"],
-            signal_strength, len(checklist), macd_line, macd_signal, rsi, stoch_k,
-            bb_lower, bb_middle, bb_upper
+            total_score, trend_strength, breakout_signals, confirmation_signals, rsi, macd_line
         )
         return res
 
     def decide_sell(self, info: RunnerDecisionInfo) -> Dict[str, Any]:
         """
-        Sell logic: Primarily rely on trailing stop, but add discretionary exits
-        for strong reversal signals.
+        Aggressive sell logic: Cut losses fast, protect profits quickly.
+        Multiple exit conditions for optimal risk management.
         """
         symbol = (getattr(info.runner, "stock", None) or "").upper()
         price = float(info.current_price)
         candles = info.candles or []
 
-        min_bars_for_discretionary = max(self.rsi_period + 1, self.atr_period + 1, self.stoch_k_period + 1)
+        min_bars = max(
+            self.rsi_period + 1, 
+            self.atr_period + 1, 
+            self.ema_fast_period + 1,
+            self.macd_slow + self.macd_signal + 1
+        )
         
-        if len(candles) < min_bars_for_discretionary:
+        if len(candles) < min_bars:
             res = {
                 "action": "NO_ACTION",
                 "reason": "insufficient_data",
                 "price": round(price, 4),
-                "explanation": f"Need ≥{min_bars_for_discretionary} bars for sell analysis",
+                "explanation": f"Need ≥{min_bars} bars for sell analysis",
                 "checks": [
                     {"label": "Minimum bars", "ok": False, "actual": len(candles), 
-                     "wanted": min_bars_for_discretionary, "direction": ">="}
+                     "wanted": min_bars, "direction": ">="}
                 ],
             }
             log.info(
                 "%s SELL NO_ACTION - insufficient_data @ %s (required=%d have=%d)",
-                symbol, res["price"], min_bars_for_discretionary, len(candles)
+                symbol, res["price"], min_bars, len(candles)
             )
             return res
 
-        # Calculate indicators for discretionary sell
+        # Calculate indicators for exit signals
         rsi = self.mkt.calculate_rsi(candles, self.rsi_period)
-        stoch_k, _ = self.mkt.calculate_stochastic(candles, self.stoch_k_period, self.stoch_d_period)
-        macd_line, macd_signal = self.mkt.calculate_macd(candles, self.macd_fast, self.macd_slow, self.macd_signal)
+        macd_line, macd_sig = self.mkt.calculate_macd(candles, self.macd_fast, self.macd_slow, self.macd_signal)
         atr = self.mkt.calculate_atr(candles, self.atr_period)
+        ema_fast = self.mkt.calculate_ema(candles, self.ema_fast_period)
+        ema_mid = self.mkt.calculate_ema(candles, self.ema_mid_period)
+        ema_slow = self.mkt.calculate_ema(candles, self.ema_slow_period)
 
         if atr is None or atr != atr:  # NaN check
             return {
@@ -281,45 +370,94 @@ class Claude45SonnetStrategy:
                 "checks": [{"label": "ATR valid", "ok": False, "actual": "NaN", "wanted": "valid"}],
             }
 
-        # Check for strong reversal signals (discretionary sell)
-        extreme_overbought = rsi is not None and rsi > 85.0
-        stoch_extreme = stoch_k is not None and stoch_k > 90.0
-        macd_bearish_cross = (macd_line is not None and macd_signal is not None and 
-                               macd_line < macd_signal * 0.95)
-
-        # If multiple reversal signals, consider discretionary sell
-        reversal_signals = sum([extreme_overbought, stoch_extreme, macd_bearish_cross])
+        # ========== DISCRETIONARY EXIT CONDITIONS ==========
         
-        if reversal_signals >= 2:
+        # 1. TREND BREAKDOWN: Price breaks below key EMAs
+        trend_break_fast = price < ema_fast * 0.98  # 2% below fast EMA
+        trend_break_mid = price < ema_mid * 0.97    # 3% below mid EMA
+        trend_break_slow = price < ema_slow         # Below slow EMA
+        
+        # 2. MOMENTUM REVERSAL: RSI or MACD turning negative
+        rsi_weak = rsi is not None and rsi < 40.0   # RSI dropping
+        macd_bearish = (macd_line is not None and macd_sig is not None and 
+                        macd_line < macd_sig * 0.98)  # MACD crossing down
+        
+        # 3. EXTREME OVERBOUGHT: Lock in profits
+        rsi_extreme = rsi is not None and rsi > 85.0
+        
+        # 4. LOSS OF MOMENTUM: Check recent price action
+        momentum_score = self._detect_price_momentum(candles) if len(candles) >= self.min_bars_for_trend + 1 else 0.5
+        momentum_lost = momentum_score < 0.3  # Dropping momentum
+        
+        # 5. VOLATILITY SPIKE: Unusual volatility suggests danger
+        bb_upper, bb_middle, bb_lower = self.mkt.calculate_bollinger_bands(candles, self.bb_period, self.bb_std)
+        price_near_lower = (bb_lower is not None and price <= bb_lower * 1.02)  # Near lower band
+        
+        # ========== EXIT DECISION MATRIX ==========
+        
+        # Critical exits (immediate sell)
+        critical_exit = (
+            (trend_break_mid and macd_bearish) or  # Breaking mid EMA + MACD bearish
+            (trend_break_fast and rsi_weak) or      # Breaking fast EMA + weak RSI
+            (price_near_lower and momentum_lost)    # Near BB lower + losing momentum
+        )
+        
+        # Profit protection (lock gains)
+        profit_protection = rsi_extreme or (trend_break_fast and rsi_weak)
+        
+        # Moderate weakness (tighten stops)
+        moderate_weakness = trend_break_fast or macd_bearish or rsi_weak
+        
+        session = getattr(self.mkt, "_last_session", (None, "regular-hours"))[1]
+        wiggle = self.limit_wiggle_xrth if session == "extended-hours" else self.limit_wiggle_rth
+        limit_price = price * (1 - wiggle)
+        
+        if critical_exit:
             log.info(
-                "💥 Discretionary SELL %s @ %s - Strong reversal signals (RSI:%.1f, Stoch:%.1f, MACD:%.4f<%.4f)",
-                symbol, price, rsi or 0, stoch_k or 0, macd_line or 0, macd_signal or 0
+                "🚨 CRITICAL EXIT %s @ %s - Trend break & momentum loss (RSI:%.1f, MACD:%.4f/%.4f)",
+                symbol, price, rsi or 0, macd_line or 0, macd_sig or 0
             )
-            session = getattr(self.mkt, "_last_session", (None, "regular-hours"))[1]
-            wiggle = self.limit_wiggle_xrth if session == "extended-hours" else self.limit_wiggle_rth
-            limit_price = price * (1 - wiggle)
-            
             return {
                 "action": "SELL",
                 "order_type": "LMT",
                 "price": round(price, 4),
                 "limit_price": round(limit_price, 4),
-                "reason": "discretionary_reversal",
-                "explanation": f"Strong reversal: RSI={rsi:.1f}, Stoch={stoch_k:.1f}, MACD bearish cross",
+                "reason": "critical_exit",
+                "explanation": f"Critical trend breakdown detected - exit immediately",
                 "checks": [
-                    {"label": "Extreme overbought", "ok": extreme_overbought, "actual": rsi if rsi else "N/A"},
-                    {"label": "Stochastic extreme", "ok": stoch_extreme, "actual": stoch_k if stoch_k else "N/A"},
-                    {"label": "MACD bearish", "ok": macd_bearish_cross, "actual": "cross" if macd_bearish_cross else "no"},
+                    {"label": "Trend break (mid)", "ok": trend_break_mid, "actual": price, "wanted": ema_mid * 0.97, "direction": "<"},
+                    {"label": "Trend break (fast)", "ok": trend_break_fast, "actual": price, "wanted": ema_fast * 0.98, "direction": "<"},
+                    {"label": "RSI weak", "ok": rsi_weak, "actual": rsi if rsi else "N/A", "wanted": "<40"},
+                    {"label": "MACD bearish", "ok": macd_bearish, "actual": f"{macd_line:.4f}" if macd_line else "N/A"},
                 ],
             }
-
-        # Otherwise, rely on trailing stop (update trail percent if needed)
-        atr_pct = (atr / price) * 100.0
-        trail_pct = min(max(atr_pct * 1.5, self.trail_min_pct), self.trail_max_pct)
         
-        session = getattr(self.mkt, "_last_session", (None, "regular-hours"))[1]
-        wiggle = self.limit_wiggle_xrth if session == "extended-hours" else self.limit_wiggle_rth
-        limit_price = price * (1 - wiggle)
+        if profit_protection:
+            log.info(
+                "💰 PROFIT LOCK %s @ %s - Extreme overbought or weakness (RSI:%.1f)",
+                symbol, price, rsi or 0
+            )
+            return {
+                "action": "SELL",
+                "order_type": "LMT",
+                "price": round(price, 4),
+                "limit_price": round(limit_price, 4),
+                "reason": "profit_protection",
+                "explanation": f"Locking in profits - RSI extreme or showing weakness",
+                "checks": [
+                    {"label": "RSI extreme", "ok": rsi_extreme, "actual": rsi if rsi else "N/A", "wanted": ">85"},
+                    {"label": "Trend weakening", "ok": trend_break_fast, "actual": price, "wanted": ema_fast * 0.98},
+                ],
+            }
+        
+        # Calculate adaptive trailing stop - TIGHTER than before
+        atr_pct = (atr / price) * 100.0 if price > 0 else self.trail_min_pct
+        
+        # If moderate weakness, tighten the trail even more
+        if moderate_weakness:
+            trail_pct = min(max(atr_pct * 1.2, self.trail_min_pct), self.trail_max_pct * 0.7)
+        else:
+            trail_pct = min(max(atr_pct * self.atr_multiplier, self.trail_min_pct), self.trail_max_pct)
 
         res = {
             "action": "SELL",
@@ -327,15 +465,16 @@ class Claude45SonnetStrategy:
             "price": round(price, 4),
             "limit_price": round(limit_price, 4),
             "trail_percent": round(trail_pct, 2),
-            "explanation": f"Trailing stop at {trail_pct:.2f}% (ATR-based adaptive)",
+            "explanation": f"Trailing stop at {trail_pct:.2f}% ({'TIGHTENED' if moderate_weakness else 'normal'})",
             "checks": [
-                {"label": "ATR-based adaptive trail", "ok": True, "actual": trail_pct, "wanted": "optimized"}
+                {"label": "ATR-based adaptive trail", "ok": True, "actual": trail_pct, "wanted": "optimized"},
+                {"label": "Moderate weakness detected", "ok": moderate_weakness, "actual": "Yes" if moderate_weakness else "No"},
             ],
         }
         
         log.debug(
-            "SELL %s @ %s (limit=%s, trail=%s%%) - Trailing stop mode",
-            symbol, res["price"], res["limit_price"], res["trail_percent"]
+            "SELL %s @ %s (limit=%s, trail=%s%%, weakness=%s) - Trailing mode",
+            symbol, res["price"], res["limit_price"], res["trail_percent"], moderate_weakness
         )
         return res
 

@@ -621,6 +621,66 @@ class MarketDataManager:
         
         return (upper, middle, lower)
 
+    # ─────────────────────────── advanced helpers (strategy) ───────────────────────────
+
+    @staticmethod
+    def atr_percent(candles: List[Dict[str, Any]], period: int = 14) -> float:
+        """
+        ATR as percent of current close. Returns NaN when insufficient data.
+        """
+        if not candles:
+            return float("nan")
+        atr = MarketDataManager.calculate_atr(candles, period)
+        px = float(candles[-1]["close"]) if candles else float("nan")
+        if px <= 0:
+            return float("nan")
+        return (atr / px) * 100.0
+
+    @staticmethod
+    def realized_volatility_pct(candles: List[Dict[str, Any]], period: int = 20) -> float:
+        """
+        Simple close-to-close realized volatility (not annualized) as percent.
+        Computes stddev of simple returns over the window, expressed in percent.
+        """
+        if len(candles) < period + 1:
+            return float("nan")
+        closes = [float(c["close"]) for c in candles[-(period + 1):]]
+        rets: List[float] = []
+        for i in range(1, len(closes)):
+            prev = closes[i - 1]
+            cur = closes[i]
+            if prev <= 0:
+                continue
+            rets.append((cur - prev) / prev)
+        if not rets:
+            return float("nan")
+        mean = sum(rets) / len(rets)
+        var = sum((r - mean) ** 2 for r in rets) / len(rets)
+        std = var ** 0.5
+        return std * 100.0
+
+    @staticmethod
+    def relative_strength(
+        subject_candles: List[Dict[str, Any]],
+        benchmark_candles: List[Dict[str, Any]],
+        period: int = 60,
+    ) -> Optional[float]:
+        """
+        Simple RS = (subject return) - (benchmark return) over window, in percent.
+        Positive means subject outperformed benchmark.
+        """
+        if len(subject_candles) < period + 1 or len(benchmark_candles) < period + 1:
+            return None
+        s0 = float(subject_candles[-(period + 1)]["close"])
+        s1 = float(subject_candles[-1]["close"])
+        b0 = float(benchmark_candles[-(period + 1)]["close"])
+        b1 = float(benchmark_candles[-1]["close"])
+        if s0 <= 0 or b0 <= 0:
+            return None
+        subj_ret = (s1 - s0) / s0
+        bench_ret = (b1 - b0) / b0
+        return (subj_ret - bench_ret) * 100.0
+
     # ─────────────────────────── mark-to-market helpers ───────────────────────────
 
     def get_last_close_for_symbols(

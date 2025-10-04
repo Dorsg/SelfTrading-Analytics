@@ -38,12 +38,17 @@ class Gemini25ProStrategy:
     bb_period = 20
     bb_std_dev = 2.0
 
+    # RSI settings
+    rsi_period = 14
+    rsi_oversold = 30.0
+    rsi_overbought = 70.0
+
     # Volume settings
     volume_ma_period = 20
 
     # ATR settings for trailing stop
     atr_period = 14
-    trail_min_pct = 1.0
+    trail_min_pct = 2.0
     trail_max_pct = 10.0
 
     limit_wiggle_rth = 0.0005
@@ -63,6 +68,7 @@ class Gemini25ProStrategy:
             self.bb_period,
             self.volume_ma_period,
             self.atr_period + 1,
+            self.rsi_period + 1,
         )
 
         if len(candles) < min_bars:
@@ -81,6 +87,7 @@ class Gemini25ProStrategy:
         bb_upper, bb_middle, bb_lower = self.mkt.calculate_bollinger_bands(
             candles, self.bb_period, self.bb_std_dev
         )
+        rsi = self.mkt.calculate_rsi(candles, self.rsi_period)
         volume_ma = self.mkt.average_volume(candles, self.volume_ma_period)
         current_volume = candles[-1]["volume"]
         atr_val = self.mkt.calculate_atr(candles, period=self.atr_period)
@@ -94,6 +101,7 @@ class Gemini25ProStrategy:
                 bb_lower,
                 volume_ma,
                 atr_val,
+                rsi,
             ]
         ):
             return {
@@ -105,13 +113,20 @@ class Gemini25ProStrategy:
         # Buy conditions
         trend_ok = macd_line > signal_line
         momentum_ok = stoch_k < self.stoch_oversold
-        volatility_ok = price <= bb_lower * 1.005  # Price is near or below the lower band
+        
+        # Volatility: previous close below lower BB, current price above it
+        prev_close = candles[-2]["close"]
+        bb_lower_prev = self.mkt.calculate_bollinger_bands(candles[:-1], self.bb_period, self.bb_std_dev)[2]
+        volatility_ok = prev_close < bb_lower_prev and price > bb_lower
+        
+        rsi_ok = rsi < self.rsi_oversold
         volume_ok = current_volume > volume_ma
 
         checklist = [
             {"label": "Trend (MACD > Signal)", "ok": trend_ok},
             {"label": f"Momentum (Stoch %K < {self.stoch_oversold})", "ok": momentum_ok},
-            {"label": "Volatility (Price near BB Lower)", "ok": volatility_ok},
+            {"label": "Volatility (BB Bounce)", "ok": volatility_ok},
+            {"label": f"RSI (< {self.rsi_oversold})", "ok": rsi_ok},
             {"label": "Volume (Current > MA)", "ok": volume_ok},
         ]
 
@@ -151,19 +166,30 @@ class Gemini25ProStrategy:
 
     def decide_sell(self, info: RunnerDecisionInfo) -> Dict[str, Any]:
         # The trailing stop is attached at buy time, so this method is for discretionary sells.
-        # For now, we rely solely on the ATR trailing stop.
         # A more complex version could implement a discretionary sell based on indicators.
         symbol = (getattr(info.runner, "stock", None) or "").upper()
         price = float(info.current_price)
         candles = info.candles or []
 
+        if len(candles) < self.stoch_k_period + self.stoch_d_period:
+            return {"action": "NO_ACTION", "reason": "insufficient_data"}
+
         # Sell conditions for discretionary exit (e.g., strong reversal signal)
         stoch_k, _ = self.mkt.calculate_stochastic(
             candles, self.stoch_k_period, self.stoch_d_period
         )
+        rsi = self.mkt.calculate_rsi(candles, self.rsi_period)
+        macd_line, signal_line = self.mkt.calculate_macd(
+            candles, self.macd_fast_period, self.macd_slow_period, self.macd_signal_period
+        )
         
-        if stoch_k is not None and stoch_k > self.stoch_overbought:
-            log.info(f"Discretionary SELL for {symbol} at {price} due to overbought condition")
-            return {"action": "SELL", "order_type": "MKT", "reason": "overbought_stochastic"}
+        overbought_condition = (stoch_k is not None and stoch_k > self.stoch_overbought) or \
+                               (rsi is not None and rsi > self.rsi_overbought)
+        
+        bearish_crossover = macd_line is not None and signal_line is not None and macd_line < signal_line
+
+        if overbought_condition and bearish_crossover:
+            log.info(f"Discretionary SELL for {symbol} at {price} due to overbought condition and bearish crossover")
+            return {"action": "SELL", "order_type": "MKT", "reason": "overbought_with_reversal_signal"}
 
         return {"action": "NO_ACTION", "reason": "no_sell_signal"}

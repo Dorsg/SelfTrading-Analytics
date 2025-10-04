@@ -46,8 +46,8 @@ class ChatGPT5UltraStrategy:
 
     # Momentum
     rsi_period = 14
-    rsi_min = 52.0
-    rsi_max = 80.0
+    rsi_min = 50.0
+    rsi_max = 85.0
 
     # MACD
     macd_fast = 12
@@ -56,15 +56,20 @@ class ChatGPT5UltraStrategy:
 
     # Volume
     volume_ma_period = 20
-    volume_surge_multiplier = 1.25
+    volume_surge_multiplier = 1.15
 
     # ATR trailing stop
     atr_period = 14
     trail_min_pct = 0.6
-    trail_max_pct = 7.5
+    trail_max_pct = 9.0
 
     # Entry buffer (percent) above Donchian for cleaner breakouts
-    buy_buffer_pct = 0.08
+    buy_buffer_pct = 0.05
+
+    # Regime and filters
+    rs_period = 60  # relative strength lookback (same timeframe); daily used when tf=5
+    min_rs_pct = 0.0  # require outperformance vs SPY
+    max_realized_vol_pct = 5.5  # avoid hyper-volatile names on entry
 
     # Limit order wiggle by session
     limit_wiggle_rth = 0.0005
@@ -147,6 +152,28 @@ class ChatGPT5UltraStrategy:
         except Exception:
             squeeze_ok = False
 
+        # Regime filters
+        rs_val = None
+        rs_daily_ok = True
+        try:
+            bench = "SPY"
+            if getattr(info.runner, "time_frame", 5) == 5:
+                bench_min = self.mkt.get_candles_until(bench, 5, candles[-1]["ts"], lookback=max(self.rs_period + 5, 120))
+                rs_val = self.mkt.relative_strength(candles, bench_min, period=min(self.rs_period, len(bench_min) - 1)) if bench_min else None
+                daily_sym = self.mkt.get_candles_until(symbol, 1440, candles[-1]["ts"], lookback=200)
+                daily_bench = self.mkt.get_candles_until(bench, 1440, candles[-1]["ts"], lookback=200)
+                if daily_sym and daily_bench:
+                    rs_daily = self.mkt.relative_strength(daily_sym, daily_bench, period=min(120, len(daily_sym) - 1, len(daily_bench) - 1))
+                    rs_daily_ok = (rs_daily is None) or (rs_daily >= self.min_rs_pct)
+            else:
+                bench_day = self.mkt.get_candles_until(bench, 1440, candles[-1]["ts"], lookback=max(self.rs_period + 5, 200))
+                rs_val = self.mkt.relative_strength(candles, bench_day, period=min(self.rs_period, len(bench_day) - 1)) if bench_day else None
+        except Exception:
+            rs_val = None
+            rs_daily_ok = True
+
+        rv = self.mkt.realized_volatility_pct(candles, period=20)
+
         # Entry logic
         breakout_level = (upper or price) * (1.0 + (self.buy_buffer_pct / 100.0)) if upper else price
         trend_ok = (price > ema_slow) and (ema_fast > ema_slow)
@@ -156,10 +183,13 @@ class ChatGPT5UltraStrategy:
         vol_ok = cur_vol >= vol_ma * self.volume_surge_multiplier if vol_ma > 0 else False
         pullback_ready = (bb_lower is not None) and (price <= bb_lower * 1.02) and trend_ok and (rsi >= self.rsi_min)
 
+        rs_ok = (rs_val is None) or (rs_val >= self.min_rs_pct)
+        rv_ok = (rv == rv) and (rv <= self.max_realized_vol_pct)
+
         # Score-based acceptance: breakout+trend with confirmations, or high-quality pullback
-        primary_signals = [trend_ok, breakout_ok, momentum_ok, macd_ok, vol_ok]
+        primary_signals = [trend_ok, breakout_ok, momentum_ok, macd_ok, vol_ok, rs_ok, rv_ok]
         score = sum(bool(x) for x in primary_signals) + (1 if squeeze_ok else 0)
-        accept = (breakout_ok and trend_ok and (score >= 4)) or (pullback_ready and macd_ok)
+        accept = ((breakout_ok and trend_ok and rs_ok and rv_ok and (score >= 5)) or (pullback_ready and macd_ok and rs_daily_ok))
 
         checklist = [
             {"label": "Trend (EMA50>EMA200 & px>EMA200)", "ok": trend_ok, "actual": price, "wanted": ema_slow},
@@ -169,6 +199,9 @@ class ChatGPT5UltraStrategy:
             {"label": "Volume surge", "ok": vol_ok, "actual": cur_vol, "wanted": vol_ma * self.volume_surge_multiplier, "direction": ">="},
             {"label": "Squeeze (low BB width)", "ok": squeeze_ok, "actual": "low" if squeeze_ok else "high", "wanted": "lower_percentile"},
             {"label": "Alt: Pullback ready", "ok": pullback_ready, "actual": price, "wanted": (bb_lower * 1.02 if bb_lower else None), "direction": "<="},
+            {"label": "Relative strength vs SPY", "ok": rs_ok, "actual": rs_val if rs_val is not None else "n/a", "wanted": self.min_rs_pct, "direction": ">="},
+            {"label": "Realized vol below cap", "ok": rv_ok, "actual": rv, "wanted": self.max_realized_vol_pct, "direction": "<="},
+            {"label": "Daily RS confirm (5m only)", "ok": rs_daily_ok, "actual": None, "wanted": None},
         ]
 
         if not accept:
@@ -176,14 +209,15 @@ class ChatGPT5UltraStrategy:
                 "action": "NO_ACTION",
                 "reason": "conditions_not_met",
                 "price": round(price, 4),
-                "signal_strength": f"{score}/6",
+                "signal_strength": f"{score}/7",
                 "explanation": format_checklist(checklist),
                 "checks": checklist,
             }
 
         # Order details
         atr_pct = (atr / price) * 100.0 if price > 0 else self.trail_min_pct
-        trail_pct = min(max(atr_pct * 1.2, self.trail_min_pct), self.trail_max_pct)
+        widen = 1.35 if (rv == rv and rv > 3.5) else 1.15
+        trail_pct = min(max(atr_pct * widen, self.trail_min_pct), self.trail_max_pct)
         session = getattr(self.mkt, "_last_session", (None, "regular-hours"))[1]
         wiggle = self.limit_wiggle_xrth if session == "extended-hours" else self.limit_wiggle_rth
         limit_price = price * (1 + wiggle)
@@ -198,7 +232,7 @@ class ChatGPT5UltraStrategy:
                 "order_type": "TRAIL_LIMIT",
                 "trailing_percent": round(trail_pct, 2),
             },
-            "signal_strength": f"{score}/6",
+            "signal_strength": f"{score}/7",
             "explanation": format_checklist(checklist),
             "checks": checklist,
         }
@@ -243,18 +277,23 @@ class ChatGPT5UltraStrategy:
                 "checks": [{"label": "ATR valid", "ok": False, "actual": "NaN", "wanted": "valid"}],
             }
 
-        # Discretionary exit if strong deterioration
+        # Discretionary exit if strong deterioration or profit fade
         trend_break = price < ema_slow
-        momentum_break = (rsi == rsi and rsi < 35.0)
-        macd_bearish = (macd_line is not None and macd_sig is not None and macd_line < macd_sig * 0.98)
-        discretionary_exit = (trend_break and (momentum_break or macd_bearish)) or (price < ema_fast * 0.97)
+        momentum_break = (rsi == rsi and rsi < 38.0)
+        macd_bearish = (macd_line is not None and macd_sig is not None and macd_line < macd_sig * 0.99)
+        up_pct = 0.0
+        if info.position and getattr(info.position, "avg_price", 0) > 0:
+            up_pct = (price - info.position.avg_price) / info.position.avg_price * 100.0
+        profit_fade = (up_pct > 8.0) and (price < ema_fast)
+        discretionary_exit = (trend_break and (momentum_break or macd_bearish)) or profit_fade
 
         session = getattr(self.mkt, "_last_session", (None, "regular-hours"))[1]
         wiggle = self.limit_wiggle_xrth if session == "extended-hours" else self.limit_wiggle_rth
         limit_price = price * (1 - wiggle)
 
         atr_pct = (atr / price) * 100.0 if price > 0 else self.trail_min_pct
-        trail_pct = min(max(atr_pct * 1.2, self.trail_min_pct), self.trail_max_pct)
+        widen = 1.35 if (price < ema_fast) else 1.1
+        trail_pct = min(max(atr_pct * widen, self.trail_min_pct), self.trail_max_pct)
 
         if discretionary_exit:
             return {
@@ -263,11 +302,12 @@ class ChatGPT5UltraStrategy:
                 "price": round(price, 4),
                 "limit_price": round(limit_price, 4),
                 "reason": "discretionary_reversal",
-                "explanation": "Trend/momentum deterioration (EMA/RSI/MACD)",
+                "explanation": "Trend/momentum deterioration or profit fade",
                 "checks": [
                     {"label": "Trend break (px < EMA200)", "ok": trend_break, "actual": price, "wanted": ema_slow, "direction": "<="},
-                    {"label": "RSI < 35", "ok": momentum_break, "actual": rsi, "wanted": 35.0, "direction": "<="},
+                    {"label": "RSI < 38", "ok": momentum_break, "actual": rsi, "wanted": 38.0, "direction": "<="},
                     {"label": "MACD bearish", "ok": macd_bearish, "actual": (macd_line or 0.0), "wanted": (macd_sig or 0.0), "direction": "<="},
+                    {"label": ">8% up and below EMA50", "ok": profit_fade, "actual": up_pct, "wanted": 8.0, "direction": ">"},
                 ],
             }
 
