@@ -8,6 +8,7 @@
             :processed="sim.importStatus.processed"
             :total="sim.importStatus.total"
             :details="sim.importStatus.details"
+            :loading="sim.importLoading"
           />
         </n-gi>
   
@@ -61,7 +62,11 @@
   }
   async function handleReset () {
     const res = await sim.reset()
-    message.success(res?.message ?? 'Simulation reset')
+    if (res?.ok) {
+      message.success(res?.message ?? 'Reset completed')
+    } else {
+      message.error(res?.message ?? 'Reset failed')
+    }
     return res
   }
   </script>

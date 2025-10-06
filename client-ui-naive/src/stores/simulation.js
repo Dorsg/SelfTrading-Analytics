@@ -17,6 +17,10 @@ export const useSimulationStore = defineStore('simulation', () => {
   const ETA_PUBLISH_MIN_INTERVAL_MS = 30000 // update visible ETA at most every 30s
   const ETA_PUBLISH_MIN_DELTA_SECONDS = 60   // or if ETA changes by >= 1 minute
   
+  function sleep (ms) {
+    return new Promise(resolve => setTimeout(resolve, ms))
+  }
+
   // ───────── Simulation status cache (prevents blank/0% flash on refresh) ─────────
   const SIM_STATUS_CACHE_KEY = 'analytics_sim_status_cache'
   const ETA_CACHE_KEY = 'analytics_eta_cache_v1'
@@ -60,6 +64,7 @@ export const useSimulationStore = defineStore('simulation', () => {
 
   // ───────── Import status cache (prevents 0% flash on refresh) ─────────
   const IMPORT_STATUS_CACHE_KEY = 'analytics_import_status_cache'
+  const IMPORT_STATUS_ONCE_KEY = 'analytics_import_status_cache_once'
   function readImportCache () {
     try {
       const raw = sessionStorage.getItem(IMPORT_STATUS_CACHE_KEY)
@@ -70,6 +75,16 @@ export const useSimulationStore = defineStore('simulation', () => {
   function writeImportCache (val) {
     try { sessionStorage.setItem(IMPORT_STATUS_CACHE_KEY, JSON.stringify(val)) } catch {}
   }
+  function readImportOnceCache () {
+    try {
+      const raw = localStorage.getItem(IMPORT_STATUS_ONCE_KEY)
+      if (!raw) return null
+      return JSON.parse(raw)
+    } catch { return null }
+  }
+  function writeImportOnceCache (val) {
+    try { localStorage.setItem(IMPORT_STATUS_ONCE_KEY, JSON.stringify(val)) } catch {}
+  }
 
   const importDefault = {
     state: 'idle',            // 'idle' | 'importing' | 'ready' | 'error' | 'pending'
@@ -79,6 +94,7 @@ export const useSimulationStore = defineStore('simulation', () => {
     details: { daily_bars: 0, minute_bars: 0, users: 0, runners: 0, date_range: { start: null, end: null }, checks_done: 0, checks_total: 0 }
   }
   const importStatus = ref(readImportCache() || importDefault)
+  const importLoading = ref(false)
 
   const logs = ref({
     warnings: [],
@@ -297,68 +313,106 @@ export const useSimulationStore = defineStore('simulation', () => {
         status.value.estimated_finish_iso = null
       }
 
-      const [s, i, p, db] = await Promise.all([
-        SimulationAPI.status(),
-        SimulationAPI.importStatus(),
-        SimulationAPI.progress().catch(() => null),
-        SimulationAPI.dbStatus().catch(() => null)
+      // Import status: perform only once. If not cached yet, show spinner and retry until backend becomes available (up to ~15s)
+      const cachedOnce = readImportOnceCache()
+      if (!cachedOnce) importLoading.value = true
+
+      const [s, p] = await Promise.all([
+        SimulationAPI.status().catch(() => null),
+        SimulationAPI.progress().catch(() => null)
       ])
-      // Normalize running indicator here too
-      const runningFlag = typeof s.running !== 'undefined' ? s.running : s.is_running
+      // Normalize running indicator here too (avoid throwing if s is null)
+      const runningFlag = s ? ((typeof s.running !== 'undefined') ? s.running : s.is_running) : false
       status.value = {
-        state: s.state ?? s.status ?? (runningFlag ? 'running' : 'idle'),
-        progress_percent: Math.round(s.progress_percent ?? s.progress ?? 0),
-        eta_seconds: s.eta_seconds ?? s.eta ?? null,
+        state: (s?.state ?? s?.status) ?? (runningFlag ? 'running' : 'idle'),
+        progress_percent: Math.round(s?.progress_percent ?? s?.progress ?? 0),
+        eta_seconds: s?.eta_seconds ?? s?.eta ?? null,
         eta_label: p?.estimated_finish ?? null,
         estimated_finish_iso: p?.estimated_finish_iso ?? null,
-        total_buys: s.total_buys ?? 0,
-        total_sells: s.total_sells ?? 0,
-        last_ts: p?.sim_time_iso ?? s.last_ts ?? null,
+        total_buys: s?.total_buys ?? 0,
+        total_sells: s?.total_sells ?? 0,
+        last_ts: p?.sim_time_iso ?? s?.last_ts ?? null,
         current: p?.current_runner_info ?? null,
-        snapshot_age_seconds: typeof s.snapshot_age_seconds !== 'undefined' ? s.snapshot_age_seconds : null
+        snapshot_age_seconds: typeof s?.snapshot_age_seconds !== 'undefined' ? s.snapshot_age_seconds : null
       }
       writeSimCache(status.value)
       if (status.value.eta_seconds != null || status.value.estimated_finish_iso) {
         writeEtaCache(status.value.eta_seconds, status.value.estimated_finish_iso, status.value.rate)
       }
-      // Normalize import status using DB readiness when available
-      try {
-        const mappedState = (function mapState () {
-          const st = i?.state
-          if (st === 'completed') return 'ready'
-          if (st === 'pending' && db && db.ready) return 'ready'
-          return st ?? 'idle'
-        })()
-        let percent = Math.round(i?.progress_percent ?? i?.progress ?? 0)
-        if ((!percent || percent <= 0) && db) {
-          const gates = [ (db?.data?.daily_bars || 0) > 0, (db?.data?.minute_bars || 0) > 0, (db?.setup?.users || 0) > 0 && (db?.setup?.runners || 0) > 0 ]
-          const done = gates.filter(Boolean).length
-          percent = Math.round((done / 3) * 100)
-          if (db?.ready) percent = 100
-        }
-        importStatus.value = {
-          state: mappedState,
-          progress_percent: percent,
-          processed: i?.processed ?? i?.done ?? (db?.ready ? 3 : 0),
-          total: i?.total ?? i?.count ?? 3,
-          details: i?.details || {
-            daily_bars: db?.data?.daily_bars || 0,
-            minute_bars: db?.data?.minute_bars || 0,
-            users: db?.setup?.users || 0,
-            runners: db?.setup?.runners || 0,
-            date_range: db?.data?.date_range || { start: null, end: null },
-            checks_done: undefined,
-            checks_total: undefined
+      // Resolve import status with short retries if needed
+      let finalImport = cachedOnce || null
+      if (!finalImport) {
+        const deadline = Date.now() + 15000
+        while (!finalImport && Date.now() < deadline) {
+          const [iTry, dbTry] = await Promise.all([
+            SimulationAPI.importStatus().catch(() => null),
+            SimulationAPI.dbStatus().catch(() => null)
+          ])
+
+          // Build resilient snapshot when either endpoint is reachable
+          if (iTry || dbTry) {
+            const stRaw = iTry?.state
+            const mappedState = (function mapState () {
+              if (stRaw === 'completed') return 'ready'
+              if (stRaw === 'pending' && dbTry && dbTry.ready) return 'ready'
+              return stRaw ?? (dbTry ? (dbTry.ready ? 'ready' : (dbTry.data?.daily_bars || dbTry.data?.minute_bars ? 'importing' : 'pending')) : 'pending')
+            })()
+            let percent = Math.round(iTry?.progress_percent ?? iTry?.progress ?? 0)
+            if ((!percent || percent <= 0) && dbTry) {
+              const gates = [ (dbTry?.data?.daily_bars || 0) > 0, (dbTry?.data?.minute_bars || 0) > 0, (dbTry?.setup?.users || 0) > 0 && (dbTry?.setup?.runners || 0) > 0 ]
+              const done = gates.filter(Boolean).length
+              percent = Math.round((done / 3) * 100)
+              if (dbTry?.ready) percent = 100
+            }
+            finalImport = {
+              state: mappedState,
+              progress_percent: percent,
+              processed: iTry?.processed ?? iTry?.done ?? (dbTry?.ready ? 3 : (dbTry ? (Math.max(0, Math.min(3, ((dbTry?.data?.daily_bars>0) + (dbTry?.data?.minute_bars>0) + ((dbTry?.setup?.users>0 && dbTry?.setup?.runners>0))))) ) : 0)),
+              total: iTry?.total ?? iTry?.count ?? 3,
+              details: iTry?.details || {
+                daily_bars: dbTry?.data?.daily_bars || 0,
+                minute_bars: dbTry?.data?.minute_bars || 0,
+                users: dbTry?.setup?.users || 0,
+                runners: dbTry?.setup?.runners || 0,
+                date_range: dbTry?.data?.date_range || { start: null, end: null },
+                checks_done: dbTry ? (((dbTry?.data?.daily_bars || 0) > 0) + ((dbTry?.data?.minute_bars || 0) > 0) + (((dbTry?.setup?.users || 0) > 0 && (dbTry?.setup?.runners || 0) > 0))) : undefined,
+                checks_total: 3
+              }
+            }
+            // keep session cache fresh while we retry
+            writeImportCache(finalImport)
+            // Persist permanent cache when we have authoritative server response or DB is ready
+            if (iTry || (dbTry && dbTry.ready) || finalImport.progress_percent >= 100 || finalImport.state === 'ready') {
+              writeImportOnceCache(finalImport)
+            } else {
+              finalImport = null
+            }
           }
+
+          if (!finalImport) await sleep(1000)
         }
+      }
+
+      if (finalImport) {
+        importStatus.value = finalImport
         writeImportCache(importStatus.value)
-      } catch (e) { /* ignore */ }
+      } else {
+        // Final fallback: persist a minimal pending snapshot so refreshes don't re-trigger spinner
+        const fallback = {
+          state: 'pending',
+          progress_percent: 0,
+          processed: 0,
+          total: 3,
+          details: { daily_bars: 0, minute_bars: 0, users: 0, runners: 0, date_range: { start: null, end: null }, checks_done: 0, checks_total: 3 }
+        }
+        importStatus.value = fallback
+        writeImportCache(fallback)
+        writeImportOnceCache(fallback)
+      }
     } finally {
       _startPolling()
-      // Only continue import polling if not fully ready
-      if (!(importStatus.value.progress_percent >= 100 || importStatus.value.state === 'ready')) {
-        _startImportPolling()
-      }
+      // We intentionally DO NOT poll import status; it's a one-time check
+      importLoading.value = false
       // Logs panel removed from SimulationView; skip logs polling
     }
   }
@@ -439,8 +493,29 @@ export const useSimulationStore = defineStore('simulation', () => {
     if (isResetting.value) return
     isResetting.value = true
     try {
-      const res = await SimulationAPI.reset()
-      // Clear execution-related caches and store values so UI returns to 0%
+      // Schedule server-side async reset
+      const res = await SimulationAPI.reset().catch(err => ({ ok: false, error: err?.message }))
+
+      // Poll status until completed/failed or timeout
+      const timeoutMs = 120000
+      const pollIntervalMs = 750
+      const deadline = Date.now() + timeoutMs
+      let statusRes = null
+      // brief initial delay to let the job start
+      await sleep(250)
+      while (Date.now() < deadline) {
+        statusRes = await SimulationAPI.resetStatus().catch(() => null)
+        const st = statusRes?.status
+        if (st === 'completed' || st === 'failed') break
+        await sleep(pollIntervalMs)
+      }
+
+      if (!statusRes || (statusRes.status !== 'completed')) {
+        const msg = statusRes?.error ? (`Reset failed: ${statusRes.error}`) : 'Reset timed out before completion'
+        return { ok: false, message: msg, status: statusRes?.status || 'unknown' }
+      }
+
+      // Clear execution-related caches and store values AFTER server confirms completion
       try {
         sessionStorage.removeItem(SIM_STATUS_CACHE_KEY)
         sessionStorage.removeItem(ETA_CACHE_KEY)
@@ -465,7 +540,7 @@ export const useSimulationStore = defineStore('simulation', () => {
       importStatus.value = { ...importDefault, state: 'ready', progress_percent: 100, processed: 3, total: 3 }
       logs.value = { warnings: [], errors: [] }
       writeSimCache(status.value)
-      return res
+      return { ok: true, message: 'Reset completed', deleted: statusRes?.deleted || null }
     } finally {
       isResetting.value = false
     }
@@ -478,7 +553,7 @@ export const useSimulationStore = defineStore('simulation', () => {
   }
 
   return {
-    status, importStatus, logs,
+    status, importStatus, logs, importLoading,
     isStarting, isStopping, isResetting, isRunning,
     warmUp, start, stop, reset, destroy, refreshOnce
   }

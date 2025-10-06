@@ -37,6 +37,7 @@ export const SimulationAPI = {
       throw e
     }
   },
+  resetStatus: () => api.get('/analytics/simulation/reset/status', { params: { _t: Date.now() } }).then(r => r.data),
   // status endpoint exposed as /analytics/simulation/state
   status: () => api.get('/analytics/simulation/state').then(r => r.data),
   // progress endpoint and helper to force a tick (useful for dev/testing)

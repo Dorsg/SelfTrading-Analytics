@@ -1,5 +1,6 @@
   <template>
     <n-card title="Import Status" size="large">
+      <n-spin :show="loading">
       <n-space v-if="isReady" align="center" justify="space-between">
         <n-space align="center">
           <n-tag :type="tagType" round>Ready</n-tag>
@@ -55,19 +56,21 @@
           </n-space>
         </div>
       </n-space>
+      </n-spin>
     </n-card>
   </template>
   
   <script setup>
   import { computed } from 'vue'
-  import { NCard, NSpace, NTag, NText, NProgress, NStatistic } from 'naive-ui'
+  import { NCard, NSpace, NTag, NText, NProgress, NStatistic, NSpin } from 'naive-ui'
   
   const props = defineProps({
     state: { type: String, default: 'idle' },
     progress: { type: Number, default: 0 },
     processed: { type: Number, default: 0 },
     total: { type: Number, default: 0 },
-    details: { type: Object, default: null }
+    details: { type: Object, default: null },
+    loading: { type: Boolean, default: false }
   })
   
   const isReady = computed(() => props.progress >= 100 || props.state === 'ready' || props.state === 'completed')

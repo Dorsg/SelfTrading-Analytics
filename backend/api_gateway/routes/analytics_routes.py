@@ -9,6 +9,9 @@ from sqlalchemy import select, func, text, desc
 import os
 import logging
 from fastapi.responses import Response
+import threading
+import time
+import json
 
 from database.db_core import engine
 from database.db_manager import DBManager
@@ -25,6 +28,87 @@ from backend.analytics.performance_metrics import calculate_performance_metrics
 
 router = APIRouter(prefix="/analytics", tags=["analytics"])
 
+
+# ---------------- Reset task state (in-process) ----------------
+RESET_STATE = {
+    "status": "idle",          # idle | running | completed | failed
+    "started_at": None,         # iso string
+    "finished_at": None,        # iso string
+    "deleted": None,            # dict of deleted counts
+    "error": None               # error message if failed
+}
+
+def _set_reset_state(**kwargs) -> None:
+    for k, v in kwargs.items():
+        RESET_STATE[k] = v
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+def _perform_reset_job(fast: bool = True) -> None:
+    logger = logging.getLogger("api-gateway")
+    _set_reset_state(status="running", started_at=_now_iso(), finished_at=None, deleted=None, error=None)
+    deleted = {"runner_executions": 0, "executed_trades": 0, "orders": 0, "open_positions": 0, "analytics_results": 0}
+    try:
+        # 1) Stop simulation and reset time
+        from database.db_manager import DBManager
+        from database.models import SimulationState
+        from database.db_core import engine
+        with DBManager() as db:
+            user = db.get_or_create_user("analytics", "analytics@example.com", "analytics")
+            st = db.db.query(SimulationState).filter(SimulationState.user_id == user.id).first()
+            if not st:
+                st = SimulationState(user_id=user.id, is_running="false", last_ts=None)
+                db.db.add(st)
+            else:
+                st.is_running = "false"
+                st.last_ts = None
+            db.db.commit()
+
+        # 2) Delete execution artifacts quickly
+        fast_allowed = fast and (os.getenv("RUNNING_ENV", "").lower() == "analytics")
+        try:
+            if fast_allowed:
+                # Single TRUNCATE is dramatically faster than filtered deletes; preserve structure
+                stmt = text("TRUNCATE TABLE runner_executions, executed_trades, orders, open_positions, analytics_results RESTART IDENTITY CASCADE")
+                with engine.connect() as conn:
+                    conn.execute(stmt)
+                    conn.commit()
+                # Row counts are unknown after TRUNCATE; report -1 to indicate fast path
+                deleted = {k: -1 for k in deleted.keys()}
+            else:
+                from database.db_manager import DBManager
+                with DBManager() as db:
+                    user = db.get_or_create_user("analytics", "analytics@example.com", "analytics")
+                    from sqlalchemy import text as sqltext
+                    res = db.db.execute(sqltext("DELETE FROM runner_executions WHERE user_id=:u"), {"u": user.id}); deleted["runner_executions"] = getattr(res, "rowcount", 0) or 0
+                    res = db.db.execute(sqltext("DELETE FROM executed_trades WHERE user_id=:u"), {"u": user.id}); deleted["executed_trades"] = getattr(res, "rowcount", 0) or 0
+                    res = db.db.execute(sqltext("DELETE FROM orders WHERE user_id=:u"), {"u": user.id}); deleted["orders"] = getattr(res, "rowcount", 0) or 0
+                    res = db.db.execute(sqltext("DELETE FROM open_positions WHERE user_id=:u"), {"u": user.id}); deleted["open_positions"] = getattr(res, "rowcount", 0) or 0
+                    res = db.db.execute(sqltext("DELETE FROM analytics_results")); deleted["analytics_results"] = getattr(res, "rowcount", 0) or 0
+                    db.db.commit()
+        except Exception:
+            logger.exception("reset: deletion phase failed")
+            raise
+
+        # 3) Remove snapshot and pacing toggles
+        try:
+            snap_path = os.getenv("SIM_PROGRESS_SNAPSHOT", "/app/data/sim_last_progress.json")
+            if os.path.exists(snap_path):
+                os.remove(snap_path)
+        except Exception:
+            logger.debug("reset: failed to remove snapshot", exc_info=True)
+        try:
+            if os.path.exists("/tmp/sim_auto_advance.json"):
+                os.remove("/tmp/sim_auto_advance.json")
+        except Exception:
+            pass
+
+        _set_reset_state(status="completed", finished_at=_now_iso(), deleted=deleted, error=None)
+        logger.info("reset: completed (fast=%s)", str(fast_allowed))
+    except Exception as e:
+        _set_reset_state(status="failed", finished_at=_now_iso(), deleted=deleted, error=str(e))
+        logger.exception("reset: failed")
 
 def _now_sim() -> Optional[int]:
     try:
@@ -645,55 +729,35 @@ def stop_simulation() -> dict:
 
 @router.post("/simulation/reset")
 def api_reset_simulation() -> dict:
-    """Reset execution data and simulation state (preserve imported bars)."""
+    """Schedule an asynchronous reset of execution data and simulation state.
+
+    Returns immediately so the client can poll status. Fast path uses TRUNCATE when
+    RUNNING_ENV=analytics; otherwise falls back to filtered deletes.
+    """
     logger = logging.getLogger("api-gateway")
     try:
-        deleted = {"runner_executions": 0, "executed_trades": 0, "orders": 0, "open_positions": 0, "analytics_results": 0}
-        with DBManager() as db:
-            user = db.get_or_create_user("analytics", "analytics@example.com", "analytics")
-            st = db.db.query(SimulationState).filter(SimulationState.user_id == user.id).first()
-            if not st:
-                st = SimulationState(user_id=user.id, is_running="false", last_ts=None)
-                db.db.add(st)
-            else:
-                st.is_running = "false"
-                st.last_ts = None
-
-            # Bulk delete execution artifacts (user-scoped where applicable)
-            try:
-                from sqlalchemy import text as sqltext
-                res = db.db.execute(sqltext("DELETE FROM runner_executions WHERE user_id=:u"), {"u": user.id}); deleted["runner_executions"] = getattr(res, "rowcount", 0) or 0
-                res = db.db.execute(sqltext("DELETE FROM executed_trades WHERE user_id=:u"), {"u": user.id}); deleted["executed_trades"] = getattr(res, "rowcount", 0) or 0
-                res = db.db.execute(sqltext("DELETE FROM orders WHERE user_id=:u"), {"u": user.id}); deleted["orders"] = getattr(res, "rowcount", 0) or 0
-                res = db.db.execute(sqltext("DELETE FROM open_positions WHERE user_id=:u"), {"u": user.id}); deleted["open_positions"] = getattr(res, "rowcount", 0) or 0
-                # analytics_results not user-scoped
-                res = db.db.execute(sqltext("DELETE FROM analytics_results")); deleted["analytics_results"] = getattr(res, "rowcount", 0) or 0
-            except Exception:
-                logger.exception("api_reset_simulation: delete operations failed")
-                db.db.rollback()
-                raise
-
-            db.db.commit()
-
-        # Remove snapshot and pace toggle
-        snap_path = os.getenv("SIM_PROGRESS_SNAPSHOT", "/app/data/sim_last_progress.json")
-        try:
-            if os.path.exists(snap_path):
-                os.remove(snap_path)
-        except Exception:
-            logger.debug("api_reset_simulation: failed to remove snapshot", exc_info=True)
-        try:
-            if os.path.exists("/tmp/sim_auto_advance.json"):
-                os.remove("/tmp/sim_auto_advance.json")
-        except Exception:
-            pass
-
-        return {"ok": True, "deleted": deleted}
-    except HTTPException:
-        raise
+        if RESET_STATE.get("status") == "running":
+            return {"ok": True, "status": "running", "started_at": RESET_STATE.get("started_at")}
+        # Start background job
+        t = threading.Thread(target=_perform_reset_job, kwargs={"fast": True}, daemon=True)
+        t.start()
+        return {"ok": True, "status": "scheduled"}
     except Exception as e:
-        logger.exception("api_reset_simulation failed")
+        logger.exception("api_reset_simulation scheduling failed")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/simulation/reset/status")
+def api_reset_status() -> dict:
+    """Return current reset task status and metadata."""
+    try:
+        return {
+            "ok": RESET_STATE.get("status") in {"idle", "running", "completed"},
+            **RESET_STATE,
+        }
+    except Exception as e:
+        logging.getLogger("api-gateway").exception("reset status failed")
+        return {"ok": False, "status": "failed", "error": str(e)}
 
 
 @router.get("/simulation/state")

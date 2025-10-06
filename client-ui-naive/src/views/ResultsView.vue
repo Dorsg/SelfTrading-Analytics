@@ -48,10 +48,14 @@
   }
 
   async function resetAll () {
-    await sim.reset()
-    store.summary = { pnl_by_year: [], pnl_by_timeframe: [], pnl_by_strategy: [] }
-    store.topStocks = []
-    message.success('Reset completed')
+    const res = await sim.reset()
+    if (res?.ok) {
+      store.summary = { pnl_by_year: [], pnl_by_timeframe: [], pnl_by_strategy: [] }
+      store.topStocks = []
+      message.success(res?.message ?? 'Reset completed')
+    } else {
+      message.error(res?.message ?? 'Reset failed')
+    }
   }
   </script>
   
