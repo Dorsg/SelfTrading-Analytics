@@ -45,6 +45,7 @@ class RunnerView:
     parameters: dict
     exit_strategy: str
     activation: str
+    cooldown_until: Optional[datetime]
 
 
 class RunnerService:
@@ -94,7 +95,8 @@ class RunnerService:
         # Scope:
         #   "symbol_tf"          → one BUY per (symbol,timeframe,bar_ts) across ALL strategies
         #   "symbol_tf_strategy" → one BUY per (symbol,timeframe,bar_ts,strategy)
-        self._same_bar_scope: str = (os.getenv("SAME_BAR_SCOPE", "symbol_tf") or "symbol_tf").strip().lower()
+        # Default relaxed to symbol_tf_strategy to avoid over-constraining buys across all strategies
+        self._same_bar_scope: str = (os.getenv("SAME_BAR_SCOPE", "symbol_tf_strategy") or "symbol_tf_strategy").strip().lower()
         self._same_bar_seen_seq: Optional[int] = None  # resets each tick (cycle_seq)
         self._same_bar_seen: Set[str] = set()
         # Thread-based lock to coordinate same-bar guard across worker threads
@@ -112,6 +114,15 @@ class RunnerService:
                 cpu = 4
             conc_default = max(2, min(32, cpu * 2))
         self._executor = ThreadPoolExecutor(max_workers=conc_default, thread_name_prefix="runner-worker")
+
+        # ── Budgeting controls ──────────────────────────────────────────────────
+        # Per-runner compounding budget (unit budget), with auto-reset when depleted
+        try:
+            self._budget_reset_fraction = float(os.getenv("SIM_BUDGET_RESET_FRACTION", "0.25"))
+        except Exception:
+            self._budget_reset_fraction = 0.25
+        # Strategy-provided quantity is ignored by default in analytics sim
+        self._allow_strategy_quantity = (os.getenv("SIM_ALLOW_STRATEGY_QUANTITY", "0") == "1")
 
     # ───────────────────────── internals ─────────────────────────
     def _get_candles_cached(
@@ -226,8 +237,8 @@ class RunnerService:
         try:
             if price is None or price <= 0:
                 return 0
-            # Use initial budget for consistent trade sizing
-            qty = int(r.budget // max(price, 0.01))
+            # Use runner's current compounding budget for trade sizing
+            qty = int(r.current_budget // max(price, 0.01))
             return max(qty, 0)
         except Exception:
             return 0
@@ -247,6 +258,7 @@ class RunnerService:
                 parameters=dict(getattr(r, "parameters", {}) or {}),
                 exit_strategy=str(getattr(r, "exit_strategy", "hold_forever") or "hold_forever"),
                 activation=str(getattr(r, "activation", "active") or "active"),
+                cooldown_until=getattr(r, "cooldown_until", None),
             )
         except Exception:
             return RunnerView(
@@ -261,6 +273,7 @@ class RunnerService:
                 parameters=dict(getattr(r, "parameters", {}) or {}),
                 exit_strategy=str(getattr(r, "exit_strategy", "hold_forever") or "hold_forever"),
                 activation=str(getattr(r, "activation", "active") or "active"),
+                cooldown_until=None,
             )
 
     # ── NEW: same-bar key helper ────────────────────────────────────────────────
@@ -294,6 +307,13 @@ class RunnerService:
                     stats_delta["excluded_pairs"] += 1
                     stats_delta["processed"] += 1
                     return stats_delta, {"runner_id": rid, "user_id": uid, "symbol": sym, "strategy": r.strategy, "status": "skipped-excluded-universe", "reason": (ex_reason or "excluded"), "details": None, "execution_time": as_of, "cycle_seq": seq, "timeframe": tf}
+
+                # NEW: Cooldown gate
+                if r.cooldown_until and as_of < r.cooldown_until:
+                    stats_delta["skipped_cooldown"] += 1
+                    stats_delta["processed"] += 1
+                    return stats_delta, {"runner_id": rid, "user_id": uid, "symbol": sym, "strategy": r.strategy, "status": "skipped-cooldown", "reason": "cooldown_active", "details": None, "execution_time": as_of, "cycle_seq": seq, "timeframe": tf}
+
 
                 # Fetch candles
                 candles = self._get_candles_cached(sym, tf, as_of, lookback=300)
@@ -364,7 +384,8 @@ class RunnerService:
                         if last_ts: self._last_bar_ts[bar_key] = last_ts
                         return stats_delta, {"runner_id": r.id, "user_id": uid, "symbol": sym, "strategy": r.strategy, "status": "completed", "reason": "skipped-same-bar-guard", "details": None, "execution_time": as_of, "cycle_seq": seq, "timeframe": tf}
 
-                    qty = int(decision.get("quantity") or 0) or self._qty_from_budget(db, r, ctx.price)
+                    # Ignore strategy-provided quantity unless explicitly allowed
+                    qty = (int(decision.get("quantity") or 0) if self._allow_strategy_quantity else 0) or self._qty_from_budget(db, r, ctx.price)
                     if qty <= 0:
                         stats_delta["skipped_no_budget"] += 1
                         stats_delta["processed"] += 1
@@ -411,9 +432,22 @@ class RunnerService:
                     if ok:
                         stats_delta["sells"] += 1
                         self.health.mark_clean_pass(sym=sym, tf=tf)
-                        # Update runner's compounding budget
+                        # Update runner's compounding budget with auto-reset if depleted
                         try:
-                            db.update_runner_budget(runner_id=rid, new_budget=r.current_budget + pnl)
+                            # Determine initial budget (persisted in parameters if available)
+                            try:
+                                params = dict(getattr(r, "parameters", {}) or {})
+                            except Exception:
+                                params = {}
+                            initial_budget = float(params.get("initial_budget_usd", self._unit_budget_usd) or self._unit_budget_usd)
+                            new_budget = float(r.current_budget) + float(pnl)
+                            # Auto-reset when below threshold
+                            if initial_budget > 0 and new_budget < (self._budget_reset_fraction * initial_budget):
+                                new_budget = initial_budget
+                            # Never allow negative
+                            if new_budget < 0:
+                                new_budget = 0.0
+                            db.update_runner_budget(runner_id=rid, new_budget=new_budget)
                         except Exception:
                             log.exception("Failed to update runner budget for runner_id=%s", rid)
                     else:
@@ -468,6 +502,27 @@ class RunnerService:
                 log.exception("ensure_account failed for user_id=%s", uid)
 
             runners_orm = db.get_runners_by_user(user_id=uid, activation="active")
+
+            # Initialize missing budgets to unit budget and persist initial budget in parameters
+            for orm_runner in runners_orm:
+                try:
+                    if float(getattr(orm_runner, "current_budget", 0.0) or 0.0) <= 0.0:
+                        # Ensure a parameters dict exists
+                        params = dict(getattr(orm_runner, "parameters", {}) or {})
+                        if "initial_budget_usd" not in params:
+                            params["initial_budget_usd"] = float(self._unit_budget_usd)
+                        setattr(orm_runner, "parameters", params)
+                        setattr(orm_runner, "current_budget", float(self._unit_budget_usd))
+                except Exception:
+                    continue
+            try:
+                db.db.commit()
+            except Exception:
+                try:
+                    db.db.rollback()
+                except Exception:
+                    pass
+
             runners: List[RunnerView] = [self._snapshot_runner(r) for r in runners_orm]
             positions_map = db.get_open_positions_map([rv.id for rv in runners])
 
@@ -523,5 +578,13 @@ class RunnerService:
             stats["processed"], stats["buys"], stats["sells"], stats["no_action"],
             stats["skipped_no_data"], stats["skipped_no_budget"],
             stats["same_bar_skips"], stats["stop_cross_exits"], stats["excluded_pairs"], stats["errors"],
+        )
+        kpi.info(
+            "tick@%s processed=%d buys=%d sells=%d no_action=%d skipped_no_data=%d skipped_no_budget=%d same_bar_skips=%d stop_cross=%d excluded=%d errors=%d cooldown_skips=%d",
+            as_of.isoformat(),
+            stats["processed"], stats["buys"], stats["sells"], stats["no_action"],
+            stats["skipped_no_data"], stats["skipped_no_budget"],
+            stats["same_bar_skips"], stats["stop_cross_exits"], stats["excluded_pairs"], stats["errors"],
+            stats["skipped_cooldown"]
         )
         return dict(stats)

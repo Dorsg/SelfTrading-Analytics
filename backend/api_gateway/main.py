@@ -75,7 +75,7 @@ async def _bootstrap_everything() -> None:
                     from backend.strategies.factory import list_available_strategy_keys as _list_strats
                     strategies = _list_strats()
                 except Exception:
-                    strategies = ["chatgpt_5_strategy", "chatgpt_5_ultra_strategy", "grok_4_strategy", "gemini_2_5_pro_strategy", "claude_4_5_sonnet_strategy", "deepseek_v3_1_strategy"]
+                    strategies = ["chatgpt_5_ultra_strategy", "grok_4_strategy", "gemini_2_5_pro_strategy", "claude_4_5_sonnet_strategy", "deepseek_v3_1_strategy"]
                 timeframes = [5, 1440]
                 created = 0
                 for sym in syms:

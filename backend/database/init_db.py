@@ -50,7 +50,7 @@ def _apply_light_migrations() -> None:
 
     - Ensure runner_executions unique index (existing behavior in your app).
     - NEW: Deduplicate runners and enforce uniqueness on (user_id, stock, strategy, time_frame).
-    - Fix strategy name for chatgpt_5_strategy to its canonical key.
+    - Clean up legacy chatgpt_5_strategy references (ultra is the only ChatGPT5 now).
     """
     try:
         # Step 1: ensure users.password_hash exists and backfill from legacy hashed_password
@@ -107,45 +107,51 @@ def _apply_light_migrations() -> None:
         except Exception:
             log.exception("Light migrations: failed uppercasing runner symbols")
 
-        # 4b) Align chatgpt strategy name safely (avoid unique conflicts)
+        # 4b) Remove legacy chatgpt_5_strategy runners or rename to ultra, avoiding duplicates
         try:
             with engine.begin() as conn:
-                # Dialect-agnostic delete of aliases that would conflict with an existing canonical row
+                # Delete legacy rows that would conflict with an existing ultra row
                 res_del = conn.execute(text(
                     """
                     DELETE FROM runners
-                     WHERE TRIM(LOWER(strategy)) IN ('chatgpt5strategy', 'chatgpt 5 strategy', 'chatgpt-5-strategy')
+                     WHERE TRIM(LOWER(strategy)) IN (
+                        'chatgpt_5_strategy','chatgpt5strategy','chatgpt 5 strategy','chatgpt-5-strategy'
+                     )
                        AND EXISTS (
                            SELECT 1 FROM runners t
                             WHERE t.user_id = runners.user_id
                               AND t.stock = runners.stock
                               AND t.time_frame = runners.time_frame
-                              AND TRIM(LOWER(t.strategy)) = 'chatgpt_5_strategy'
+                              AND TRIM(LOWER(t.strategy)) = 'chatgpt_5_ultra_strategy'
                        )
                     """
                 ))
                 removed = getattr(res_del, "rowcount", 0) or 0
                 if removed:
-                    log.info("Light migrations: removed %d conflicting chatgpt alias runners.", removed)
+                    log.info("Light migrations: removed %d conflicting legacy chatgpt runners.", removed)
 
-                # Then, update remaining alias rows to canonical where it won't create a duplicate
+                # Update remaining legacy rows to ultra where it won't create a duplicate
                 res_upd = conn.execute(text(
                     """
                     UPDATE runners
-                       SET strategy = 'chatgpt_5_strategy'
-                     WHERE TRIM(LOWER(strategy)) IN ('chatgpt5strategy', 'chatgpt 5 strategy', 'chatgpt-5-strategy')
+                       SET strategy = 'chatgpt_5_ultra_strategy'
+                     WHERE TRIM(LOWER(strategy)) IN (
+                        'chatgpt_5_strategy','chatgpt5strategy','chatgpt 5 strategy','chatgpt-5-strategy'
+                     )
                        AND NOT EXISTS (
                            SELECT 1 FROM runners t
-                            WHERE t.user_id = runners.user_id AND t.stock = runners.stock AND t.time_frame = runners.time_frame
-                              AND TRIM(LOWER(t.strategy)) = 'chatgpt_5_strategy'
+                            WHERE t.user_id = runners.user_id
+                              AND t.stock = runners.stock
+                              AND t.time_frame = runners.time_frame
+                              AND TRIM(LOWER(t.strategy)) = 'chatgpt_5_ultra_strategy'
                        )
                     """
                 ))
-                updated_strat = getattr(res_upd, "rowcount", 0) or 0
-                if updated_strat:
-                    log.info("Light migrations: aligned %d runners to 'chatgpt_5_strategy' canonical key.", updated_strat)
+                updated = getattr(res_upd, "rowcount", 0) or 0
+                if updated:
+                    log.info("Light migrations: migrated %d runners to 'chatgpt_5_ultra_strategy'.", updated)
         except Exception:
-            log.exception("Light migrations: failed aligning chatgpt strategy name")
+            log.exception("Light migrations: failed migrating chatgpt runners to ultra")
 
         # 4c) Delete duplicates (keep lowest id per key)
         try:
@@ -175,7 +181,7 @@ def _apply_light_migrations() -> None:
         except Exception:
             log.exception("Light migrations: failed creating ux_runners_unique")
 
-        # 4e) Normalize executed_trades strategy names to canonical (reporting consistency)
+        # 4e) Normalize executed_trades strategy names to ultra (reporting consistency)
         try:
             with engine.begin() as conn:
                 insp = inspect(conn)
@@ -185,15 +191,17 @@ def _apply_light_migrations() -> None:
                         res_et = conn.execute(text(
                             """
                             UPDATE executed_trades
-                               SET strategy = 'chatgpt_5_strategy'
-                             WHERE TRIM(LOWER(strategy)) IN ('chatgpt5strategy', 'chatgpt 5 strategy', 'chatgpt-5-strategy')
+                               SET strategy = 'chatgpt_5_ultra_strategy'
+                             WHERE TRIM(LOWER(strategy)) IN (
+                                'chatgpt5strategy','chatgpt 5 strategy','chatgpt-5-strategy','chatgpt_5_strategy'
+                             )
                             """
                         ))
                         updated_et = getattr(res_et, "rowcount", 0) or 0
                         if updated_et:
-                            log.info("Light migrations: normalized %d executed_trades to 'chatgpt_5_strategy'.", updated_et)
+                            log.info("Light migrations: normalized %d executed_trades to 'chatgpt_5_ultra_strategy'.", updated_et)
         except Exception:
-            log.exception("Light migrations: failed normalizing executed_trades strategy names")
+            log.exception("Light migrations: failed normalizing executed_trades strategy names to ultra")
 
         log.info("Light migrations completed.")
     except Exception:

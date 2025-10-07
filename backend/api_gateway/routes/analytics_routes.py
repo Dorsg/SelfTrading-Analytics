@@ -162,9 +162,8 @@ def _ensure_runners_if_needed(users_ct: int, runners_ct: int) -> int:
             from backend.strategies.factory import list_available_strategy_keys as _list_strats
             strategies = _list_strats()
         except Exception:
-            # Fallback to a static list if discovery fails
+            # Fallback to a static list if discovery fails (legacy removed)
             strategies = [
-                "chatgpt_5_strategy",
                 "chatgpt_5_ultra_strategy",
                 "grok_4_strategy",
                 "gemini_2_5_pro_strategy",
@@ -1097,8 +1096,8 @@ def get_results_summary() -> dict:
         by_year_q = text("""
             SELECT
                 EXTRACT(YEAR FROM sell_ts) AS year,
-                COALESCE(SUM(pnl_amount), 0) / NULLIF(SUM(buy_price * quantity), 0) * 100 AS weighted_pct,
-                AVG(COALESCE(pnl_amount, 0) / NULLIF(buy_price * quantity, 0) * 100) AS avg_pct,
+                CAST(SUM(sell_price * quantity) - SUM(buy_price * quantity) AS FLOAT) * 100.0 / NULLIF(SUM(buy_price * quantity), 0) AS weighted_pct,
+                AVG(pnl_percent) AS avg_pct,
                 CAST(COUNT(*) AS INT) AS trades
             FROM executed_trades
             WHERE sell_ts IS NOT NULL AND buy_price > 0 AND quantity > 0
@@ -1116,13 +1115,13 @@ def get_results_summary() -> dict:
                         WHEN timeframe IN ('5','5m','5min','5MIN') THEN '5m'
                         ELSE NULL
                     END AS timeframe_bucket,
-                    pnl_amount, buy_price, quantity, pnl_percent
+                    buy_price, sell_price, quantity, pnl_percent
                 FROM executed_trades
                 WHERE sell_ts IS NOT NULL AND buy_price > 0 AND quantity > 0
             )
             SELECT timeframe_bucket,
-                   COALESCE(SUM(pnl_amount), 0) / NULLIF(SUM(buy_price * quantity), 0) * 100 AS weighted_pct,
-                   AVG(COALESCE(pnl_amount, 0) / NULLIF(buy_price * quantity, 0) * 100) AS avg_pct,
+                   CAST(SUM(sell_price * quantity) - SUM(buy_price * quantity) AS FLOAT) * 100.0 / NULLIF(SUM(buy_price * quantity), 0) AS weighted_pct,
+                   AVG(pnl_percent) AS avg_pct,
                    CAST(COUNT(*) AS INT) AS trades
             FROM tf
             WHERE timeframe_bucket IN ('1d','5m')
@@ -1135,10 +1134,10 @@ def get_results_summary() -> dict:
         by_strat_q = text("""
             SELECT
                 strategy,
-                COALESCE(SUM(pnl_amount), 0) / NULLIF(SUM(buy_price * quantity), 0) * 100 AS weighted_pct,
-                AVG(COALESCE(pnl_amount, 0) / NULLIF(buy_price * quantity, 0) * 100) AS avg_pct,
+                CAST(SUM(sell_price * quantity) - SUM(buy_price * quantity) AS FLOAT) * 100.0 / NULLIF(SUM(buy_price * quantity), 0) AS weighted_pct,
+                AVG(pnl_percent) AS avg_pct,
                 CAST(COUNT(*) AS INT) AS trades,
-                100.0 * SUM(CASE WHEN COALESCE(pnl_amount,0) > 0 THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0) AS win_rate_pct,
+                100.0 * SUM(CASE WHEN pnl_percent > 0 THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0) AS win_rate_pct,
                 AVG(CASE WHEN buy_ts IS NOT NULL AND sell_ts IS NOT NULL THEN EXTRACT(EPOCH FROM (sell_ts - buy_ts)) ELSE NULL END) / 86400.0 AS avg_trade_days
             FROM executed_trades
             WHERE sell_ts IS NOT NULL
@@ -1227,7 +1226,7 @@ def get_results_summary() -> dict:
                         ELSE NULL
                     END AS tf,
                     strategy,
-                    pnl_amount, buy_price, quantity,
+                    buy_price, sell_price, quantity, pnl_percent,
                     buy_ts, sell_ts
                 FROM executed_trades
                 WHERE sell_ts IS NOT NULL AND buy_price > 0 AND quantity > 0
@@ -1237,8 +1236,8 @@ def get_results_summary() -> dict:
                 year,
                 tf AS timeframe,
                 strategy,
-                COALESCE(SUM(pnl_amount), 0) / NULLIF(SUM(buy_price * quantity), 0) * 100 AS weighted_pct,
-                AVG(COALESCE(pnl_amount, 0) / NULLIF(buy_price * quantity, 0) * 100) AS avg_pct,
+                CAST(SUM(sell_price * quantity) - SUM(buy_price * quantity) AS FLOAT) * 100.0 / NULLIF(SUM(buy_price * quantity), 0) AS weighted_pct,
+                AVG(pnl_percent) AS avg_pct,
                 CAST(COUNT(*) AS INT) AS trades,
                 AVG(CASE WHEN buy_ts IS NOT NULL AND sell_ts IS NOT NULL THEN EXTRACT(EPOCH FROM (sell_ts - buy_ts)) ELSE NULL END) / 86400.0 AS avg_trade_days
             FROM base
@@ -1288,10 +1287,10 @@ def get_top_stocks(limit: int = Query(20, ge=1, le=100)) -> list[dict]:
                 ELSE NULL
             END AS timeframe,
             strategy,
-            COALESCE(SUM(pnl_amount), 0) / NULLIF(SUM(buy_price * quantity), 0) * 100 AS compounded_pnl_pct,
-            AVG(COALESCE(pnl_amount, 0) / NULLIF(buy_price * quantity, 0) * 100) AS avg_pct,
+            CAST(SUM(sell_price * quantity) - SUM(buy_price * quantity) AS FLOAT) * 100.0 / NULLIF(SUM(buy_price * quantity), 0) AS compounded_pnl_pct,
+            AVG(pnl_percent) AS avg_pct,
             CAST(COUNT(*) AS INT) AS trades,
-            100.0 * SUM(CASE WHEN COALESCE(pnl_amount,0) > 0 THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0) AS win_rate_pct,
+            100.0 * SUM(CASE WHEN pnl_percent > 0 THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0) AS win_rate_pct,
             AVG(CASE WHEN buy_ts IS NOT NULL AND sell_ts IS NOT NULL THEN EXTRACT(EPOCH FROM (sell_ts - buy_ts)) ELSE NULL END) / 86400.0 AS avg_trade_days
         FROM executed_trades
         WHERE sell_ts IS NOT NULL

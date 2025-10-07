@@ -473,11 +473,43 @@ class MarketDataManager:
     def calculate_ema(candles: List[Dict[str, Any]], period: int) -> float:
         if len(candles) < period:
             return float("nan")
+        
+        closes = [float(c["close"]) for c in candles]
+        
+        # Initialize EMA with the SMA of the first 'period' values
+        sma = sum(closes[-period:]) / period
+        
+        # The first EMA value is the SMA
+        if len(candles) == period:
+            return sma
+        
+        # Start with the SMA and apply EMA formula for the rest
         k = 2.0 / (period + 1.0)
-        ema = float(candles[-period]["close"])
-        for c in candles[-period + 1:]:
-            ema = c["close"] * k + ema * (1.0 - k)
-        return float(ema)
+        ema = sma
+        
+        # This implementation is for a rolling EMA calculation.
+        # However, the current structure recalculates on each call.
+        # For a more accurate EMA, we should calculate it iteratively over the series.
+        # Let's re-calculate from the start of the provided candle window for better accuracy.
+        
+        window_closes = closes[-period:]
+        ema = sum(window_closes) / period # Initial SMA for the window
+        
+        # The candles are assumed to be sorted chronologically
+        # This method is repeatedly called with a sliding window of candles.
+        # A simple iterative EMA calculation:
+        
+        ema_values = []
+        # Initial SMA
+        initial_sma = sum(c["close"] for c in candles[:period]) / period
+        ema_values.append(initial_sma)
+
+        for i in range(period, len(candles)):
+            close = float(candles[i]["close"])
+            new_ema = (close - ema_values[-1]) * k + ema_values[-1]
+            ema_values.append(new_ema)
+            
+        return ema_values[-1] if ema_values else float("nan")
 
     @staticmethod
     def calculate_rsi(candles: List[Dict[str, Any]], period: int = 14) -> float:

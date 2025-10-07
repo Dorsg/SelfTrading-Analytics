@@ -3,13 +3,13 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Any
 
 from sqlalchemy import inspect
 
 from database.db_manager import DBManager
-from database.models import OpenPosition, Order, ExecutedTrade
+from database.models import OpenPosition, Order, ExecutedTrade, Runner
 from backend.trades_logger import log_buy, log_sell
 
 log = logging.getLogger("mock-broker")
@@ -18,6 +18,7 @@ log = logging.getLogger("mock-broker")
 _SIM_COMMISSION_PER_TRADE = float(os.environ.get("SIM_COMMISSION_PER_TRADE", 1.00))  # e.g., $1 per trade
 _SIM_BID_ASK_SPREAD = float(os.environ.get("SIM_BID_ASK_SPREAD", 0.01))  # e.g., 1 cent spread
 _SIM_SLIPPAGE_PERCENT = float(os.environ.get("SIM_SLIPPAGE_PERCENT", 0.0005))  # e.g., 0.05% slippage
+_SIM_COOLDOWN_BARS_AFTER_STOP = int(os.environ.get("SIM_COOLDOWN_BARS_AFTER_STOP", "3"))
 
 
 def _utc(dt: datetime) -> datetime:
@@ -226,7 +227,7 @@ class MockBroker:
 
             # ExecutedTrade roll-up
             pnl_amt = (exec_price - avg) * q - (self.commission * 2) # Commission on buy and sell
-            cost_basis = avg * q
+            cost_basis = avg * q + self.commission
             pnl_pct = (pnl_amt / cost_basis) * 100.0 if cost_basis > 0 else 0.0
 
             trade = ExecutedTrade(
@@ -353,12 +354,31 @@ class MockBroker:
                     at=at,
                     reason_override=exit_reason,
                 )
-                # Commit highest price change if trail was active
-                db.db.commit()
 
-            # If no exit, but trailing is active, still commit highest price update
-            elif pos in inspect(pos).session.dirty:
-                 db.db.commit()
+                # NEW: Apply cooldown period to the runner after a stop-loss exit
+                if _SIM_COOLDOWN_BARS_AFTER_STOP > 0:
+                    try:
+                        runner_obj = db.db.query(Runner).filter(Runner.id == rid).first()
+                        if runner_obj:
+                            tf_min = int(getattr(runner_obj, "time_frame", 5) or 5)
+                            cooldown_delta = timedelta(minutes=_SIM_COOLDOWN_BARS_AFTER_STOP * tf_min)
+                            runner_obj.cooldown_until = at + cooldown_delta
+                            log.info(
+                                "Runner %d on cooldown for %d bars (until %s) after %s",
+                                rid, _SIM_COOLDOWN_BARS_AFTER_STOP, runner_obj.cooldown_until.isoformat(), exit_reason
+                            )
+                    except Exception:
+                        log.exception("Failed to apply cooldown for runner_id=%s", rid)
+
+
+                # The position has been sold and the transaction committed in sell_all.
+                # We should not interact with the 'pos' object or the 'db' session further.
+                return out
+
+            # If no exit, but trailing is active, highest price might have been updated.
+            # Commit the session to save the new highest_price.
+            if pos in inspect(pos).session.dirty:
+                db.db.commit()
 
 
         return out

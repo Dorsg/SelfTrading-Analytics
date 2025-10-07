@@ -59,6 +59,17 @@ def calculate_performance_metrics(trades: List[Dict[str, Any]], runners: List[Di
             # If clip not available due to dtype issues, fallback via numpy
             returns = pd.Series(np.maximum(returns.values, -1.0), index=returns.index)
 
+        # --- NON-ANNUALIZED SHARPE RATIO ---
+        # The Sharpe ratio is not annualized here. Annualization (e.g., * sqrt(252))
+        # is only appropriate if the returns are daily. Since these are per-trade returns,
+        # annualizing without resampling would be statistically incorrect.
+        try:
+            std = float(returns.std(ddof=1)) if len(returns) > 1 else 0.0
+            mean = float(returns.mean()) if len(returns) > 0 else 0.0
+            sharpe_ratio = (mean / std) if std > 0 else 0.0
+        except Exception:
+            sharpe_ratio = 0.0
+
         # Compounded P&L: sequentially compound per-trade returns
         try:
             if len(returns) > 0:
@@ -70,13 +81,15 @@ def calculate_performance_metrics(trades: List[Dict[str, Any]], runners: List[Di
 
         compounded_pnl_pct = compounded * 100.0
 
-        # Profit Factor
+        # Profit Factor (percent-based, size-invariant): sum positive returns / abs(sum negative returns)
         try:
-            gross_profit = float(group.loc[group["pnl_amount"] > 0, "pnl_amount"].sum())
-            gross_loss = float(abs(group.loc[group["pnl_amount"] < 0, "pnl_amount"].sum()))
-            profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else (0.0 if gross_profit == 0 else float("inf"))
-            if not np.isfinite(profit_factor):
-                # Represent infinity as a large number for UI readability (optional)
+            pos_ret_sum = float(returns[returns > 0].sum())
+            neg_ret_sum = float(abs(returns[returns < 0].sum()))
+            if neg_ret_sum > 0:
+                profit_factor = pos_ret_sum / neg_ret_sum
+            elif pos_ret_sum > 0:
+                profit_factor = 99999.0  # Represent infinity for UI
+            else:
                 profit_factor = 0.0
         except Exception:
             profit_factor = 0.0
@@ -89,17 +102,6 @@ def calculate_performance_metrics(trades: List[Dict[str, Any]], runners: List[Di
             max_drawdown_pct = float(np.max(dd) * 100.0) if dd.size else 0.0
         except Exception:
             max_drawdown_pct = 0.0
-
-        # Sharpe Ratio (per-trade returns, RF=0), annualized with sqrt(252)
-        try:
-            std = float(returns.std(ddof=1)) if len(returns) > 1 else 0.0
-            mean = float(returns.mean()) if len(returns) > 0 else 0.0
-            if std > 0:
-                sharpe_ratio = (mean / std) * math.sqrt(252.0)
-            else:
-                sharpe_ratio = 0.0
-        except Exception:
-            sharpe_ratio = 0.0
 
         results[strategy_name] = {
             "compounded_pnl_pct": float(compounded_pnl_pct),
